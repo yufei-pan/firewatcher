@@ -80,6 +80,15 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--uninstall-service` | Disable and remove the unit |
 | `-V`, `--version` | Show version and exit |
 
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+pytest --cov=firewatcher --cov-fail-under=95 --cov-report=term-missing
+```
+
 ## Author
 
 Yufei Pan (pan@zopyr.us)
