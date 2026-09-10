@@ -1,0 +1,15 @@
+hard resetting link
+Initializing cgroup subsys cpuset
+Linux version
+Out of Memory
+Call Trace
+I/O error
+bad sector
+panic
+Critical
+controller is down
+timeout, aborting
+timeout, reset controller
+timeout, disable controller
+iotest: 1% high is too high compared to 1% low!
+Hardware error

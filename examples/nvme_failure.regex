@@ -1,0 +1,1 @@
+(?i)(?:^|[\s:])nvme(?:\d+n\d+)?\W.*(timeout|abort|restart|reset|unable|cannot|invalid|froze|fail|down|above|cancel|dead|large|bogus|could not|deprecate)
