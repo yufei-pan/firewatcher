@@ -15,7 +15,7 @@ import datetime
 import os
 import unicodedata
 
-version = '1.56'
+version = '1.57'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -24,7 +24,7 @@ DEFAULT_UNIT_NAME = 'firewatcher'
 SYSTEMD_RUNTIME_DIR = '/run/systemd/system'
 SYSTEMD_UNIT_DIR = '/etc/systemd/system'
 SLUG_MAX_LEN = 80
-_OWN_SYSLOG_IDENT_RE = re.compile(r'(?:^|\s)firewatch(?:er)?\[\d+\]:')
+_OWN_SYSLOG_IDENT_RE = re.compile(r'(?:^|\s)firewatcher\[\d+\]:')
 
 class Log_Compressor:
 	def __init__(self, logsDir, compressAfterMonths, deleteLogAfterMonths):
@@ -136,7 +136,7 @@ def load_patterns(pattern_files):
 	return rtn_patterns
 
 def _is_own_log_line(line):
-	"""True for this process's own syslog/journal lines, not incidental 'firewatch' text."""
+	"""True for this process's own syslog/journal lines, not incidental matching text."""
 	if _OWN_SYSLOG_IDENT_RE.search(line):
 		return True
 	base = os.path.basename(__file__)
@@ -366,10 +366,9 @@ def unit_filename(unit_name):
 
 
 def resolve_executable():
-	for name in ('firewatcher', 'firewatch'):
-		found = shutil.which(name)
-		if found:
-			return os.path.abspath(found)
+	found = shutil.which('firewatcher')
+	if found:
+		return os.path.abspath(found)
 	return os.path.abspath(sys.argv[0])
 
 

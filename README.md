@@ -2,8 +2,6 @@
 
 Watch a log stream (journald, syslog, or any file) for incident patterns, then persist a window of surrounding messages to a durable location — including a network filesystem — so the record survives even if the machine later dies.
 
-`firewatch` is a command alias for `firewatcher`.
-
 The watcher prefers `journalctl --follow` when `journalctl` is on PATH. On hosts without journald it falls back to `/var/log/syslog`, then `/var/log/messages`, or `--log-file`. Running the daemon does not require systemd; only `--install-service` / `--uninstall-service` do.
 
 ## Install
@@ -24,7 +22,7 @@ Requires **Python 3.6+**. No third-party runtime dependencies.
 
 ```bash
 firewatcher /etc/firewatcher/patterns.d
-firewatch -t 300 -o /var/log/captured_messages/ /etc/firewatcher/patterns.d
+firewatcher -t 300 -o /var/log/captured_messages/ /etc/firewatcher/patterns.d
 ```
 
 A directory argument loads every non-hidden pattern file inside it. Files ending in `.regex` are compiled as regular expressions. Any other pattern file is treated as fnmatch (bash-like) substrings, with `*` added on both ends.

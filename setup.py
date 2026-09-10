@@ -14,7 +14,6 @@ setup(
     entry_points={
         'console_scripts': [
             'firewatcher=firewatcher:main',
-            'firewatch=firewatcher:main',
         ],
     },
     classifiers=[

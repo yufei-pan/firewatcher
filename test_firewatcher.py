@@ -220,16 +220,13 @@ def test_get_matched_pattern_returns_regex_span_or_fnmatch():
 def test_own_log_line_skips_syslog_identifier_not_random_substring():
 	patterns = {'fnmatch': {'*error*'}}
 	assert fw.match_patterns('host firewatcher[12]: Capturing logs to /tmp/error', patterns) is False
-	assert fw.match_patterns('host firewatch[99]: Starting firewatcher', patterns) is False
-	assert fw.match_patterns('kernel: firewatch sensor reported an error', patterns) is True
 	assert fw.match_patterns('kernel: hardware error on disk', patterns) is True
 
 
 def test_own_log_line_skips_module_path():
 	base = os.path.basename(fw.__file__)
 	assert fw._is_own_log_line('Traceback in /usr/lib/' + base)
-	assert not fw._is_own_log_line('kernel: firewatch sensor online')
-	assert fw._is_own_log_line('box firewatch[1]: x')
+	assert not fw._is_own_log_line('kernel: watchdog sensor online')
 	assert fw._is_own_log_line('box firewatcher[12]: x')
 	assert not fw._is_own_log_line('box firewatcher: missing pid')
 
@@ -568,8 +565,6 @@ def test_systemd_is_available(tmp_path):
 def test_resolve_executable(monkeypatch):
 	monkeypatch.setattr(fw.shutil, 'which', lambda name: '/usr/bin/firewatcher' if name == 'firewatcher' else None)
 	assert fw.resolve_executable() == '/usr/bin/firewatcher'
-	monkeypatch.setattr(fw.shutil, 'which', lambda name: '/usr/local/bin/firewatch' if name == 'firewatch' else None)
-	assert fw.resolve_executable() == '/usr/local/bin/firewatch'
 	monkeypatch.setattr(fw.shutil, 'which', lambda name: None)
 	assert os.path.isabs(fw.resolve_executable())
 
@@ -862,7 +857,7 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
 	src = open(fw.__file__, encoding='utf-8').read().lower()
 	assert 'nebula' not in src
-	assert fw.version == '1.56'
+	assert fw.version == '1.57'
 	assert fw.__version__ == fw.version
 
 
