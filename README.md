@@ -2,7 +2,7 @@
 
 Watch a log stream (journald, syslog, or any file) for incident patterns, then persist a window of surrounding messages to a durable location — including a network filesystem — so the record survives even if the machine later dies.
 
-This is the PyPI name for the internal `firewatch` tool (in use since 2023). The `firewatch` command remains as an alias. The PyPI name `firewatch` is a different, unrelated project.
+`firewatch` is a command alias for `firewatcher`.
 
 The watcher prefers `journalctl --follow` when `journalctl` is on PATH. On hosts without journald it falls back to `/var/log/syslog`, then `/var/log/messages`, or `--log-file`. Running the daemon does not require systemd; only `--install-service` / `--uninstall-service` do.
 

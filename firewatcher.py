@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 # requires-python = ">=3.6"
 # -*- coding: utf-8 -*-
-"""Watch logs for incident patterns and persist surrounding context.
-
-Formerly the internal ``firewatch`` script. The PyPI package and module are
-``firewatcher``; ``firewatch`` remains a console-script alias.
-"""
+"""Watch logs for incident patterns and persist surrounding context."""
 import argparse
 import fnmatch
 import subprocess
@@ -19,7 +15,7 @@ import datetime
 import os
 import unicodedata
 
-version = '1.55'
+version = '1.56'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
