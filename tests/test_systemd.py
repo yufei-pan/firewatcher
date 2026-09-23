@@ -1,4 +1,5 @@
 import os
+import shlex
 
 import pytest
 
@@ -6,6 +7,34 @@ import firewatcher as fw
 from conftest import parse_cli, ok_systemctl, systemctl_recorder
 
 # --- systemd unit rendering ---
+
+def test_unit_resolves_relative_config_path_before_systemd_changes_directory(tmp_path, monkeypatch):
+    conf = tmp_path / 'firewatcher.conf'
+    conf.write_text('[watch]\npatterns = /etc/firewatcher/patterns.d\n')
+    monkeypatch.chdir(tmp_path)
+    unit = fw.render_unit_file(parse_cli(['--print-unit', '--config', 'firewatcher.conf']), executable='/bin/fw')
+    command = next(line.partition('=')[2] for line in unit.splitlines() if line.startswith('ExecStart='))
+    monkeypatch.chdir('/')
+    resolved = fw.resolve_settings(parse_cli(shlex.split(command)[1:]), environ={})
+    assert resolved.config_path == str(conf)
+    assert resolved.pattern_file == ['/etc/firewatcher/patterns.d']
+
+
+def test_install_existing_config_without_patterns_keeps_default_pattern_directory(tmp_path, monkeypatch):
+    patterns = tmp_path / 'patterns.d'
+    monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(patterns))
+    conf = tmp_path / 'firewatcher.conf'
+    original = '[llm]\nenabled = false\n'
+    conf.write_text(original)
+    args = parse_cli(['--install-service', '--no-enable', '--config', str(conf), '-o', str(tmp_path / 'out')])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    unit = (tmp_path / 'units' / 'firewatcher.service').read_text()
+    command = next(line.partition('=')[2] for line in unit.splitlines() if line.startswith('ExecStart='))
+    resolved = fw.resolve_settings(parse_cli(shlex.split(command)[1:]), environ={})
+    assert resolved.pattern_file == [str(patterns)]
+    assert conf.read_text() == original
+
 
 def test_render_unit_file_uses_pattern_dir_and_output():
     parsed = parse_cli([
@@ -22,21 +51,30 @@ def test_render_unit_file_uses_pattern_dir_and_output():
     assert 'remote-fs.target' in unit
     assert 'KillSignal=SIGINT' in unit
     assert 'Restart=always' in unit
-    assert '/etc/firewatcher/patterns.d' in unit
-    assert '-o /mnt/logs/captured_messages' in unit or '-o "/mnt/logs/captured_messages"' in unit
+    assert 'TimeoutStopSec=85' in unit
+    assert '--config' in unit
+    exec_line = next(line for line in unit.splitlines() if line.startswith('ExecStart='))
+    assert '-o ' not in exec_line
+    assert '/etc/firewatcher/patterns.d' not in exec_line
+    override = fw.render_unit_file(parsed, executable='/usr/local/bin/firewatcher', config_exists=True)
+    assert '-o /mnt/logs/captured_messages' in override or '-o "/mnt/logs/captured_messages"' in override
+    assert '/etc/firewatcher/patterns.d' in override
     assert unit.strip().endswith('WantedBy=multi-user.target')
 
 
 def test_render_unit_skips_journald_after_when_log_file_set():
     parsed = parse_cli(['--print-unit', '--log-file', '/var/log/messages', 'p.txt'])
-    unit = fw.render_unit_file(parsed, executable='/usr/bin/firewatcher')
+    fresh = fw.render_unit_file(parsed, executable='/usr/bin/firewatcher', config_exists=False)
+    assert 'systemd-journald.socket' not in fresh
+    assert '--log-file' not in fresh
+    unit = fw.render_unit_file(parsed, executable='/usr/bin/firewatcher', config_exists=True)
     assert 'systemd-journald.socket' not in unit
     assert '--log-file /var/log/messages' in unit
 
 
 def test_render_unit_quotes_spaces_and_omits_default_flags():
     parsed = parse_cli(['--print-unit', '-o', '/mnt/My Logs/out', 'p.txt'])
-    unit = fw.render_unit_file(parsed, executable='/usr/local/bin/firewatcher')
+    unit = fw.render_unit_file(parsed, executable='/usr/local/bin/firewatcher', config_exists=True)
     assert '"/mnt/My Logs/out"' in unit
     assert '--compress-after-months' not in unit
     assert '--filter_only' not in unit
@@ -46,7 +84,7 @@ def test_render_unit_quotes_spaces_and_omits_default_flags():
         '--capture_line_count_max', '50', '--tail_lines', '8',
         'p.txt',
     ])
-    unit = fw.render_unit_file(parsed, executable='/bin/fw')
+    unit = fw.render_unit_file(parsed, executable='/bin/fw', config_exists=True)
     assert '--filter_only' in unit
     assert '-t 15' in unit
     assert '--compress-after-months 9' in unit
@@ -136,7 +174,13 @@ def test_install_service_writes_unit_and_seeds_examples(tmp_path):
     assert unit_path.is_file()
     text = unit_path.read_text()
     assert 'ExecStart=/usr/local/bin/firewatcher' in text
-    assert str(patterns) in text
+    assert '--config' in text
+    cfg_path = fw.DEFAULT_CONFIG_PATH
+    cfg = open(cfg_path, encoding='utf-8').read()
+    assert str(patterns) in cfg
+    assert str(out) in cfg
+    assert (os.stat(cfg_path).st_mode & 0o777) == 0o600
+    assert str(patterns) not in text
     assert out.is_dir()
     assert (patterns / 'sys_msg.txt').is_file()
     assert (patterns / 'nvme_failure.regex').is_file()

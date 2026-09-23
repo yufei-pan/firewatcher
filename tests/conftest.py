@@ -2,11 +2,21 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import firewatcher as fw  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_firewatcher_config(tmp_path, monkeypatch):
+    """Keep tests off the host config and any secret environment variables."""
+    monkeypatch.setattr(fw, 'DEFAULT_CONFIG_PATH', str(tmp_path / 'firewatcher.conf'))
+    monkeypatch.delenv(fw.LLM_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(fw.NTFY_TOKEN_ENV, raising=False)
 
 
 def parse_cli(argv):

@@ -31,6 +31,13 @@ def test_own_log_line_skips_syslog_identifier_not_random_substring():
     assert fw.match_patterns('kernel: hardware error on disk', patterns) is True
 
 
+def test_own_log_line_skips_self_marker_even_when_it_quotes_a_pattern():
+    patterns = {'fnmatch': {'*panic*', '*I/O error*'}}
+    assert fw.match_patterns('firewatcher-self panic in the summary', patterns) is False
+    assert fw._is_own_log_line('continuation firewatcher-self I/O error')
+    assert fw.match_patterns('kernel panic', patterns) is True
+
+
 def test_own_log_line_skips_module_path():
     base = os.path.basename(fw.__file__)
     assert fw._is_own_log_line('Traceback in /usr/lib/' + base)

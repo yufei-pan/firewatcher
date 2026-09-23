@@ -21,7 +21,9 @@ def test_print_unit_via_main(capsys):
 def test_print_unit_defaults_pattern_dir(capsys):
     rc = fw.main(['--print-unit'])
     assert rc == 0
-    assert fw.DEFAULT_PATTERNS_DIR in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert '--config' in out
+    assert fw.DEFAULT_CONFIG_PATH in out
 
 
 def test_main_requires_pattern_file():
@@ -32,7 +34,8 @@ def test_main_requires_pattern_file():
 
 def test_main_dispatches_install_and_uninstall(monkeypatch):
     seen = {}
-    def fake_install(args):
+
+    def fake_install(args, raw=None):
         seen['install'] = args
         return 0
     def fake_uninstall(args):
@@ -99,7 +102,7 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
     src = open(fw.__file__, encoding='utf-8').read().lower()
     assert 'nebula' not in src
-    assert fw.version == '1.57'
+    assert fw.version == '1.58'
     assert fw.__version__ == fw.version
 
 
@@ -127,7 +130,7 @@ def test_parser_workers_flag():
 def test_main_install_defaults_pattern_dir(monkeypatch):
     seen = {}
 
-    def fake_install(parsed):
+    def fake_install(parsed, raw=None):
         seen['patterns'] = list(parsed.pattern_file)
         return 0
 
