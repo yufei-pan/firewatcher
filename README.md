@@ -34,7 +34,7 @@ On a match, `firewatcher` writes:
 - a per-incident capture under `{output-folder}/{YYYY-MM}/…`
 - a line in `{output-folder}/journal.log`
 
-Live capture is written as lines arrive, so a copy can already be on another filesystem if the host then disappears.
+Live capture is written as lines arrive, so a copy can already be on another filesystem if the host then disappears. Each captured line is flushed as it is written, and the capture file is fsynced at most once a second and when the capture closes, so a host crash loses at most about the last second of it.
 
 ## systemd service
 
@@ -74,7 +74,7 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--filter_only` | Filter existing logs only (`cat` instead of `tail -F`, or `journalctl` without `--follow`) |
 | `--compress-after-months` | Tar.xz monthly dirs after N months (default: 3) |
 | `--delete-after-months` | Delete `YYYY-MM` dirs after N months (default: 0 = never) |
-| `--capture_line_count_max` | Max lines before/after a match (default: 10000) |
+| `--capture_line_count_max` | Max lines before/after a match (default: 10000). Also caps how many recent lines are held in memory |
 | `--config PATH` | INI config file. Default: `/etc/firewatcher/firewatcher.conf` when that file exists. An explicit path must exist |
 | `--llm` / `--no-llm` | Enable or disable LLM analysis of each finished capture |
 | `--llm-base-url URL` | OpenAI-compatible API root, such as `http://127.0.0.1:11434/v1` |

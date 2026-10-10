@@ -16,16 +16,12 @@ import datetime
 import os
 import unicodedata
 import configparser
-import json
 import queue
-import secrets
 import socket
 import syslog
 import threading
-import urllib.error
-import urllib.request
 
-version = '1.58'
+version = '1.59'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -35,10 +31,13 @@ SYSTEMD_RUNTIME_DIR = '/run/systemd/system'
 SYSTEMD_UNIT_DIR = '/etc/systemd/system'
 SLUG_MAX_LEN = 80
 _OWN_SYSLOG_IDENT_RE = re.compile(r'(?:^|\s)firewatcher\[\d+\]:')
+_OWN_FILE_NEEDLE = '/' + os.path.basename(__file__)
+_GLOB_CHARS = frozenset('*?[')
 
 DEFAULT_CONFIG_PATH = '/etc/firewatcher/firewatcher.conf'
 SELF_MARKER = 'firewatcher-self'
 ANALYSIS_QUEUE_MAX = 4
+CAPTURE_SYNC_INTERVAL = 1.0
 OVERFLOW_NOTIFY_TIMEOUT = 5
 PROGRAMMATIC_TITLE_MAX = 120
 NTFY_TITLE_MAX = 200
@@ -168,41 +167,60 @@ def load_patterns(pattern_files):
 
 def _is_own_log_line(line):
 	"""True for this process's own syslog/journal lines, not incidental matching text."""
-	if SELF_MARKER in line:
-		return True
-	if _OWN_SYSLOG_IDENT_RE.search(line):
-		return True
-	base = os.path.basename(__file__)
-	if base and ('/' + base) in line:
-		return True
-	return False
+	return SELF_MARKER in line or _OWN_FILE_NEEDLE in line or _OWN_SYSLOG_IDENT_RE.search(line) is not None
 
-def match_patterns(line, patterns):
-	"""Check if the line matches any of the patterns based on the matching mode."""
-	if _is_own_log_line(line):
-		return False
-	if 'regex' in patterns:
-		if any(regex.search(line) for regex in patterns['regex']):
-			return True
-	if 'fnmatch' in patterns:
-		if any(fnmatch.fnmatch(line, pattern) for pattern in patterns['fnmatch']):
-			return True
-	return False
-	
-def get_matched_pattern(line, patterns):
-	'''Get the first matched pattern for the line'''
-	if 'regex' in patterns:
-		for regex in patterns['regex']:
-			# if regex.search(line):
-			# 	return regex.pattern
+class PatternMatcher(object):
+	"""load_patterns() output compiled once for the per-line hot path.
+
+	A `*text*` fnmatch pattern without wildcards inside is a plain substring test,
+	which is far cheaper than fnmatch's backtracking regex. Patterns are checked in
+	sorted order (regex, then substrings, then wildcard globs) so the label does not
+	depend on set order.
+	"""
+
+	def __init__(self, patterns):
+		self.regexes = sorted(patterns.get('regex', ()), key=lambda regex: (regex.pattern, regex.flags))
+		self.substrings = []
+		self.globs = []
+		for pattern in sorted(patterns.get('fnmatch', ())):
+			inner = pattern[1:-1]
+			if len(pattern) > 2 and pattern[0] == '*' and pattern[-1] == '*' and not _GLOB_CHARS.intersection(inner):
+				self.substrings.append((inner, pattern))
+			else:
+				# fnmatch.fnmatch is fnmatchcase on POSIX; this is its compiled form.
+				self.globs.append((re.compile(fnmatch.translate(pattern)).match, pattern))
+
+	def first_match(self, line):
+		"""Label of the first matching pattern: the regex match text or the fnmatch pattern."""
+		for regex in self.regexes:
 			matched = regex.search(line)
 			if matched:
 				return matched[0]
-	if 'fnmatch' in patterns:
-		for pattern in patterns['fnmatch']:
-			if fnmatch.fnmatch(line, pattern):
+		for needle, pattern in self.substrings:
+			if needle in line:
 				return pattern
-	return None
+		for match, pattern in self.globs:
+			if match(line):
+				return pattern
+		return None
+
+	def find(self, line):
+		"""Like first_match(), but this process's own log lines never match."""
+		label = self.first_match(line)
+		if label is None or _is_own_log_line(line):
+			return None
+		return label
+
+def _as_matcher(patterns):
+	return patterns if isinstance(patterns, PatternMatcher) else PatternMatcher(patterns)
+
+def match_patterns(line, patterns):
+	"""Check if the line matches any of the patterns based on the matching mode."""
+	return _as_matcher(patterns).find(line) is not None
+
+def get_matched_pattern(line, patterns):
+	'''Get the first matched pattern for the line'''
+	return _as_matcher(patterns).first_match(line)
 
 class ConfigError(Exception):
 	"""Raised when the config file or merged settings are unusable."""
@@ -440,6 +458,7 @@ def _ini_text(value):
 
 def _generate_ntfy_url():
 	"""A hostname plus 72 random bits in ntfy's allowed URL-safe alphabet."""
+	import secrets
 	prefix = 'firewatcher-'
 	suffix = secrets.token_urlsafe(9)
 	hostname = re.sub(r'[^A-Za-z0-9_-]+', '-', _hostname()).strip('-_') or 'localhost'
@@ -617,6 +636,10 @@ def _notify_body(text, path):
 
 
 def _urlopen_bytes(url, data, headers, timeout):
+	# Imported on first use: urllib.request pulls in ssl and http.client (about 9 MB RSS),
+	# and only LLM analysis and ntfy pushes need them.
+	import urllib.error
+	import urllib.request
 	request = urllib.request.Request(url, data=data, headers=headers, method='POST')
 	try:
 		with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -631,6 +654,7 @@ def _urlopen_bytes(url, data, headers, timeout):
 
 
 def _parse_llm_object(content):
+	import json
 	text = str(content).strip()
 	if text.startswith('```'):
 		rows = text.splitlines()
@@ -690,6 +714,7 @@ def _capture_excerpt(path, max_bytes):
 
 
 def call_llm(settings, incident):
+	import json
 	excerpt = _capture_excerpt(incident['path'], settings.llm_max_bytes)
 	user = (
 		'Host: %s\nMatched pattern: %s\nMatched line: %s\nCapture path: %s\n\nExcerpt:\n%s'
@@ -857,30 +882,81 @@ def _start_dispatcher(settings):
 		return None
 	return IncidentDispatcher(settings)
 
-def _end_capture(log_file_name, captured_line_counter, capture_line_count_max, incident=None, dispatcher=None):
-	if not log_file_name:
+class CaptureFile(object):
+	"""Append handle kept open for one capture.
+
+	commit() flushes to the OS after each captured line, so losing this process
+	loses nothing. fsync runs at most once per sync_interval and on close, which
+	bounds what a host crash (or an NFS client cache) can lose to about that long.
+	"""
+
+	def __init__(self, path, sync_interval):
+		self.path = path
+		self.sync_interval = sync_interval
+		self.handle = open(path, 'a')
+		self.last_sync = None
+		self.dirty = False
+
+	def write(self, text):
+		self.handle.write(text)
+
+	def commit(self):
+		self.handle.flush()
+		self.dirty = True
+		now = time.time()
+		if self.last_sync is None or now - self.last_sync >= self.sync_interval:
+			self.sync(now)
+
+	def sync_due(self):
+		"""When committed data must be fsynced, or None when nothing is pending."""
+		return self.last_sync + self.sync_interval if self.dirty else None
+
+	def sync(self, now=None):
+		self.handle.flush()
+		try:
+			os.fsync(self.handle.fileno())
+		except OSError:
+			# Some filesystems cannot fsync; the data has still been flushed.
+			pass
+		self.dirty = False
+		self.last_sync = time.time() if now is None else now
+
+	def close(self):
+		try:
+			self.sync()
+		finally:
+			self.handle.close()
+
+def _end_capture(capture, captured_line_counter, capture_line_count_max, incident=None, dispatcher=None):
+	if not capture:
 		return
-	with open(log_file_name, "a") as log_file:
+	try:
 		if captured_line_counter > capture_line_count_max:
-			log_file.write(f"{bcolors.warning}Captured line count exceeded capture_line_count_max {capture_line_count_max}. Truncated to {capture_line_count_max} lines.{bcolors.ENDC}\n")
-		log_file.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
-		log_file.write(f"{bcolors.warning}End of capture at {datetime.datetime.now().isoformat()}{bcolors.ENDC}\n")
-		log_file.write(f"{bcolors.warning}Captured {captured_line_counter} lines after first match.{bcolors.ENDC}\n")
-		log_file.write(bcolors.warning+'-'*80 + bcolors.ENDC +'\n')
+			capture.write(f"{bcolors.warning}Captured line count exceeded capture_line_count_max {capture_line_count_max}. Truncated to {capture_line_count_max} lines.{bcolors.ENDC}\n")
+		capture.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
+		capture.write(f"{bcolors.warning}End of capture at {datetime.datetime.now().isoformat()}{bcolors.ENDC}\n")
+		capture.write(f"{bcolors.warning}Captured {captured_line_counter} lines after first match.{bcolors.ENDC}\n")
+		capture.write(bcolors.warning+'-'*80 + bcolors.ENDC +'\n')
 		print(f"  End of capture at {datetime.datetime.now().isoformat()}")
-		log_file.write('-'*80 +'\n')
+		capture.write('-'*80 +'\n')
+	finally:
+		capture.close()
 	if dispatcher is not None and incident is not None:
 		job = dict(incident)
-		job['path'] = log_file_name
+		job['path'] = capture.path
 		dispatcher.submit(job)
 
 
 def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None):
 	"""Tail the log file and process lines with buffer management."""
-	log_buffer = deque()  # Stores tuples of (read_time, line)
+	matcher = _as_matcher(patterns)
+	# Only the newest capture_line_count_max buffered lines are ever written, so hold no more.
+	buffer_cap = max(0, capture_line_count_max)
+	log_buffer = deque(maxlen=buffer_cap)  # Stores tuples of (read_time, line)
+	dropped_until = None  # read_time of the newest line the cap pushed out of log_buffer
 	log_compressor = Log_Compressor(output_folder, compress_after_months, delete_after_months)
 	capture_until = None
-	log_file_name = None
+	capture = None
 	captured_line_counter = 0
 	processed_line_counter = 0
 	incident = None
@@ -896,17 +972,28 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 			pending_read = None
 			while True:
 				try:
-					if pending_read is None:
-						pending_read = reader.submit(proc.stdout.readline)
-					remaining = None if capture_until is None else max(0, capture_until - time.time())
-					line = pending_read.result(timeout=remaining)
-					pending_read = None
+					if pending_read is None and capture_until is None:
+						# Nothing can time out, so read inline instead of waking the reader thread per line.
+						line = proc.stdout.readline()
+					else:
+						if pending_read is None:
+							pending_read = reader.submit(proc.stdout.readline)
+						deadline = capture_until
+						sync_due = capture.sync_due() if capture else None
+						if sync_due is not None and (deadline is None or sync_due < deadline):
+							deadline = sync_due
+						remaining = None if deadline is None else max(0, deadline - time.time())
+						line = pending_read.result(timeout=remaining)
+						pending_read = None
 				except ReadTimeout:
 					# Keep the same pending read while the source is quiet.
-					_end_capture(log_file_name, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
+					if capture and capture_until is not None and time.time() < capture_until:
+						capture.sync()
+						continue
+					_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
 					capture_until = None
 					captured_line_counter = 0
-					log_file_name = None
+					capture = None
 					continue
 				except KeyboardInterrupt:
 					print("Exiting.")
@@ -926,15 +1013,17 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 				read_time = time.time()
 				processed_line_counter += 1
 
-				# Maintain a 10-minute buffer
+				# Keep capture_time seconds of context, at most buffer_cap lines
 				while log_buffer and read_time - log_buffer[0][0] > capture_time:
 					log_buffer.popleft()
+				if len(log_buffer) == buffer_cap:
+					dropped_until = log_buffer[0][0] if log_buffer else read_time
 				log_buffer.append((read_time, line))
 
 				# if the current line matches the pattern, capture the logs for the next capture_time seconds
-				if match_patterns(line, patterns):
+				matched_pattern = matcher.find(line)
+				if matched_pattern is not None:
 					if not capture_until:
-						matched_pattern = get_matched_pattern(line, patterns)
 						# Dump the buffer to file at output_folder/{Year-Month}/{Day-Hour-Minute-Second}.log
 						log_folder = f"{output_folder}/{datetime.datetime.fromtimestamp(read_time).strftime('%Y-%m')}"
 						os.makedirs(log_folder, exist_ok=True)
@@ -945,59 +1034,56 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							journal_file.write(f"{datetime.datetime.fromtimestamp(read_time).isoformat()} Captured logs for {matched_pattern} to {log_file_name}\n")
 						print(f"Capturing logs to {log_file_name}")
 						incident = {
-							'pattern': matched_pattern if matched_pattern is not None else '',
+							'pattern': matched_pattern,
 							'matched_line': line.strip(),
 							'hostname': _hostname(),
 						}
-						with open(log_file_name, "a") as log_file:
-							log_file.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
-							# Write the matched pattern and the line that matched
-							log_file.write(f"{bcolors.warning}Matched pattern: {bcolors.critical}{matched_pattern}{bcolors.ENDC}\n")
-							print(f"  Matched pattern: {matched_pattern}")
-							log_file.write(f"{bcolors.warning}Matched line:    {line}{bcolors.ENDC}")
-							print(f"  Matched line:    {line.strip()}")
-							log_file.write(f"{bcolors.warning}Captured at:     {datetime.datetime.now().isoformat()}{bcolors.ENDC}\n")
-							print(f"  Captured at:     {datetime.datetime.now().isoformat()}")
-							log_file.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
-							log_file.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(read_time - capture_time).isoformat()}:{bcolors.ENDC}\n")
-							skip_lines = 0
-							if len(log_buffer) > capture_line_count_max:
-								skip_lines = len(log_buffer) - capture_line_count_max
-								log_file.write(f"{bcolors.warning}Captured line count exceeded capture_line_count_max {capture_line_count_max}. Skipping cached {skip_lines} in-memory lines ...{bcolors.ENDC}\n")
-							for i in range(skip_lines, len(log_buffer)):
-								buffered_line = log_buffer[i][1]
-								if match_patterns(buffered_line, patterns):
-									log_file.write(f'{bcolors.critical}-> {buffered_line.strip()}{bcolors.ENDC}\n')
-								else:
-									log_file.write(buffered_line)
+						capture = CaptureFile(log_file_name, CAPTURE_SYNC_INTERVAL)
+						capture.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
+						# Write the matched pattern and the line that matched
+						capture.write(f"{bcolors.warning}Matched pattern: {bcolors.critical}{matched_pattern}{bcolors.ENDC}\n")
+						print(f"  Matched pattern: {matched_pattern}")
+						capture.write(f"{bcolors.warning}Matched line:    {line}{bcolors.ENDC}")
+						print(f"  Matched line:    {line.strip()}")
+						capture.write(f"{bcolors.warning}Captured at:     {datetime.datetime.now().isoformat()}{bcolors.ENDC}\n")
+						print(f"  Captured at:     {datetime.datetime.now().isoformat()}")
+						capture.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
+						capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(read_time - capture_time).isoformat()}:{bcolors.ENDC}\n")
+						if dropped_until is not None and read_time - dropped_until <= capture_time:
+							capture.write(f"{bcolors.warning}Captured line count exceeded capture_line_count_max {capture_line_count_max}. Older cached in-memory lines were dropped ...{bcolors.ENDC}\n")
+						for _buffered_time, buffered_line in log_buffer:
+							if matcher.find(buffered_line) is not None:
+								capture.write(f'{bcolors.critical}-> {buffered_line.strip()}{bcolors.ENDC}\n')
+							else:
+								capture.write(buffered_line)
 					else:
 						# Append the line to the current log file
-						with open(log_file_name, "a") as log_file:
-							log_file.write(f'{bcolors.critical}-> {line.strip()}{bcolors.ENDC}\n')
+						capture.write(f'{bcolors.critical}-> {line.strip()}{bcolors.ENDC}\n')
 						captured_line_counter += 1
+					capture.commit()
 					# If a match is found, set to capture the next capture_time seconds
 					capture_until = read_time + capture_time
-					if log_file_name and captured_line_counter > capture_line_count_max:
-						_end_capture(log_file_name, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
+					if captured_line_counter > capture_line_count_max:
+						_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
 						capture_until = None
 						captured_line_counter = 0
-						log_file_name = None
+						capture = None
 				# if the current line doesn't match the pattern, and capture_until is set and expired, reset capture_until and close the current log file
-				elif log_file_name and ((capture_until and read_time > capture_until) or captured_line_counter > capture_line_count_max):
-					_end_capture(log_file_name, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
+				elif capture and ((capture_until and read_time > capture_until) or captured_line_counter > capture_line_count_max):
+					_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
 					capture_until = None
 					captured_line_counter = 0
-					log_file_name = None
+					capture = None
 				# if the current line doesn't match the pattern, continue to write the logs to the current log file if capture_until is set and not expired
 				elif capture_until and read_time <= capture_until:
-					with open(log_file_name, "a") as log_file:
-						log_file.write(line)
+					capture.write(line)
+					capture.commit()
 					captured_line_counter += 1
 					if captured_line_counter > capture_line_count_max:
-						_end_capture(log_file_name, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
+						_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
 						capture_until = None
 						captured_line_counter = 0
-						log_file_name = None
+						capture = None
 				# if the current line doesn't match the pattern, and capture_until is not set, check for log compression
 				else:
 					log_compressor.compressLogs()
@@ -1005,8 +1091,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					print(f"Processed {processed_line_counter} lines.",flush=True)
 	finally:
 		try:
-			if log_file_name:
-				_end_capture(log_file_name, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
+			if capture:
+				_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher)
 		finally:
 			if dispatcher is not None:
 				dispatcher.close()
@@ -1280,7 +1366,7 @@ def build_parser():
 	filt.add_argument('--filter_only', dest='filter_only', action='store_true', help='Only filter logs and do not wait for new lines. Uses cat instead of tail -F, or journalctl without --follow.')
 	filt.add_argument('--no-filter_only', dest='filter_only', action='store_false', help='Follow new log lines. Overrides filter_only from the config file.')
 	parser.add_argument('--compress-after-months', type=int, default=None, help='Compress logs after this many months. Default: 3 months.')
-	parser.add_argument('--capture_line_count_max', type=int, default=None, help='Maximum number of lines to capture before and after in a single log file. Default: 10000 lines. Note: The final file maybe 2 * this number.')
+	parser.add_argument('--capture_line_count_max', type=int, default=None, help='Maximum number of lines to capture before and after in a single log file. Default: 10000 lines. Note: The final file maybe 2 * this number. Also caps how many recent lines are held in memory.')
 	parser.add_argument('--delete-after-months', type=int, default=None, help='Delete logs after this many months. (will only delete files in YYYY-MM format) Default: 0 (never).')
 	svc = parser.add_mutually_exclusive_group()
 	svc.add_argument('--install-service', action='store_true', help='Install and enable a systemd unit for this command line. Warns and exits if systemd is not available.')

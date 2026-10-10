@@ -2,6 +2,7 @@ import io
 import json
 import sys
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -93,7 +94,7 @@ def test_capture_notifies_without_llm(tmp_path, monkeypatch):
         calls.append((req, timeout))
         return Body(b'ok')
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
     resolved = settings_from(tmp_path, '[notify]\nenabled = true\nntfy_url = https://ntfy.example/alerts\npriority = 4\ntoken = secret\n')
     pat = tmp_path / 'p.txt'
     pat.write_text('HIT\n')
@@ -164,7 +165,7 @@ def test_llm_notify_true_appends_report_and_pushes(tmp_path, monkeypatch):
             return chat(payload)
         return Body(b'ok')
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
     resolved = settings_from(
         tmp_path,
         '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\napi_key = key\n'
@@ -202,7 +203,7 @@ def test_llm_decline_does_not_push(tmp_path, monkeypatch):
         calls.append(req.full_url)
         return chat(payload)
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
     resolved = settings_from(
         tmp_path,
         '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n'
@@ -228,7 +229,7 @@ def test_llm_bad_json_and_http_error_fail_open(tmp_path, monkeypatch):
             return chat('not json')
         return Body(b'ok')
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', bad_json)
+    monkeypatch.setattr(urllib.request, 'urlopen', bad_json)
     resolved = settings_from(
         tmp_path,
         '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\ntimeout = 3\n'
@@ -251,7 +252,7 @@ def test_llm_bad_json_and_http_error_fail_open(tmp_path, monkeypatch):
             raise urllib.error.HTTPError(req.full_url, 503, 'down', {}, io.BytesIO(b'busy'))
         return Body(b'ok')
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', http_down)
+    monkeypatch.setattr(urllib.request, 'urlopen', http_down)
     path2 = tmp_path / 'cap2.log'
     path2.write_text('HIT again\n')
     dispatcher = fw.IncidentDispatcher(resolved, start_thread=True)
@@ -267,7 +268,7 @@ def test_ntfy_failure_is_journaled(tmp_path, monkeypatch):
     def urlopen(req, timeout=None):
         raise urllib.error.URLError('unreachable')
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
     resolved = settings_from(tmp_path, '[notify]\nenabled = true\nntfy_url = https://ntfy.example/alerts\n')
     dispatcher = fw.IncidentDispatcher(resolved, start_thread=True)
     dispatcher.submit(incident(tmp_path / 'cap.log'))
@@ -283,7 +284,7 @@ def test_queue_full_skips_llm_and_notifies_immediately(tmp_path, monkeypatch):
         calls.append((req.full_url, timeout))
         return Body(b'ok')
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
     resolved = settings_from(
         tmp_path,
         '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n'
@@ -302,7 +303,7 @@ def test_queue_full_skips_llm_and_notifies_immediately(tmp_path, monkeypatch):
 
 def test_notify_only_jobs_use_higher_priority(tmp_path, monkeypatch):
     silence_syslog(monkeypatch)
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', lambda *args, **kwargs: Body(b'ok'))
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda *args, **kwargs: Body(b'ok'))
     resolved = settings_from(tmp_path, '[notify]\nenabled = true\nntfy_url = https://ntfy.example/alerts\n')
     dispatcher = fw.IncidentDispatcher(resolved, start_thread=False)
     dispatcher.submit(incident(tmp_path / 'cap.log'))
@@ -351,10 +352,10 @@ def test_helper_edges(tmp_path, monkeypatch, capsys):
     def urlopen(req, timeout=None):
         raise urllib.error.HTTPError(req.full_url, 500, 'err', {}, Boom())
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
     with pytest.raises(RuntimeError, match='HTTP 500'):
         fw._urlopen_bytes('http://llm.example/v1', b'{}', {}, 1)
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', lambda req, timeout=None: Body(b'not-json'))
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda req, timeout=None: Body(b'not-json'))
     settings = settings_from(tmp_path, '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n')
     with pytest.raises(ValueError, match='unreadable'):
         fw.call_llm(settings, incident(path))
@@ -362,7 +363,7 @@ def test_helper_edges(tmp_path, monkeypatch, capsys):
 
 def test_overflow_without_notify_and_unwritable_failure_note(tmp_path, monkeypatch):
     records = silence_syslog(monkeypatch)
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('no http')))
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('no http')))
     resolved = settings_from(tmp_path, '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n')
     dispatcher = fw.IncidentDispatcher(resolved, start_thread=False)
     for index in range(fw.ANALYSIS_QUEUE_MAX):
@@ -385,7 +386,7 @@ def test_llm_without_notify_writes_report_only(tmp_path, monkeypatch):
         calls.append(req.full_url)
         return chat(payload)
 
-    monkeypatch.setattr(fw.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
     resolved = settings_from(
         tmp_path,
         '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n',

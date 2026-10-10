@@ -94,3 +94,36 @@ def test_match_regex_miss_falls_through_to_fnmatch():
     assert fw.get_matched_pattern('xx HIT yy', patterns) == '*HIT*'
     assert fw.match_patterns('nope', patterns) is False
     assert fw.get_matched_pattern('nope', patterns) is None
+
+
+def test_pattern_matcher_agrees_with_fnmatch_for_wildcards_and_literals():
+    import fnmatch
+    pats = ['*I/O error*', '*a?c*', '*[0-9]x*', '*back\\slash*', '*100%*', 'exact', '*[unclosed*', '***']
+    lines = ['sd I/O error', 'zzabczz', 'a?c', 'id 7x', 'back\\slash', 'at 100%', 'exact', 'exactly',
+             '[unclosed', 'nothing', '', 'multi\nline a1c\n']
+    for pat in pats:
+        matcher = fw.PatternMatcher({'fnmatch': {pat}})
+        for line in lines:
+            expected = pat if fnmatch.fnmatch(line, pat) else None
+            assert matcher.first_match(line) == expected, (pat, line)
+
+
+def test_matched_pattern_label_does_not_depend_on_pattern_order():
+    for order in (['*error*', '*disk*'], ['*disk*', '*error*']):
+        assert fw.get_matched_pattern('disk error', {'fnmatch': order}) == '*disk*'
+    regexes = [re.compile(r'sd[a-z]'), re.compile(r'ata\d')]
+    for order in (regexes, regexes[::-1]):
+        assert fw.get_matched_pattern('ata3 sdb fail', {'regex': order}) == 'ata3'
+
+
+def test_own_line_check_runs_only_for_candidate_matches(monkeypatch):
+    calls = []
+    real = fw._is_own_log_line
+    monkeypatch.setattr(fw, '_is_own_log_line', lambda line: calls.append(line) or real(line))
+    matcher = fw.PatternMatcher({'fnmatch': {'*panic*'}, 'regex': {re.compile(r'nvme\d')}})
+    for line in ('quiet line', 'another quiet line', 'host firewatcher[12]: nothing'):
+        assert matcher.find(line) is None
+    assert calls == []
+    assert matcher.find('host firewatcher[12]: panic') is None
+    assert matcher.find('kernel panic') == '*panic*'
+    assert len(calls) == 2

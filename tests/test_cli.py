@@ -102,7 +102,7 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
     src = open(fw.__file__, encoding='utf-8').read().lower()
     assert 'nebula' not in src
-    assert fw.version == '1.58'
+    assert fw.version == '1.59'
     assert fw.__version__ == fw.version
 
 
@@ -142,3 +142,13 @@ def test_main_install_defaults_pattern_dir(monkeypatch):
 def test_print_honors_explicit_flush_false(capsys):
     fw.print('no-force', flush=False)
     assert 'no-force' in capsys.readouterr().out
+
+
+def test_import_leaves_http_and_secret_modules_unloaded():
+    heavy = ('urllib.request', 'http.client', 'ssl', 'json', 'secrets')
+    code = (
+        'import sys; sys.path.insert(0, %r); import firewatcher; '
+        'print(" ".join(m for m in %r if m in sys.modules))'
+    ) % (os.path.dirname(os.path.abspath(fw.__file__)), heavy)
+    loaded = subprocess.run([sys.executable, '-I', '-S', '-c', code], capture_output=True, text=True, check=True).stdout.split()
+    assert loaded == []

@@ -1,4 +1,7 @@
+import collections
 import datetime
+import threading
+import time
 
 import firewatcher as fw
 from conftest import Clock, capture, incident_logs, ScriptedPopen, patch_popen
@@ -157,7 +160,7 @@ def test_capture_skips_excess_pre_match_buffer(tmp_path):
     body = ''.join(f'pre-{i}\n' for i in range(10)) + 'HIT\n'
     out = capture(tmp_path, body, capture_line_count_max=3)
     text = incident_logs(out)[0].read_text()
-    assert 'Skipping cached' in text
+    assert 'Older cached in-memory lines were dropped' in text
     assert 'pre-0' not in text
     assert 'pre-8' in text
     assert 'pre-9' in text
@@ -224,3 +227,121 @@ def test_capture_rematch_extends_window(tmp_path, monkeypatch):
     text = incident_logs(out)[0].read_text()
     assert '-> HIT 2' in text
     assert 'late' in text
+
+
+def run_scripted(tmp_path, monkeypatch, popen, **kw):
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    opts = dict(capture_time=60, output_folder=str(tmp_path / 'out'), compress_after_months=0, delete_after_months=0)
+    opts.update(kw)
+    patch_popen(monkeypatch, popen)
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), **opts)
+    return tmp_path / 'out'
+
+
+def test_pre_match_buffer_is_capped_at_capture_line_count_max(tmp_path, monkeypatch):
+    class RecordingDeque(collections.deque):
+        peak = 0
+
+        def append(self, item):
+            super().append(item)
+            RecordingDeque.peak = max(RecordingDeque.peak, len(self))
+
+    monkeypatch.setattr(fw, 'deque', RecordingDeque)
+    capture(tmp_path, ''.join(f'noise-{i}\n' for i in range(50)), capture_line_count_max=5)
+    assert 0 < RecordingDeque.peak <= 5
+
+
+def test_capture_does_not_report_dropped_lines_that_aged_out(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    popen = ScriptedPopen([
+        ('old-1\n', 0), ('old-2\n', 0), ('old-3\n', 0),
+        ('mid\n', 70), ('HIT now\n', 0),
+    ], clock=clock)
+    out = run_scripted(tmp_path, monkeypatch, popen, capture_line_count_max=2)
+    text = incident_logs(out)[0].read_text()
+    assert 'mid' in text
+    assert 'old-3' not in text
+    assert 'Older cached in-memory lines were dropped' not in text
+
+
+def test_idle_reads_stay_on_the_calling_thread(tmp_path, monkeypatch):
+    threads = []
+
+    class RecordingPopen(ScriptedPopen):
+        def __init__(self, events):
+            super().__init__(events)
+            readline = self.stdout.readline
+
+            def recording_readline():
+                threads.append(threading.current_thread())
+                return readline()
+
+            self.stdout.readline = recording_readline
+
+    run_scripted(tmp_path, monkeypatch, RecordingPopen(['noise\n', 'HIT now\n', 'after\n']))
+    main = threading.current_thread()
+    assert threads[0] is main and threads[1] is main
+    assert threads[2] is not main
+
+
+def test_capture_opens_the_capture_file_once(tmp_path, monkeypatch):
+    opened = []
+    real_open = open
+
+    def counting_open(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(fw, 'open', counting_open, raising=False)
+    out = capture(tmp_path, 'HIT now\n' + ''.join(f'after-{i}\n' for i in range(20)))
+    cap = str(incident_logs(out)[0])
+    assert opened.count(cap) == 1
+    assert 'after-19' in incident_logs(out)[0].read_text()
+
+
+def test_capture_fsyncs_at_most_once_per_interval(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    synced_at = []
+    monkeypatch.setattr(fw.os, 'fsync', lambda fd: synced_at.append(clock.t))
+    popen = ScriptedPopen([
+        ('HIT now\n', 0), ('a\n', 0.125), ('b\n', 0.25), ('c\n', 0.875),
+    ], clock=clock)
+    run_scripted(tmp_path, monkeypatch, popen)
+    start = 1_000_000.0
+    assert synced_at == [start, start + 1.25, start + 1.25]
+
+
+def test_capture_fsyncs_pending_lines_when_source_goes_quiet(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'CAPTURE_SYNC_INTERVAL', 0.05)
+    events = []
+    monkeypatch.setattr(fw.os, 'fsync', lambda fd: events.append('fsync'))
+
+    class QuietStdout:
+        def __init__(self):
+            self.lines = ['HIT now\n', 'more\n']
+
+        def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            time.sleep(0.5)
+            events.append('eof')
+            return ''
+
+    popen = ScriptedPopen([])
+    popen.stdout = QuietStdout()
+    run_scripted(tmp_path, monkeypatch, popen)
+    assert events == ['fsync', 'fsync', 'eof', 'fsync']
+
+
+def test_capture_survives_filesystems_without_fsync(tmp_path, monkeypatch):
+    def no_fsync(fd):
+        raise OSError(22, 'Invalid argument')
+
+    monkeypatch.setattr(fw.os, 'fsync', no_fsync)
+    out = capture(tmp_path, 'HIT now\nafter\n')
+    text = incident_logs(out)[0].read_text()
+    assert 'after' in text
+    assert 'End of capture' in text
