@@ -21,7 +21,7 @@ import socket
 import syslog
 import threading
 
-version = '1.59'
+version = '1.60'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
