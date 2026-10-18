@@ -114,8 +114,8 @@ def test_print_flushes_by_default(capsys):
 def test_module_entrypoint_version():
     result = subprocess.run(
         [sys.executable, str(ROOT / 'firewatcher.py'), '-V'],
-        capture_output=True,
-        text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True,
         check=False,
     )
     assert result.returncode == 0
@@ -150,5 +150,5 @@ def test_import_leaves_http_and_secret_modules_unloaded():
         'import sys; sys.path.insert(0, %r); import firewatcher; '
         'print(" ".join(m for m in %r if m in sys.modules))'
     ) % (os.path.dirname(os.path.abspath(fw.__file__)), heavy)
-    loaded = subprocess.run([sys.executable, '-I', '-S', '-c', code], capture_output=True, text=True, check=True).stdout.split()
+    loaded = subprocess.run([sys.executable, '-I', '-S', '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True).stdout.split()
     assert loaded == []

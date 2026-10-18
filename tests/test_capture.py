@@ -4,7 +4,7 @@ import threading
 import time
 
 import firewatcher as fw
-from conftest import Clock, capture, incident_logs, ScriptedPopen, patch_popen
+from conftest import Clock, capture, incident_logs, ScriptedPopen, patch_popen, REAL_OUTPUT_FOLDER
 
 # --- capture loop ---
 
@@ -19,8 +19,8 @@ def test_capture_messages_returns_on_eof(tmp_path):
 def test_capture_messages_default_output_folder_matches_cli():
     import inspect
     defaults = inspect.signature(fw.capture_messages).parameters
-    assert defaults['output_folder'].default == fw.DEFAULT_OUTPUT_FOLDER
-    assert fw.DEFAULT_OUTPUT_FOLDER == '/var/log/captured_messages/'
+    assert defaults['output_folder'].default == REAL_OUTPUT_FOLDER
+    assert REAL_OUTPUT_FOLDER == '/var/log/captured_messages/'
 
 
 def test_matching_lines_count_toward_capture_cap(tmp_path):
