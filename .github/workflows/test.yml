@@ -7,7 +7,8 @@ permissions:
   contents: read
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    # 24.04, not ubuntu-latest: setup-python has no Python 3.9 for Ubuntu 26.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -21,8 +22,9 @@ jobs:
       - run: python -m pytest -q
   # setup-python no longer ships 3.6, the oldest Python firewatcher supports: it runs in a container
   pytest-py36:
-    runs-on: ubuntu-latest
-    container: python:3.6
+    runs-on: ubuntu-24.04
+    # by digest: the python:3.6 tag gets no updates, and a digest cannot be moved
+    container: python:3.6@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python -m pip install "pytest<7.1"
