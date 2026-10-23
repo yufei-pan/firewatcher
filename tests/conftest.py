@@ -1,6 +1,5 @@
 import os
 import sys
-import threading
 from pathlib import Path
 
 import pytest
@@ -29,7 +28,7 @@ def isolated_firewatcher_config(tmp_path, monkeypatch):
     monkeypatch.delenv(fw.LLM_API_KEY_ENV, raising=False)
     monkeypatch.delenv(fw.NTFY_TOKEN_ENV, raising=False)
     # a SIGHUP flag left set by one test must not reload patterns in the next
-    monkeypatch.setattr(fw, '_reload_requested', threading.Event())
+    monkeypatch.setattr(fw, '_reload_requested', False)
 
 
 def parse_cli(argv):

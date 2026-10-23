@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as ReadTimeout
 import time
 import datetime
 import errno
+import fcntl
+import io
 import os
 import unicodedata
 import configparser
@@ -46,6 +48,8 @@ DEFAULT_BUFFER_MAX_MB = 16
 BUFFER_LINE_OVERHEAD = 96
 # Text gathered before a block of that buffer is compressed, and each compressed block's own bookkeeping.
 BUFFER_BLOCK_BYTES = 64 * 1024
+# The open block is also compressed once its lines take this much memory, which many short lines reach first.
+BUFFER_OPEN_MEMORY = 4 * BUFFER_BLOCK_BYTES
 BUFFER_BLOCK_OVERHEAD = 512
 # Longest line read at once; a longer one arrives in pieces, so one huge line cannot fill memory.
 MAX_LINE_CHARS = 1 << 20
@@ -60,6 +64,8 @@ DEFAULT_POSITION_FILE = '/var/lib/firewatcher/journal.position'
 DEFAULT_RESUME_MAX = 3600
 # The journal position is saved this often while lines arrive, and when firewatcher stops.
 POSITION_SAVE_INTERVAL = 1.0
+# A journal line read this many seconds after its timestamp was logged while firewatcher was stopped.
+BACKLOG_LAG = 2
 # journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
 _ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
 DEFAULT_UNIT_NAME = 'firewatcher'
@@ -91,6 +97,8 @@ RECENT_MONTH_ACTIVITY = 86400
 PURGE_RETRY = 300
 # Free space is checked at least every this many bytes written, besides the once-a-second check.
 CHECK_EVERY_MAX = 8 * 1024 * 1024
+# A capture fsyncs at least every this many characters written, which bounds the text it keeps for a move.
+UNSYNCED_MAX = 1024 * 1024
 # fsync errors that only mean the filesystem cannot fsync; any other error means written data may be lost.
 _FSYNC_UNSUPPORTED = frozenset((errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS))
 _ANSI_RE = re.compile(rb'\x1b\[[0-9;]*m')
@@ -1552,7 +1560,7 @@ class ContextBuffer(object):
 		self.lines_memory += size
 		self.memory += size
 		# Every line comes through here, so only the cheap checks run each time.
-		if self.text_bytes >= BUFFER_BLOCK_BYTES:
+		if self.text_bytes >= BUFFER_BLOCK_BYTES or self.lines_memory >= BUFFER_OPEN_MEMORY:
 			self._seal()
 			self._trim(read_time)
 		elif self.blocks:
@@ -1613,17 +1621,24 @@ class ContextBuffer(object):
 			if read_time >= since and not _covered(skip, seq, seq):
 				yield read_time, seq, line
 
-	def seqs(self, since):
-		"""Yields the sequence numbers of the lines read at or after since, oldest first, without decompressing."""
+	def seq_span(self, since):
+		"""(first, last) sequence numbers of the lines read at or after since, or None; without decompressing."""
+		if self.lines:
+			last = self.first_seq + len(self.lines) - 1
+		elif self.blocks:
+			last = self.blocks[-1][2] + self.blocks[-1][3] - 1
+		else:
+			return None
 		for _first_time, last_time, first_seq, count, times, _lengths, _text, _memory in self.blocks:
 			if last_time < since:
 				continue
 			for index in range(count):
 				if times[index] >= since:
-					yield first_seq + index
+					return first_seq + index, last
 		for index, (read_time, _line) in enumerate(self.lines):
 			if read_time >= since:
-				yield self.first_seq + index
+				return self.first_seq + index, last
+		return None
 
 class CaptureFile(object):
 	"""Append handle kept open for one capture.
@@ -1660,7 +1675,10 @@ class CaptureFile(object):
 		self.handle = None
 		self.saved = False
 		self.closed = False
+		# Whether the capture left a file it had written to, so its lines are not all in self.path.
+		self.moved = False
 		self.unsynced = []  # text written since the last successful fsync
+		self.unsynced_size = 0  # its characters
 		self.last_sync = None
 		self.dirty = False
 		self._move_on(None)
@@ -1673,6 +1691,8 @@ class CaptureFile(object):
 		"""
 		failed = self.path
 		pending = None
+		if self.saved:
+			self.moved = True
 		if self.handle is not None:
 			try:
 				self.handle.close()
@@ -1717,6 +1737,7 @@ class CaptureFile(object):
 			self.written = pending or 0
 			return
 		self.unsynced = []
+		self.unsynced_size = 0
 		_journal(syslog.LOG_ERR, 'no writable folder with free space left for capture %s; its remaining lines are dropped' % failed)
 
 	def _room_left(self, room):
@@ -1749,10 +1770,14 @@ class CaptureFile(object):
 					return
 			self.written += size
 		self.unsynced.append(text)
+		self.unsynced_size += len(text)
 		try:
 			self.handle.write(text)
 		except OSError as exc:
 			self._move_on(exc)
+		# A capture opens with its whole window before the first commit, so bound what is kept for a move.
+		if self.unsynced_size > UNSYNCED_MAX:
+			self._fsync()
 
 	def _flush(self):
 		while self.handle is not None:
@@ -1800,6 +1825,7 @@ class CaptureFile(object):
 				# Some filesystems cannot fsync; the data has still been flushed.
 			break
 		self.unsynced = []
+		self.unsynced_size = 0
 
 	def sync(self, now=None):
 		self._fsync()
@@ -1888,6 +1914,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	journal_position (a JournalPosition) records each line read, and the lines it says were read
 	before the last stop only refill the context.
 	"""
+	global _reload_requested
 	matcher = _as_matcher(patterns)
 	always_matcher = _as_matcher(always_notify_patterns) if always_notify_patterns else None
 	context = ContextBuffer(max(0, capture_time), buffer_max_mb * 1024 * 1024)
@@ -1914,7 +1941,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 		reached_max = capture_ends_by is not None and now >= capture_ends_by
 		_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher,
 					 capture_time_max=capture_time_max if reached_max else None)
-		if capture and capture.saved and written and written['ranges']:
+		# A capture that moved has lines in more than one file, or lost some, so later captures write them again.
+		if capture and capture.saved and not capture.moved and written and written['ranges']:
 			written['path'] = capture.path
 			earlier.append(written)
 		written = None
@@ -1925,23 +1953,25 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 
 	reached_eof = False
 	try:
-		with subprocess.Popen(
-			command_to_run,
-			stdout=subprocess.PIPE,
-			universal_newlines=True,
-			encoding='utf-8',
-			errors='replace',
-		) as proc, ThreadPoolExecutor(max_workers=1) as reader:
+		with subprocess.Popen(command_to_run, stdout=subprocess.PIPE) as proc, ThreadPoolExecutor(max_workers=1) as reader:
+			# Lines end only at \n. Splitting at a bare \r as well would let a message start a line that looks
+			# like a journal entry of its own, with a timestamp the message chose.
+			stream = proc.stdout
+			if isinstance(stream, io.BufferedIOBase):
+				stream = io.TextIOWrapper(stream, encoding='utf-8', errors='replace', newline='\n')
 			pending_read = None
+			line_in_flight = False
 			try:
 				while True:
+					# Set while a line read from the journal is being handled, so a stop then reads it again after the restart.
+					line_in_flight = False
 					try:
 						if pending_read is None and capture_until is None:
 							# Nothing can time out, so read inline instead of waking the reader thread per line.
-							line = proc.stdout.readline(MAX_LINE_CHARS)
+							line = stream.readline(MAX_LINE_CHARS)
 						else:
 							if pending_read is None:
-								pending_read = reader.submit(proc.stdout.readline, MAX_LINE_CHARS)
+								pending_read = reader.submit(stream.readline, MAX_LINE_CHARS)
 							deadline = capture_until
 							sync_due = capture.sync_due() if capture else None
 							if sync_due is not None and (deadline is None or sync_due < deadline):
@@ -1975,8 +2005,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 						continue
 					read_time = time.time()
 					processed_line_counter += 1
-					if _reload_requested.is_set():
-						_reload_requested.clear()
+					if _reload_requested:
+						_reload_requested = False
 						if reload_patterns is not None:
 							try:
 								new_patterns, new_always = reload_patterns()
@@ -1989,6 +2019,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 									len(matcher.regexes), len(matcher.substrings) + len(matcher.globs),
 									', always_notify too' if always_matcher else ''))
 
+					line_time = read_time
 					if journal_position is not None:
 						if journal_position.replaying:
 							replayed_at = journal_position.replay_time(line)
@@ -1997,10 +2028,15 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 								context.append(min(replayed_at, read_time), processed_line_counter, line)
 								continue
 						# Before matching, so a line that crashes firewatcher is not read again after the restart.
+						line_in_flight = True
 						journal_position.saw(line, read_time)
+						# Logged while firewatcher was stopped: its own time, so a match in that backlog has the
+						# capture_time before it as context, not the whole backlog read in the same instant.
+						if journal_position.stamp_time is not None and journal_position.stamp_time < read_time - BACKLOG_LAG:
+							line_time = journal_position.stamp_time
 
 					# Keep capture_time seconds of context, compressed, in at most buffer_max_mb of memory
-					context.append(read_time, processed_line_counter, line)
+					context.append(line_time, processed_line_counter, line)
 
 					# A capture whose window (or capture_time_max) ran out before this line ends first,
 					# so a matching line starts a new capture instead of extending a finished one.
@@ -2033,22 +2069,31 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							capture.write(f"{bcolors.warning}Captured at:     {datetime.datetime.now().isoformat()}{bcolors.ENDC}\n")
 							print(f"  Captured at:     {datetime.datetime.now().isoformat()}")
 							capture.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
-							since = read_time - max(0, capture_time)
+							since = line_time - max(0, capture_time)
 							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(since).isoformat()}:{bcolors.ENDC}\n")
 							if context.dropped_until is not None and context.dropped_until >= since:
 								capture.write(f"{bcolors.warning}Older cached in-memory lines were dropped to stay within buffer_max_mb {buffer_max_mb} MiB ...{bcolors.ENDC}\n")
 							# Lines of the window an earlier capture already holds are left out, with a note per file.
-							while earlier and earlier[0]['last_time'] < since:
+							# The window's lines are numbered first..last; a record wholly before that cannot matter.
+							window = context.seq_span(since)
+							while earlier and (window is None or earlier[0]['last_time'] < since or earlier[0]['ranges'][-1][1] < window[0]):
 								earlier.popleft()
 							held = sorted((low, high, record['path']) for record in earlier for low, high in record['ranges'])
-							skip = [(low, high) for low, high, _path in held]
+							# Neighbouring captures' ranges merged, so a block they hold between them is not decompressed.
+							skip = []
+							for low, high, _path in held:
+								if skip and low <= skip[-1][1] + 1:
+									skip[-1] = (skip[-1][0], max(skip[-1][1], high))
+								else:
+									skip.append((low, high))
 							if held:
 								counts = {}
-								for seq in context.seqs(since):
-									index = bisect.bisect_right(skip, (seq, float('inf'))) - 1
-									if index >= 0 and skip[index][0] <= seq <= skip[index][1]:
-										counts[held[index][2]] = counts.get(held[index][2], 0) + 1
-								for path in sorted(counts, key=lambda path: [r['path'] for r in earlier].index(path)):
+								for low, high, path in held:
+									overlap = min(high, window[1]) - max(low, window[0]) + 1
+									if overlap > 0:
+										counts[path] = counts.get(path, 0) + overlap
+								order = [record['path'] for record in earlier]
+								for path in sorted(counts, key=order.index):
 									capture.write(f"{bcolors.warning}{counts[path]} lines of this window are left out: they are in {path}{bcolors.ENDC}\n")
 							header_end = capture.position()
 							written = {'path': None, 'ranges': [], 'last_time': read_time}
@@ -2075,6 +2120,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							incident['always_notify'] = True
 							incident['always_notify_line'] = line.strip()
 						capture.commit()
+						line_in_flight = False
 						if opened and journal_position is not None:
 							# Now that the capture holds the match, a crash repeats this capture after the restart rather than losing it.
 							journal_position.save(read_time)
@@ -2088,6 +2134,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					elif capture:
 						capture.write(line)
 						capture.commit()
+						line_in_flight = False
 						captured_line_counter += 1
 						if capture.writing:
 							_add_to_ranges(written['ranges'], processed_line_counter)
@@ -2101,6 +2148,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					if processed_line_counter % 10000 == 0:
 						print(f"Processed {processed_line_counter} lines.",flush=True)
 			except KeyboardInterrupt:
+				if line_in_flight and journal_position is not None:
+					journal_position.unsee()
 				print("Exiting.")
 			finally:
 				if not reached_eof:
@@ -2453,6 +2502,11 @@ def _iso_stamp(line):
 	if not matched:
 		return None
 	year, month, day, hour, minute, second = (int(part) for part in matched.group(1, 2, 3, 4, 5, 6))
+	# Log text can look like a stamp: a bare carriage return in a message starts a new line here.
+	try:
+		datetime.datetime(year, month, day, hour, minute, min(second, 59))
+	except ValueError:
+		return None
 	when = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
 	if matched.group(7):
 		offset = int(matched.group(8)) * 3600 + int(matched.group(9)) * 60
@@ -2489,6 +2543,10 @@ class JournalPosition(object):
 		self.changed = False
 		self.next_save = 0
 		self.save_failed = False
+		# The time of self.stamp, for the context: a line read long after it was logged keeps its own time.
+		self.stamp_time = None
+		# What saw() changed for the line being handled, for unsee().
+		self.before = None
 		# While replaying: lines of the saved second read so far, the time of the last one, and whether the saved line was among them.
 		self.seen_in_second = 0
 		self.replay_at = None
@@ -2500,7 +2558,7 @@ class JournalPosition(object):
 		except FileNotFoundError:
 			self.note = 'No journal position saved in %s yet; reading the last %s lines.' % (path, tail_lines)
 			return
-		except (OSError, ValueError, TypeError, KeyError) as exc:
+		except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
 			self.note = 'Cannot read the journal position in %s (%s); reading the last %s lines.' % (path, exc, tail_lines)
 			return
 		saved_time = saved[0]
@@ -2544,15 +2602,22 @@ class JournalPosition(object):
 		if when == saved_time:
 			self.seen_in_second += 1
 			# Counting from where this run's view of that second starts: the line number and digest must both agree.
+			# A run that started with --lines in the middle of a second numbers that second's lines from there, so
+			# identical lines before the saved one can end the replay early: lines are read again, never skipped.
 			if self.seen_in_second >= saved_ordinal and _line_digest(line, stamp_end) == saved_digest:
 				self.found = True
 				self.stamp = line[:stamp_end]
+				self.stamp_time = when
 				self.ordinal = self.seen_in_second
 		self.replay_at = when
 		return when
 
 	def saw(self, line, now):
-		"""Record a line as read; saves the position at most once per POSITION_SAVE_INTERVAL."""
+		"""Record a line as read, before it is handled. The periodic save (at most once per POSITION_SAVE_INTERVAL)
+		runs first, so it never covers a line still being handled; unsee() takes the line back."""
+		if self.changed and now >= self.next_save:
+			self.save(now)
+		self.before = (self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed)
 		if self.stamp is not None and line.startswith(self.stamp):
 			self.ordinal += 1
 		else:
@@ -2560,12 +2625,17 @@ class JournalPosition(object):
 			if stamp is None:
 				return
 			self.stamp = line[:stamp[1]]
+			self.stamp_time = stamp[0]
 			self.ordinal = 1
 		self.last_line = line
 		self.last_end = len(self.stamp)
 		self.changed = True
-		if now >= self.next_save:
-			self.save(now)
+
+	def unsee(self):
+		"""Take back the line saw() recorded last: a stop came before it was handled, so the next run reads it again."""
+		if self.before is not None:
+			self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed = self.before
+			self.before = None
 
 	def save(self, now=None, final=False):
 		"""Write the position atomically; a failure is logged once and retried at the next save."""
@@ -2575,31 +2645,35 @@ class JournalPosition(object):
 		if not self.changed:
 			return
 		self.changed = False
+		import tempfile
 		record = {
 			'time': _iso_stamp(self.last_line)[0],
 			'line': self.ordinal,
 			'sha1': _line_digest(self.last_line, self.last_end),
 		}
-		partial = '%s.%d.tmp' % (self.path, os.getpid())
+		folder = os.path.dirname(self.path) or '.'
+		unfinished = None
 		try:
-			folder = os.path.dirname(self.path)
-			if folder:
-				os.makedirs(folder, exist_ok=True)
-			with open(partial, 'w', encoding='utf-8') as f:
+			os.makedirs(folder, exist_ok=True)
+			# A new file with a name no one can guess, so a link planted in a shared folder is never followed.
+			fd, unfinished = tempfile.mkstemp(prefix=os.path.basename(self.path) + '.', suffix='.tmp', dir=folder)
+			with os.fdopen(fd, 'w', encoding='utf-8') as f:
 				f.write(json.dumps(record) + '\n')
 				if final:
 					f.flush()
 					os.fsync(f.fileno())
-			os.replace(partial, self.path)
+			os.replace(unfinished, self.path)
 		except OSError as exc:
 			self.changed = True
 			if not self.save_failed:
-				_journal(syslog.LOG_ERR, 'cannot save the journal position to %s, so a restart reads the last lines again: %s' % (self.path, exc))
+				_journal(syslog.LOG_ERR, 'cannot save the journal position to %s, so a restart reads the journal again '
+						 'from the last position saved: %s' % (self.path, exc))
 			self.save_failed = True
-			try:
-				os.unlink(partial)
-			except OSError:
-				pass
+			if unfinished is not None:
+				try:
+					os.unlink(unfinished)
+				except OSError:
+					pass
 		else:
 			self.save_failed = False
 
@@ -2654,11 +2728,13 @@ def log_source_command(args):
 		return journal
 	return None
 
-# Set by SIGHUP; the capture loop reloads the pattern files at the next line.
-_reload_requested = threading.Event()
+# Set by SIGHUP; the capture loop reloads the pattern files at the next line. A plain flag, not a
+# threading.Event: the handler runs on the main thread, which may hold the Event's lock in clear().
+_reload_requested = False
 
 def _request_reload(signum, frame):
-	_reload_requested.set()
+	global _reload_requested
+	_reload_requested = True
 
 
 def _load_pattern_sets(pattern_sources, always_notify_sources):
@@ -2704,6 +2780,20 @@ def main(argv=None):
 	if args.install_service:
 		return install_service(resolved, raw=args)
 	print(f"Starting firewatcher v{version}")
+	# SIGHUP reloads the pattern files, but not in a terminal, where it means the terminal went away. It is
+	# handled from here on, so a reload right after a start does not end the process while it starts up.
+	previous_sighup = None
+	if not _isatty(sys.stdin):
+		previous_sighup = signal.signal(signal.SIGHUP, _request_reload)
+	try:
+		return _watch(resolved)
+	finally:
+		if previous_sighup is not None:
+			signal.signal(signal.SIGHUP, previous_sighup)
+
+
+def _watch(resolved):
+	"""Watch the logs with resolved settings until the input ends or firewatcher is stopped."""
 	command_to_run = log_source_command(resolved)
 	if not command_to_run:
 		print("No log file specified and no journalctl / syslog / messages found. Use --log-file. Exiting.")
@@ -2718,8 +2808,12 @@ def main(argv=None):
 		print(f"No usable patterns in {resolved.pattern_file}. Exiting.", file=sys.stderr)
 		return 1
 	journal_position = None
+	position_lock = None
 	if resolved.position_file and command_to_run[0] == 'journalctl' and '--follow' in command_to_run:
-		if _journal_can_resume(command_to_run[0]):
+		position_lock = _lock_position_file(resolved.position_file)
+		if position_lock is None:
+			print(f"Another firewatcher is using the journal position in {resolved.position_file}; reading the last {resolved.tail_lines} lines, without saving a position.")
+		elif _journal_can_resume(command_to_run[0]):
 			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines)
 			command_to_run = journal_position.journal_command(command_to_run)
 			print(journal_position.note)
@@ -2742,10 +2836,6 @@ def main(argv=None):
 	if always_notify_patterns:
 		print(f"Always notify for patterns: {always_notify_patterns}")
 	previous_sigterm = signal.signal(signal.SIGTERM, _stop_on_sigterm)
-	# SIGHUP reloads the pattern files, but not in a terminal, where it means the terminal went away.
-	previous_sighup = None
-	if not _isatty(sys.stdin):
-		previous_sighup = signal.signal(signal.SIGHUP, _request_reload)
 	try:
 		capture_messages(
 			command_to_run, patterns,
@@ -2767,9 +2857,27 @@ def main(argv=None):
 	finally:
 		if previous_sigterm is not None:
 			signal.signal(signal.SIGTERM, previous_sigterm)
-		if previous_sighup is not None:
-			signal.signal(signal.SIGHUP, previous_sighup)
+		if position_lock is not None and position_lock >= 0:
+			os.close(position_lock)
 	return 0
+
+
+def _lock_position_file(path):
+	"""Lock path + '.lock' so two firewatchers never share a journal position; returns the descriptor to close
+	when done, -1 when no lock can be taken there (saving will say why), or None when another process holds it."""
+	try:
+		folder = os.path.dirname(path)
+		if folder:
+			os.makedirs(folder, exist_ok=True)
+		fd = os.open(path + '.lock', os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+	except OSError:
+		return -1
+	try:
+		fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except OSError as exc:
+		os.close(fd)
+		return None if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN) else -1
+	return fd
 
 
 def _isatty(stream):

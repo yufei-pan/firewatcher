@@ -1052,13 +1052,15 @@ def test_context_buffer_ages_out_by_time_and_skips_without_decompressing(monkeyp
     assert entries[0][1] == 4000 and entries[-1][1] == 4999
     assert all(line.startswith('line %05d ' % seq) for _t, seq, line in entries)
     assert [seq for _t, seq, _l in buffer.entries(400.0, skip=[(4000, 4900)])][0] == 4901
-    assert list(buffer.seqs(400.0)) == list(range(4000, 5000))
+    assert buffer.seq_span(400.0) == (4000, 4999)
+    assert buffer.seq_span(500.0) is None
+    assert fw.ContextBuffer(100, 1024).seq_span(0) is None
     real = fw.zlib.decompress
     calls = []
     monkeypatch.setattr(fw.zlib, 'decompress', lambda data: calls.append(1) or real(data))
     list(buffer.entries(0, skip=[(0, 4990)]))
     assert len(calls) <= 1  # only a block that is not wholly skipped
-    list(buffer.seqs(0))
+    buffer.seq_span(0)
     assert len(calls) <= 1
     # 500 s on, everything but the newest line has aged out
     buffer.append(1000.0, 5000, 'newest\n')
@@ -1350,7 +1352,7 @@ def test_sighup_reload_matches_the_next_line_with_the_new_patterns(tmp_path, mon
     assert '-> NEW after' in text
     # OLD was dropped by the reload, so a later OLD line is context, not a match
     assert '-> OLD again' not in text and 'OLD again' in text
-    assert not fw._reload_requested.is_set()
+    assert not fw._reload_requested
 
 
 def test_sighup_reload_failure_keeps_the_old_patterns(tmp_path, monkeypatch, capsys):
@@ -1366,7 +1368,7 @@ def test_sighup_without_a_reloader_changes_nothing(tmp_path, monkeypatch, capsys
     printed = capsys.readouterr().out
     assert 'reloaded patterns' not in printed and 'reloading patterns' not in printed
     assert 'OLD still watched' in incident_logs(out)[0].read_text()
-    assert not fw._reload_requested.is_set()
+    assert not fw._reload_requested
 
 
 def test_load_pattern_sets_drops_an_empty_always_notify_list(tmp_path, capsys):
@@ -1379,3 +1381,83 @@ def test_load_pattern_sets_drops_an_empty_always_notify_list(tmp_path, capsys):
     assert patterns == {'fnmatch': {'*HIT*'}}
     assert always is None
     assert 'no usable always_notify patterns' in capsys.readouterr().out
+
+
+def test_lines_of_a_capture_that_moved_are_written_again(tmp_path, monkeypatch):
+    # Its lines are split between two files, so the next capture writes them again rather than point at one.
+    journal_records(monkeypatch)
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = tmp_path / 'out'
+    fallback = tmp_path / 'fallback'
+    full = {'out': False}
+    monkeypatch.setattr(fw, '_free_space', lambda path: FULL if full['out'] and str(path).startswith(str(out)) else ROOMY)
+
+    class FillingStdout(ScriptedStdout):
+        def readline(self, size=-1):
+            line = super().readline(size)
+            if line.startswith('fill'):
+                full['out'] = True
+            return line
+
+    popen = ScriptedPopen([])
+    popen.stdout = FillingStdout([('ctx\n', 0), ('HIT 1\n', 0), ('a-0\n', 0), ('fill\n', 0), ('a-1\n', 2),
+                                  ('a-2\n', 0), ('a-3\n', 0), ('HIT 2\n', 0)], clock=clock)
+    run_scripted(tmp_path, monkeypatch, popen, fallback_folder=str(fallback), min_free_percent=1, capture_line_count_max=3)
+    assert 'a-0' in incident_logs(out)[0].read_text()
+    second = [p.read_text() for p in incident_logs(fallback) if 'Matched line:    HIT 2' in p.read_text()][0]
+    assert 'left out' not in second
+    assert 'ctx' in second and 'a-0' in second
+
+
+def test_capture_file_moved_only_after_it_held_a_file(tmp_path):
+    blocked = tmp_path / 'blocked'
+    blocked.write_text('a file where a folder should be')
+    capture = fw.CaptureFile([str(blocked / 'x.log'), str(tmp_path / 'ok' / 'x.log')], 1.0)
+    assert capture.saved and not capture.moved
+    capture.write('line\n')
+    capture._move_on(OSError('lost the server'))
+    assert capture.moved
+    capture.close()
+
+
+def test_capture_file_bounds_text_kept_for_a_move(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'UNSYNCED_MAX', 1000)
+    fsyncs = []
+    real_fsync = fw.os.fsync
+    monkeypatch.setattr(fw.os, 'fsync', lambda fd: fsyncs.append(fd) or real_fsync(fd))
+    capture = fw.CaptureFile(str(tmp_path / 'x.log'), 1.0)
+    for i in range(100):
+        capture.write('line %03d %s\n' % (i, 'x' * 90))
+        assert capture.unsynced_size <= 1000 and sum(map(len, capture.unsynced)) == capture.unsynced_size
+    assert len(fsyncs) >= 9
+    capture.close()
+    assert (tmp_path / 'x.log').read_text().count('line ') == 100
+
+
+def test_storm_captures_do_not_decompress_what_earlier_ones_hold(tmp_path, monkeypatch):
+    real = fw.zlib.decompress
+    calls = []
+    monkeypatch.setattr(fw.zlib, 'decompress', lambda data: calls.append(1) or real(data))
+    body = ''.join('HIT %05d %s\n' % (i, random_text(100)) for i in range(6000))
+    out = capture(tmp_path, body, capture_line_count_max=50)
+    captures = incident_logs(out)
+    assert len(captures) > 100
+    # at most the block still open to new lines, per capture
+    assert len(calls) <= 2 * len(captures)
+    every = re.findall(r'HIT (\d{5})', ''.join(p.read_text().split('Logs since', 1)[1] for p in captures))
+    assert len(every) == len(set(every)) == 6000
+
+
+def test_a_carriage_return_does_not_split_a_line(tmp_path):
+    out = capture(tmp_path, 'x\r2000-01-01T00:00:00Z HIT that looks like its own entry\nafter\n')
+    data = incident_logs(out)[0].read_bytes()
+    assert b'Matched line:    x\r2000-01-01T00:00:00Z HIT' in data
+
+
+def test_context_buffer_compresses_many_short_lines_early():
+    buffer = fw.ContextBuffer(10 ** 9, 1024 * 1024)
+    for seq in range(200000):
+        buffer.append(float(seq), seq, '%d\n' % (seq % 10))
+        assert buffer.lines_memory < fw.BUFFER_OPEN_MEMORY + 200
+    assert buffer.memory <= 1024 * 1024 + fw.BUFFER_OPEN_MEMORY + 64 * 1024

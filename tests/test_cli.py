@@ -351,3 +351,21 @@ def test_parser_accepts_hyphenated_spellings():
     assert parsed.filter_only is True
     assert parsed.capture_line_count_max == 7
     assert parse_cli(['--no-filter-only', 'p.txt']).filter_only is False
+
+
+def test_sighup_is_handled_from_the_start(tmp_path, monkeypatch):
+    # a reload right after a start must not end the process while it loads patterns or probes journalctl
+    seen = {}
+
+    def source(resolved):
+        seen['sighup'] = signal.getsignal(signal.SIGHUP)
+        return None
+
+    monkeypatch.setattr(fw, 'log_source_command', source)
+    monkeypatch.setattr(sys, 'stdin', _Stdin(False))
+    before = signal.getsignal(signal.SIGHUP)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    assert fw.main([str(pat)]) == 1
+    assert seen['sighup'] is fw._request_reload
+    assert signal.getsignal(signal.SIGHUP) == before

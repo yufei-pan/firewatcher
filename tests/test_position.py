@@ -1,5 +1,7 @@
+import datetime
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -61,7 +63,9 @@ def test_iso_stamp_reads_journalctl_short_iso(text, expected):
     assert text[end:] == 'host a: x'
 
 
-@pytest.mark.parametrize('text', ['Jan 15 08:00:00 host a: x', '    continued', '-- Boot 0123abcd --', '2027-01-15T08:00:00+0000'])
+@pytest.mark.parametrize('text', ['Jan 15 08:00:00 host a: x', '    continued', '-- Boot 0123abcd --', '2027-01-15T08:00:00+0000',
+                                  '0000-01-01T00:00:00Z x', '2027-13-01T00:00:00Z x', '2027-00-01T00:00:00Z x',
+                                  '2027-02-30T00:00:00Z x', '2027-01-15T25:61:00+0000 x'])
 def test_iso_stamp_rejects_other_lines(text):
     assert fw._iso_stamp(text) is None
 
@@ -156,14 +160,16 @@ def test_saw_saves_once_per_interval_and_round_trips(tmp_path):
     path = tmp_path / 'state' / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
     position.saw(jline(0, 'a'), 100.0)
-    assert json.loads(path.read_text())['line'] == 1
+    # a save covers only lines already handled, so 'a' is saved when the next line comes
+    assert not path.exists()
     position.saw(jline(0, 'b'), 100.5)
-    position.saw('    b continued\n', 100.6)
     assert json.loads(path.read_text())['line'] == 1
+    position.saw('    b continued\n', 100.6)
     position.saw(jline(0, 'c'), 101.0)
+    assert json.loads(path.read_text())['line'] == 1
+    position.saw(jline(1, 'd'), 101.5)
     saved = json.loads(path.read_text())
     assert saved['time'] == T and saved['line'] == 3
-    position.saw(jline(1, 'd'), 101.5)
     position.save(final=True)
     assert json.loads(path.read_text())['line'] == 1
     assert not [name for name in os.listdir(str(path.parent)) if name.endswith('.tmp')]
@@ -461,3 +467,165 @@ def test_a_quiet_journal_during_a_capture_still_saves_the_position(tmp_path, mon
                         journal_position=fw.JournalPosition(str(path), now=T))
     # 'HIT two' only extended the open capture, so no save came with it: the quiet wait saved it
     assert seen_while_quiet == [2]
+
+
+def test_a_carriage_return_fragment_that_looks_like_a_stamp_is_harmless(tmp_path, monkeypatch):
+    # journalctl --all passes a bare CR through, and reading text splits the line there
+    position = fw.JournalPosition(str(tmp_path / 'journal.position'), now=T)
+    patch_popen(monkeypatch, ScriptedPopen([jline(0, 'before'), '0000-01-01T00:00:00Z poison\n', '2026-13-01T00:00:00Z poison\n', jline(1, 'after')]))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                        compress_after_months=0, delete_after_months=0, journal_position=position)
+    assert json.loads((tmp_path / 'journal.position').read_text())['time'] == T + 1
+
+
+def _stopped_run(tmp_path, monkeypatch, lines, stop_at=None):
+    position = fw.JournalPosition(str(tmp_path / 'journal.position'), now=T)
+    real_write = fw.CaptureFile.write
+
+    def write(self, text):
+        if stop_at is not None and stop_at in text:
+            raise KeyboardInterrupt  # where SIGINT or SIGTERM would land
+        return real_write(self, text)
+
+    monkeypatch.setattr(fw.CaptureFile, 'write', write)
+    patch_popen(monkeypatch, ScriptedPopen(lines))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                        compress_after_months=0, delete_after_months=0, journal_position=position)
+    monkeypatch.setattr(fw.CaptureFile, 'write', real_write)
+    return fw.JournalPosition(str(tmp_path / 'journal.position'), now=T + 5)
+
+
+def test_a_stop_while_a_line_is_handled_reads_it_again(tmp_path, monkeypatch):
+    lines = [jline(0, 'HIT'), jline(0, 'post-1'), jline(1, 'post-2'), jline(1, 'post-3')]
+    again = _stopped_run(tmp_path, monkeypatch, lines, stop_at='post-2')
+    assert replay(again, lines) == ['old', 'old', 'new', 'new']
+
+
+def test_a_stop_between_lines_keeps_the_last_one_read(tmp_path, monkeypatch):
+    lines = [jline(0, 'HIT'), jline(0, 'post-1'), KeyboardInterrupt()]
+    again = _stopped_run(tmp_path, monkeypatch, lines)
+    assert replay(again, lines[:2] + [jline(1, 'next')]) == ['old', 'old', 'new']
+
+
+def test_a_stop_after_a_match_is_captured_does_not_capture_it_again(tmp_path, monkeypatch):
+    class StopAtOpen(fw.JournalPosition):
+        def save(self, now=None, final=False):
+            if not final:
+                raise KeyboardInterrupt  # lands as the capture that holds the match is saved
+            super().save(now, final)
+
+    patch_popen(monkeypatch, ScriptedPopen([jline(0, 'HIT'), jline(0, 'post-1')]))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                        compress_after_months=0, delete_after_months=0,
+                        journal_position=StopAtOpen(str(tmp_path / 'journal.position'), now=T))
+    again = fw.JournalPosition(str(tmp_path / 'journal.position'), now=T + 5)
+    assert replay(again, [jline(0, 'HIT'), jline(0, 'post-1')]) == ['old', 'new']
+
+
+def test_a_stop_after_a_line_is_written_does_not_read_it_again(tmp_path, monkeypatch):
+    real_end = fw._end_capture
+    calls = []
+
+    def stop_once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise KeyboardInterrupt  # lands as the line cap ends the capture, after post-2 is written
+        return real_end(*args, **kwargs)
+
+    monkeypatch.setattr(fw, '_end_capture', stop_once)
+    lines = [jline(0, 'HIT'), jline(0, 'post-1'), jline(0, 'post-2'), jline(1, 'post-3')]
+    patch_popen(monkeypatch, ScriptedPopen(lines))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                        compress_after_months=0, delete_after_months=0, capture_line_count_max=1,
+                        journal_position=fw.JournalPosition(str(tmp_path / 'journal.position'), now=T))
+    again = fw.JournalPosition(str(tmp_path / 'journal.position'), now=T + 5)
+    assert replay(again, lines) == ['old', 'old', 'old', 'new']
+
+
+@pytest.mark.parametrize('content', ['{"time": 1e400, "line": 1, "sha1": "x"}', '{"time": Infinity, "line": 1, "sha1": "x"}'])
+def test_an_infinite_time_in_the_position_file_reads_the_last_lines(tmp_path, content):
+    path = tmp_path / 'journal.position'
+    path.write_text(content)
+    position = fw.JournalPosition(str(path), now=T)
+    assert position.since is None and 'Cannot read the journal position' in position.note
+
+
+def test_save_never_follows_a_link_planted_where_the_file_is_written(tmp_path):
+    victim = tmp_path / 'victim'
+    victim.write_text('keep me')
+    path = tmp_path / 'journal.position'
+    (tmp_path / ('journal.position.%d.tmp' % os.getpid())).symlink_to(victim)
+    position = fw.JournalPosition(str(path), now=T)
+    position.saw(jline(0, 'a'), 100.0)
+    position.save(final=True)
+    assert victim.read_text() == 'keep me'
+    assert json.loads(path.read_text())['time'] == T
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.endswith('.tmp')) == ['journal.position.%d.tmp' % os.getpid()]
+
+
+def test_lines_logged_while_stopped_keep_their_own_time_as_context(tmp_path, monkeypatch):
+    # 40 minutes of backlog, one line a minute, read in the same instant; then a match in it
+    base = int(time.time()) - 2400
+    lines = ['%s host app[1]: backlog %02d\n' % (time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime(base + 60 * i)), i) for i in range(30)]
+    lines.append('%s host app[1]: HIT in the backlog\n' % time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime(base + 60 * 30 - 30)))
+    patch_popen(monkeypatch, ScriptedPopen(lines))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    out = tmp_path / 'out'
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=120, output_folder=str(out),
+                        compress_after_months=0, delete_after_months=0,
+                        journal_position=fw.JournalPosition(str(tmp_path / 'journal.position')))
+    text = incident_logs(out)[0].read_text()
+    # the two minutes before the match, by the time each line was logged
+    assert re.findall(r'backlog (\d+)', text) == ['28', '29']
+    assert 'Logs since %s' % datetime.datetime.fromtimestamp(base + 60 * 30 - 30 - 120).isoformat() in text
+
+
+def test_a_second_firewatcher_does_not_share_the_journal_position(tmp_path, monkeypatch, capsys):
+    import fcntl
+    held = os.open(fw.DEFAULT_POSITION_FILE + '.lock', os.O_RDWR | os.O_CREAT)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        pat = tmp_path / 'p.txt'
+        pat.write_text('HIT\n')
+        seen = _main_with(monkeypatch, [str(pat)])
+        assert seen['journal_position'] is None and '--output=short-iso' not in seen['command']
+        assert 'Another firewatcher is using the journal position' in capsys.readouterr().out
+    finally:
+        os.close(held)
+    # once it is free, and after a run that used it, the next run takes it
+    assert _main_with(monkeypatch, [str(pat)])['journal_position'] is not None
+    assert _main_with(monkeypatch, [str(pat)])['journal_position'] is not None
+
+
+def test_a_position_folder_that_cannot_be_made_still_runs(tmp_path, monkeypatch):
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('a file where a folder should be')
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    seen = _main_with(monkeypatch, ['--position-file', str(blocker / 'journal.position'), str(pat)])
+    assert seen['journal_position'] is not None
+
+
+def test_a_match_in_the_saved_second_keeps_its_own_time(tmp_path, monkeypatch):
+    stopped = int(time.time()) - 600
+    stamp = time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime(stopped))
+    saved_line = '%s host app[1]: last line read\n' % stamp
+    end = fw._iso_stamp(saved_line)[1]
+    path = tmp_path / 'journal.position'
+    path.write_text(json.dumps({'time': stopped, 'line': 1, 'sha1': fw._line_digest(saved_line, end)}))
+    patch_popen(monkeypatch, ScriptedPopen([saved_line, '%s host app[1]: HIT logged as it stopped\n' % stamp]))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    out = tmp_path / 'out'
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(out),
+                        compress_after_months=0, delete_after_months=0, journal_position=fw.JournalPosition(str(path), context_time=60))
+    assert 'Logs since %s' % datetime.datetime.fromtimestamp(stopped - 60).isoformat() in incident_logs(out)[0].read_text()
