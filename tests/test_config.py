@@ -428,6 +428,7 @@ def test_disk_and_memory_limits_load_and_validate(tmp_path):
 
 @pytest.mark.parametrize('text, message', [
     ('[watch]\nmin_free_percent = 100\n', 'watch.min_free_percent'),
+    ('[watch]\nmin_free_percent = 51\n', 'watch.min_free_percent must be 0 to 50'),
     ('[watch]\nmin_free_percent = -1\n', 'watch.min_free_percent'),
     ('[watch]\nmin_free_percent = lots\n', 'invalid number for watch.min_free_percent'),
     ('[watch]\nbuffer_max_mb = 0\n', 'watch.buffer_max_mb'),
@@ -449,3 +450,9 @@ def test_main_passes_the_disk_and_memory_limits(tmp_path, monkeypatch, capsys):
     assert fw.main(['--filter_only', '--log-file', str(src), '--min-free-percent', '3', '--buffer-max-mb', '2', str(pat)]) == 0
     assert (seen['min_free_percent'], seen['buffer_max_mb']) == (3, 2)
     assert 'Keeping at least 3% free' in capsys.readouterr().out
+
+
+def test_cli_accepts_a_percent_sign():
+    assert parse_cli(['--min-free-percent', '1%', 'p.txt']).min_free_percent == 1
+    with pytest.raises(SystemExit):
+        parse_cli(['--min-free-percent', 'lots', 'p.txt'])

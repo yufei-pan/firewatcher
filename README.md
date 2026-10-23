@@ -50,9 +50,18 @@ The fallback needs the failure to come back as an error. On an NFS mount with th
 
 ### Disk and memory limits
 
-firewatcher never takes a filesystem below `--min-free-percent` free (default 1%, counted as `df` does, so the root-reserved blocks are left alone). It checks when a capture opens, about once a second while one is written, and whenever half the room it last saw has been written, so even a capture written faster than that stops at the floor, give or take one line. Near the floor, it deletes its own oldest months in that folder, archives and directories alike, never the current month or the one being written, and logs each deletion. If that is not enough, the capture moves to the fallback folder, or stops being written there, with a note; the incident is still logged and pushed. Since everything else on the disk fills it first, firewatcher's captures are the last thing to go.
+firewatcher keeps the filesystems it writes captures to above `--min-free-percent` free (default 1%, counted as `df` does, so the root-reserved blocks are left alone). It checks when a capture opens, about once a second while one is written, and whenever half the room it last saw has been written, fsyncing first so the filesystem, an NFS server included, counts every byte. A line that would cross the floor is not written there, so a capture stops at the floor even when written fast.
 
-Memory is bounded too. The lines kept before a match are capped at `--capture-line-count-max` lines and `--buffer-max-mb` (default 16 MiB, counting the text plus about 128 bytes of bookkeeping per line); past either, the oldest lines are dropped and the capture says so. A line longer than 1 MiB is read in pieces. The LLM excerpt reads at most `max_bytes` of a capture.
+Near the floor, firewatcher may delete its own oldest months in that folder, so a new incident can be recorded, under these rules:
+
+- **What:** only what firewatcher itself creates: `YYYY-MM` folders, `YYYY-MM[.N].tar.xz` archives, and their `.partial` files. A month counts as a whole.
+- **Never:** the current month, the month being written, or a month with anything changed in the last day, since another firewatcher may be writing there.
+- **How much:** only as many months as it takes, counted by their size on disk, and nothing at all if deleting every one of them still could not make room. That happens when something else filled the disk, and then the history is kept.
+- **How often:** at most once an hour per folder, so a disk that something else keeps filling drains firewatcher's history slowly. Each deletion is logged.
+
+If there is still no room, the capture moves to the fallback folder with a note, or, with no folder left, stops being written, which is logged; the incident is still pushed. Compression also keeps to the floor: a month whose archive could cross it is left uncompressed for now. `--delete-after-months 0` means nothing is deleted by age; the floor can still delete the oldest months. Set `--min-free-percent 0` to turn all of this off.
+
+Memory is bounded too. The lines kept before a match are capped at `--capture-line-count-max` lines and `--buffer-max-mb` (default 16 MiB, measured as Python's own size of each line plus about 96 bytes of bookkeeping); past either, the oldest lines are dropped and the capture says so. A line longer than 1 MiB is read in pieces, and each piece is matched on its own, so a pattern split across the 1 MiB boundary is missed. The LLM excerpt reads at most `max_bytes` of a capture.
 
 Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`. The directory is removed only after `tar` succeeds and the archive is synced to disk. An existing archive is never overwritten: the new one becomes `YYYY-MM.1.tar.xz`, and so on.
 
@@ -97,10 +106,10 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--tail-lines` | Lines to start with (default: 20; `+N` from line N, not with journalctl) |
 | `--filter-only` | Filter existing logs only (`cat` instead of `tail -F`, or `journalctl` without `--follow`). Windows are measured in read time, not log time, and existing logs are read far faster than they were written, so `-t` and `--capture-time-max` barely limit a capture: it usually runs to `--capture-line-count-max` lines or the end of the input |
 | `--compress-after-months` | Tar.xz monthly dirs after N months (default: 3) |
-| `--delete-after-months` | Delete `YYYY-MM` dirs after N months (default: 0 = never) |
+| `--delete-after-months` | Delete `YYYY-MM` dirs after N months (default: 0 = never by age; the free-space floor can still delete the oldest months) |
 | `--capture-line-count-max` | Max lines before/after a match (default: 10000). Also caps how many recent lines are held in memory |
 | `--buffer-max-mb` | Memory, in MiB, for the lines kept before a match (default: 16). The oldest lines are dropped past it |
-| `--min-free-percent` | Free-space floor for the filesystems captures go to (default: 1; 0 disables). See below |
+| `--min-free-percent` | Free-space floor, 0–50%, for the filesystems captures go to (default: 1; 0 disables). See [Disk and memory limits](#disk-and-memory-limits) |
 | `--config PATH` | INI config file. Default: `/etc/firewatcher/firewatcher.conf` when that file exists. An explicit path must exist |
 | `--llm` / `--no-llm` | Enable or disable LLM analysis of each finished capture |
 | `--llm-base-url URL` | OpenAI-compatible API root, such as `http://127.0.0.1:11434/v1` |
@@ -151,7 +160,7 @@ always_notify =
 
 `patterns` and `always_notify` are one path per line, or comma-separated. Positional pattern arguments replace the `patterns` list.
 
-Out-of-range values stop `firewatcher` at startup: a negative time or count, `capture_time` over 7 days or `capture_time_max` over 30 days, a timeout of 0 or less or over a day, an ntfy priority outside 1–5, or an LLM or ntfy URL that does not start with `http://` or `https://` or that contains spaces.
+Out-of-range values stop `firewatcher` at startup: a negative time or count, `capture_time` over 7 days or `capture_time_max` over 30 days, `min_free_percent` outside 0–50, `buffer_max_mb` below 1, a timeout of 0 or less or over a day, an ntfy priority outside 1–5, or an LLM or ntfy URL that does not start with `http://` or `https://` or that contains spaces.
 
 `api_key` under `[llm]` and `token` under `[notify]` are not command-line flags. `FIREWATCHER_LLM_API_KEY` and `FIREWATCHER_NTFY_TOKEN` override them when set. `--install-service` creates `/etc/firewatcher/firewatcher.conf` with mode `0600` only when it is missing, and the unit runs `firewatcher --config` that path. An existing file is left as it is. Flags passed to a later install are appended on `ExecStart` so they override the file.
 
