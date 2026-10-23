@@ -1171,3 +1171,15 @@ def test_writes_check_before_leaving_less_than_the_margin(tmp_path):
     cap.close()
     assert (tmp_path / 'a.log').read_text() == ''
     assert 'x' * 10_000 in (tmp_path / 'b.log').read_text()
+
+
+def test_a_hard_linked_month_counts_as_freeing_nothing(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    months(out, **{'2019-01': 200_000})
+    os.link(str(out / '2019-01' / 'x.log'), str(tmp_path / 'backup.log'))  # a backup elsewhere on the disk
+    os.utime(str(out / '2019-01'), (TWO_DAYS_AGO, TWO_DAYS_AGO))
+    disk = FakeDisk(monkeypatch, tmp_path, 10_000_000)
+    disk.set_headroom(-10_000, 0.10)
+    assert guard_for(out).headroom(str(out / '2026-10' / 'hit.log')) < fw.MIN_HEADROOM
+    assert (out / '2019-01').is_dir()  # deleting it could not have made room, so it is kept

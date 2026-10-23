@@ -126,7 +126,7 @@ def _month_of(name):
 	return matched.group(1)
 
 def _entry_stats(path):
-	"""(bytes on disk, newest change time, devices) of path and, for a folder, everything in it.
+	"""(bytes deleting it would free, newest change time, devices) of path and, for a folder, everything in it.
 
 	Symlinks are not followed. More than one device means another filesystem is mounted inside.
 	"""
@@ -134,7 +134,7 @@ def _entry_stats(path):
 		st = os.lstat(path)
 	except OSError:
 		return 0, 0, set()
-	total, newest, devices = st.st_blocks * 512, st.st_mtime, {st.st_dev}
+	total, newest, devices = _freed_by_delete(st), st.st_mtime, {st.st_dev}
 	if stat.S_ISDIR(st.st_mode):
 		for folder, dirs, files in os.walk(path):
 			for name in dirs + files:
@@ -142,10 +142,14 @@ def _entry_stats(path):
 					entry = os.lstat(os.path.join(folder, name))
 				except OSError:
 					continue
-				total += entry.st_blocks * 512
+				total += _freed_by_delete(entry)
 				newest = max(newest, entry.st_mtime)
 				devices.add(entry.st_dev)
 	return total, newest, devices
+
+def _freed_by_delete(st):
+	# A file with other hard links frees nothing when this name goes.
+	return st.st_blocks * 512 if stat.S_ISDIR(st.st_mode) or st.st_nlink == 1 else 0
 
 class Log_Compressor:
 	def __init__(self, logsDir, compressAfterMonths, deleteLogAfterMonths, background=False, guard=None):
