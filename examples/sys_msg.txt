@@ -1,7 +1,8 @@
 hard resetting link
 Initializing cgroup subsys cpuset
 Linux version
-Out of Memory
+Out of memory
+out of memory: Killed process
 Call Trace
 I/O error
 bad sector
@@ -13,3 +14,4 @@ timeout, reset controller
 timeout, disable controller
 iotest: 1% high is too high compared to 1% low!
 Hardware error
+Hardware Error

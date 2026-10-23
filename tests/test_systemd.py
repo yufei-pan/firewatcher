@@ -430,3 +430,20 @@ def test_render_unit_resolves_executable_when_omitted(monkeypatch):
     monkeypatch.setattr(fw, 'resolve_executable', lambda: '/opt/bin/firewatcher')
     unit = fw.render_unit_file(parse_cli(['--print-unit', 'p.txt']))
     assert 'ExecStart=/opt/bin/firewatcher' in unit
+
+
+def test_unit_passes_new_flags_when_config_exists():
+    raw = parse_cli(['--capture-time-max', '600', '--fallback-folder', '', '--always-notify', '/a', '--always-notify', '/b', 'p.txt'])
+    parts = fw._explicit_cli_args(raw)
+    assert parts[:2] == ['--capture-time-max', '600']
+    assert ['--fallback-folder', ''] == parts[2:4]
+    assert parts[4:8] == ['--always-notify', '/a', '--always-notify', '/b']
+
+
+def test_install_warns_when_the_topic_goes_on_execstart(tmp_path, capsys, monkeypatch):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\npatterns = %s\n' % (tmp_path / 'patterns.d'))
+    args = parse_cli(['--config', str(conf), '--ntfy-url', 'https://ntfy.example/secret-topic', '-o', str(tmp_path / 'out')])
+    rc = fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'), systemctl=ok_systemctl, executable='/bin/fw')
+    assert rc == 0
+    assert 'any user can read it' in capsys.readouterr().err
