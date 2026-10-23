@@ -104,7 +104,7 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
     src = open(fw.__file__, encoding='utf-8').read().lower()
     assert 'nebula' not in src
-    assert fw.version == '1.60'
+    assert fw.version == '1.61'
     assert fw.__version__ == fw.version
 
 

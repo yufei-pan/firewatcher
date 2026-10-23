@@ -24,7 +24,7 @@ import stat
 import syslog
 import threading
 
-version = '1.60'
+version = '1.61'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -63,9 +63,9 @@ COMPRESS_INTERVAL = 172800
 LOW_SPACE_REASON = 'because free space there fell below the floor'
 # Room above the free-space floor below which old months are deleted, and then a capture moves on.
 MIN_HEADROOM = 64 * 1024
-# At most one deletion of old months per folder this often, so a disk that something else keeps
-# filling drains firewatcher's history slowly: its captures go last.
-PURGE_INTERVAL = 3600
+# Default for purge_interval: at most one deletion of old months per folder this often, so a disk that
+# something else keeps filling drains firewatcher's history slowly: its captures go last.
+DEFAULT_PURGE_INTERVAL = 3600
 # A month with anything changed this recently is never deleted: another firewatcher may be using it.
 RECENT_MONTH_ACTIVITY = 86400
 # After a purge that could not make room, or freed nothing, how long until the next try there.
@@ -378,14 +378,17 @@ class DiskGuard(object):
 	as statvfs reports it: nothing else ever authorizes a write. When fewer than MIN_HEADROOM plus what
 	the caller needs are left, the oldest months in that folder may be deleted first: only as many as
 	their size on disk says are needed, only if they can make that room at all, at most once per
-	PURGE_INTERVAL per folder, and never the current month, the one being written, a month with anything
+	purge_interval seconds per folder, and never the current month, the one being written, a month with anything
 	in it changed in the last day, or one holding what firewatcher would not have made there. Otherwise
 	the capture moves to the next folder or stops being written.
 	"""
 
-	def __init__(self, min_free_percent, compressors=()):
+	def __init__(self, min_free_percent, compressors=(), purge_interval=DEFAULT_PURGE_INTERVAL):
 		self.min_free = float(min_free_percent) / 100
 		self.min_free_percent = min_free_percent
+		self.purge_interval = purge_interval
+		# A purge that could not help, or freed nothing, is tried again sooner, but never more often than purges.
+		self.purge_retry = min(PURGE_RETRY, purge_interval)
 		self.compressors = {}
 		# folder -> when a purge may next be tried there
 		self.next_purge = {}
@@ -450,7 +453,7 @@ class DiskGuard(object):
 		if total < needed:
 			# Deleting history and still falling short would lose it for nothing: something else filled the
 			# disk. Look again only after a while, rather than walk the history for every capture.
-			self.next_purge[folder] = now + PURGE_RETRY
+			self.next_purge[folder] = now + self.purge_retry
 			return False
 		why = 'to keep %g%% of the disk free' % self.min_free_percent
 		freed = 0
@@ -463,7 +466,7 @@ class DiskGuard(object):
 		except OSError:
 			pass
 		# Only a purge that freed something waits the full interval.
-		self.next_purge[folder] = now + (PURGE_INTERVAL if freed else PURGE_RETRY)
+		self.next_purge[folder] = now + (self.purge_interval if freed else self.purge_retry)
 		return freed > 0
 
 	def can_spend(self, folder, nbytes):
@@ -632,6 +635,7 @@ class Settings(object):
 		self.capture_line_count_max = 10000
 		self.buffer_max_mb = DEFAULT_BUFFER_MAX_MB
 		self.min_free_percent = DEFAULT_MIN_FREE_PERCENT
+		self.purge_interval = DEFAULT_PURGE_INTERVAL
 		self.llm_enabled = False
 		self.llm_base_url = ''
 		self.llm_model = ''
@@ -735,6 +739,7 @@ def _read_config_file(path):
 	take('watch', 'capture_line_count_max', 'capture_line_count_max', 'int')
 	take('watch', 'buffer_max_mb', 'buffer_max_mb', 'int')
 	take('watch', 'min_free_percent', 'min_free_percent', 'float')
+	take('watch', 'purge_interval', 'purge_interval', 'int')
 	take('llm', 'enabled', 'llm_enabled', 'bool')
 	take('llm', 'base_url', 'llm_base_url', 'str')
 	take('llm', 'model', 'llm_model', 'str')
@@ -787,7 +792,7 @@ def resolve_settings(args, environ=None):
 	if 'log_file' in file_values:
 		settings.log_file = file_values['log_file'] or None
 	for key in ('capture_time', 'capture_time_max', 'compress_after_months', 'delete_after_months', 'capture_line_count_max',
-				'buffer_max_mb', 'min_free_percent', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
+				'buffer_max_mb', 'min_free_percent', 'purge_interval', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
 				'filter_only', 'llm_enabled', 'notify_enabled'):
 		if key in file_values:
 			setattr(settings, key, file_values[key])
@@ -827,6 +832,8 @@ def resolve_settings(args, environ=None):
 		settings.buffer_max_mb = args.buffer_max_mb
 	if getattr(args, 'min_free_percent', None) is not None:
 		settings.min_free_percent = args.min_free_percent
+	if getattr(args, 'purge_interval', None) is not None:
+		settings.purge_interval = args.purge_interval
 	if getattr(args, 'filter_only', None) is not None:
 		settings.filter_only = bool(args.filter_only)
 	if getattr(args, 'llm', None) is not None:
@@ -895,6 +902,8 @@ def validate_settings(settings):
 	# Above about half the disk, a floor would mostly mean deleting history and writing nothing.
 	if not 0 <= settings.min_free_percent <= 50:
 		raise ConfigError('watch.min_free_percent must be 0 to 50: %s' % settings.min_free_percent)
+	if not 0 <= settings.purge_interval <= 30 * 86400:
+		raise ConfigError('watch.purge_interval must be 0 to %d seconds: %s' % (30 * 86400, settings.purge_interval))
 
 
 def _is_http_url(url):
@@ -974,6 +983,8 @@ def render_config_text(settings):
 		'# Free-space floor in percent (0 to 50; 0 disables). Near it, old months may be deleted (see the README),',
 		'# then captures move to the fallback folder or stop.',
 		'min_free_percent = %g' % settings.min_free_percent,
+		'# Least seconds between two deletions of old months in one folder for free space; 0: no wait.',
+		'purge_interval = %s' % int(settings.purge_interval),
 		'',
 		'[llm]',
 		'# Set true after configuring your OpenAI-compatible API and model.',
@@ -1049,6 +1060,8 @@ def _explicit_cli_args(raw):
 		parts.extend(['--buffer-max-mb', str(raw.buffer_max_mb)])
 	if getattr(raw, 'min_free_percent', None) is not None:
 		parts.extend(['--min-free-percent', '%g' % raw.min_free_percent])
+	if getattr(raw, 'purge_interval', None) is not None:
+		parts.extend(['--purge-interval', str(raw.purge_interval)])
 	if getattr(raw, 'delete_after_months', None) is not None:
 		parts.extend(['--delete-after-months', str(raw.delete_after_months)])
 	if getattr(raw, 'llm', None) is True:
@@ -1700,7 +1713,7 @@ def _end_capture(capture, captured_line_counter, capture_line_count_max, inciden
 				dispatcher.submit(job)
 
 
-def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB):
+def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB, purge_interval=DEFAULT_PURGE_INTERVAL):
 	"""Tail the log file and process lines with buffer management.
 
 	capture_time_max bounds how long one capture runs however often its pattern repeats (0: no bound).
@@ -1720,7 +1733,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	buffer_max_bytes = buffer_max_mb * 1024 * 1024
 	dropped_until = None  # read_time of the newest line a cap pushed out of log_buffer
 	# The guard comes first, so the compressors' first runs already keep to its floor.
-	disk_guard = DiskGuard(min_free_percent)
+	disk_guard = DiskGuard(min_free_percent, purge_interval=purge_interval)
 	log_compressors = [Log_Compressor(output_folder, compress_after_months, delete_after_months, background=True, guard=disk_guard)]
 	if fallback_folder and os.path.abspath(fallback_folder) != os.path.abspath(output_folder):
 		log_compressors.append(Log_Compressor(fallback_folder, compress_after_months, delete_after_months, background=True, guard=disk_guard))
@@ -2190,6 +2203,7 @@ def build_parser():
 	parser.add_argument('--capture_line_count_max', '--capture-line-count-max', type=int, default=None, help='Maximum number of lines to capture before and after in a single log file. Default: 10000 lines. Note: The final file maybe 2 * this number. Also caps how many recent lines are held in memory.')
 	parser.add_argument('--buffer-max-mb', type=int, default=None, help='Memory, in MiB, for the lines kept before a match. The oldest lines are dropped past it. Default: %d.' % DEFAULT_BUFFER_MAX_MB)
 	parser.add_argument('--min-free-percent', type=_percent_arg, default=None, help='Free-space floor, in percent (0 to 50), for the filesystems captures are written to. Near it, old months of captures may be deleted (see the README), then the capture moves to the fallback folder or stops. 0 disables. Default: %g.' % DEFAULT_MIN_FREE_PERCENT)
+	parser.add_argument('--purge-interval', type=int, default=None, metavar='SEC', help='Least seconds between two deletions of old months in one folder to keep the free-space floor, so a disk that something else keeps filling drains the history slowly. 0: no wait. Default: %d.' % DEFAULT_PURGE_INTERVAL)
 	parser.add_argument('--delete-after-months', type=int, default=None, help='Delete logs after this many months. (will only delete files in YYYY-MM format) Default: 0 (never by age; the free-space floor can still delete the oldest months).')
 	svc = parser.add_mutually_exclusive_group()
 	svc.add_argument('--install-service', action='store_true', help='Install and enable a systemd unit for this command line. Warns and exits if systemd is not available.')
@@ -2317,6 +2331,7 @@ def main(argv=None):
 			fallback_folder=resolved.fallback_folder or None,
 			always_notify_patterns=always_notify_patterns,
 			min_free_percent=resolved.min_free_percent,
+			purge_interval=resolved.purge_interval,
 			buffer_max_mb=resolved.buffer_max_mb,
 		)
 	finally:

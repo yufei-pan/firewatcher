@@ -456,3 +456,28 @@ def test_cli_accepts_a_percent_sign():
     assert parse_cli(['--min-free-percent', '1%', 'p.txt']).min_free_percent == 1
     with pytest.raises(SystemExit):
         parse_cli(['--min-free-percent', 'lots', 'p.txt'])
+
+
+def test_purge_interval_loads_validates_and_round_trips(tmp_path, monkeypatch):
+    assert fw.resolve_settings(parse_cli(['p.txt']), environ={}).purge_interval == 3600
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\npurge_interval = 600\n')
+    settings = fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+    assert settings.purge_interval == 600
+    cli = fw.resolve_settings(parse_cli(['--config', str(conf), '--purge-interval', '0', 'p.txt']), environ={})
+    assert cli.purge_interval == 0
+    generated = tmp_path / 'generated.conf'
+    fw.write_config_file(str(generated), cli)
+    assert fw.resolve_settings(parse_cli(['--config', str(generated)]), environ={}).purge_interval == 0
+    assert fw._explicit_cli_args(parse_cli(['--purge-interval', '60', 'p.txt']))[:2] == ['--purge-interval', '60']
+    conf.write_text('[watch]\npurge_interval = -1\n')
+    with pytest.raises(fw.ConfigError, match='watch.purge_interval'):
+        fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+    seen = {}
+    monkeypatch.setattr(fw, 'capture_messages', lambda command, patterns, **kwargs: seen.update(kwargs))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    src = tmp_path / 'log'
+    src.write_text('x\n')
+    assert fw.main(['--filter_only', '--log-file', str(src), '--purge-interval', '90', str(pat)]) == 0
+    assert seen['purge_interval'] == 90

@@ -57,7 +57,7 @@ Near the floor, firewatcher may delete its own oldest months in that folder, so 
 - **What:** only what firewatcher itself creates: `YYYY-MM` folders, `YYYY-MM[.N].tar.xz` archives, and their `.partial` files, each of the kind it should be (a folder, or a regular file). A month counts as a whole.
 - **Never:** the current month, the month being written, a month with anything in it changed in the last day (another firewatcher may be writing there), a month being compressed, or a month with another filesystem mounted inside it.
 - **How much:** only as many months as it takes, counted by their size on disk, and nothing at all if deleting every one of them still could not make room. That happens when something else filled the disk, and then the history is kept.
-- **How often:** at most once an hour per folder, so a disk that something else keeps filling drains firewatcher's history slowly. A purge that could not help is not tried again for five minutes. Each deletion is logged.
+- **How often:** at most once per `--purge-interval` per folder (default an hour), so a disk that something else keeps filling drains firewatcher's history slowly. A purge that could not help is not tried again for five minutes (or the interval, if shorter). Each deletion is logged.
 
 After deleting, firewatcher syncs and reads the free space again. A filesystem that shows freed space late costs a move to the fallback folder, never the floor. If there is still no room, the capture moves to the fallback folder with a note, or, with no folder left, stops being written, which is logged; the incident is still pushed. Compression keeps to the floor too: a month whose archive could cross it is left uncompressed for now. Purging and compression never wait for each other, so log reading never waits for `tar`. `--delete-after-months 0` means nothing is deleted by age; the floor can still delete the oldest months. Set `--min-free-percent 0` to turn all of this off.
 
@@ -110,6 +110,7 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--capture-line-count-max` | Max lines before/after a match (default: 10000). Also caps how many recent lines are held in memory |
 | `--buffer-max-mb` | Memory, in MiB, for the lines kept before a match (default: 16). The oldest lines are dropped past it |
 | `--min-free-percent` | Free-space floor, 0–50%, for the filesystems captures go to (default: 1; 0 disables). See [Disk and memory limits](#disk-and-memory-limits) |
+| `--purge-interval SEC` | Least time between two deletions of old months in one folder for free space (default: 3600; 0: no wait) |
 | `--config PATH` | INI config file. Default: `/etc/firewatcher/firewatcher.conf` when that file exists. An explicit path must exist |
 | `--llm` / `--no-llm` | Enable or disable LLM analysis of each finished capture |
 | `--llm-base-url URL` | OpenAI-compatible API root, such as `http://127.0.0.1:11434/v1` |

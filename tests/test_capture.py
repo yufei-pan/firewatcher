@@ -760,7 +760,7 @@ def test_purge_runs_at_most_once_an_hour_per_folder(tmp_path, monkeypatch):
     disk.set_headroom(-10_000, 0.10)  # filled again
     assert guard.headroom(path) < fw.MIN_HEADROOM
     assert (out / '2020-02').is_dir()
-    clock.t += fw.PURGE_INTERVAL
+    clock.t += fw.DEFAULT_PURGE_INTERVAL
     assert guard.headroom(path) >= fw.MIN_HEADROOM
     assert not (out / '2020-02').exists()
 
@@ -1183,3 +1183,25 @@ def test_a_hard_linked_month_counts_as_freeing_nothing(tmp_path, monkeypatch):
     disk.set_headroom(-10_000, 0.10)
     assert guard_for(out).headroom(str(out / '2026-10' / 'hit.log')) < fw.MIN_HEADROOM
     assert (out / '2019-01').is_dir()  # deleting it could not have made room, so it is kept
+
+
+def test_purge_interval_is_a_setting(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    monkeypatch.setattr(fw.os, 'sync', lambda: None)
+    clock = Clock(time.time())
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = tmp_path / 'out'
+    months(out, **{'2020-01': 200_000, '2020-02': 200_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    guard = fw.DiskGuard(10, [fw.Log_Compressor(str(out), 0, 0)], purge_interval=120)
+    path = str(out / '2026-10' / 'hit.log')
+    disk.set_headroom(-10_000, 0.10)
+    guard.headroom(path)
+    assert sorted(p.name for p in out.iterdir()) == ['2020-02']
+    disk.set_headroom(-10_000, 0.10)
+    clock.t += 60
+    guard.headroom(path)
+    assert (out / '2020-02').is_dir()  # within the 120 s
+    clock.t += 61
+    guard.headroom(path)
+    assert not (out / '2020-02').exists()
