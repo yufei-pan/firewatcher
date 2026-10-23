@@ -50,6 +50,7 @@ def test_render_unit_file_uses_pattern_dir_and_output():
     assert 'RequiresMountsFor=/mnt/logs/captured_messages' in unit
     assert 'remote-fs.target' in unit
     assert 'KillSignal=SIGINT' in unit
+    assert 'ExecReload=/bin/kill -HUP $MAINPID' in unit
     assert 'Restart=always' in unit
     assert 'TimeoutStopSec=85' in unit
     assert '--config' in unit

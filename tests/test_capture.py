@@ -160,15 +160,13 @@ def test_capture_nonmatch_lines_can_hit_line_cap(tmp_path):
     assert 'line4' not in text
 
 
-def test_capture_skips_excess_pre_match_buffer(tmp_path):
-    body = ''.join(f'pre-{i}\n' for i in range(10)) + 'HIT\n'
+def test_line_cap_limits_only_the_lines_after_the_match(tmp_path):
+    body = ''.join(f'pre-{i}\n' for i in range(10)) + 'HIT\n' + ''.join(f'post-{i}\n' for i in range(10))
     out = capture(tmp_path, body, capture_line_count_max=3)
     text = incident_logs(out)[0].read_text()
-    assert 'Older cached in-memory lines were dropped' in text
-    assert 'pre-0' not in text
-    assert 'pre-8' in text
-    assert 'pre-9' in text
-    assert 'HIT' in text
+    assert all('pre-%d' % i in text for i in range(10))
+    assert 'post-2' in text and 'post-4' not in text
+    assert 'Older cached in-memory lines were dropped' not in text
 
 
 def test_capture_progress_every_10000_lines(tmp_path, capsys):
@@ -243,17 +241,11 @@ def run_scripted(tmp_path, monkeypatch, popen, **kw):
     return tmp_path / 'out'
 
 
-def test_pre_match_buffer_is_capped_at_capture_line_count_max(tmp_path, monkeypatch):
-    class RecordingDeque(collections.deque):
-        peak = 0
-
-        def append(self, item):
-            super().append(item)
-            RecordingDeque.peak = max(RecordingDeque.peak, len(self))
-
-    monkeypatch.setattr(fw, 'deque', RecordingDeque)
-    capture(tmp_path, ''.join(f'noise-{i}\n' for i in range(50)), capture_line_count_max=5)
-    assert 0 < RecordingDeque.peak <= 5
+def test_full_window_of_context_is_kept_past_ten_thousand_lines(tmp_path):
+    body = ''.join('pre-%05d some context\n' % i for i in range(30000)) + 'HIT\n'
+    text = incident_logs(capture(tmp_path, body))[0].read_text()
+    assert 'pre-00000' in text and 'pre-29999' in text
+    assert text.count('some context') == 30000
 
 
 def test_capture_does_not_report_dropped_lines_that_aged_out(tmp_path, monkeypatch):
@@ -391,7 +383,7 @@ def test_capture_time_max_ends_a_capture_its_pattern_keeps_extending(tmp_path, m
     assert 'Capture reached capture_time_max of 120 seconds' in first
     assert 'Matched line:    HIT 4' in second
     assert 'tail' in second
-    assert 'capture_time_max' not in second
+    assert 'Capture reached capture_time_max' not in second
 
 
 def test_capture_time_max_zero_disables_the_bound(tmp_path, monkeypatch):
@@ -1012,23 +1004,67 @@ def test_capture_with_no_room_anywhere_is_not_saved(tmp_path, monkeypatch):
 
 # --- memory ---
 
-def test_buffer_drops_the_oldest_lines_past_its_memory_limit(tmp_path, monkeypatch):
-    monkeypatch.setattr(fw, 'BUFFER_LINE_OVERHEAD', 0)
-    # 1 MiB of buffer: twelve 100 KiB lines do not fit, the newest ten (1,024,080 bytes) do
-    body = ''.join('old-%02d %s\n' % (i, 'x' * 100 * 1024) for i in range(12)) + 'HIT\n'
-    out = capture(tmp_path, body, buffer_max_mb=1)
-    text = incident_logs(out)[0].read_text()
-    assert 'Older cached in-memory lines were dropped' in text
-    assert 'old-00' not in text and 'old-01' not in text
-    assert 'old-02' in text and 'old-11' in text and 'HIT' in text
+def random_text(n):
+    import base64
+    return base64.b64encode(os.urandom(n * 3 // 4)).decode()[:n]
+
+
+def test_buffer_drops_the_oldest_lines_past_its_memory_limit(tmp_path):
+    # incompressible lines: 3 MB of them do not fit in 1 MiB
+    lines = ['old-%04d %s\n' % (i, random_text(1000)) for i in range(3000)]
+    # '!' never occurs in base64, so only the last line can match
+    out = capture(tmp_path, ''.join(lines) + 'HIT!\n', pattern='HIT!', buffer_max_mb=1)
+    (cap,) = incident_logs(out)
+    text = cap.read_text()
+    assert 'Older cached in-memory lines were dropped to stay within buffer_max_mb 1 MiB' in text
+    assert 'old-0000 ' not in text
+    assert 'old-2999 ' in text and 'Matched line:    HIT!' in text
+    kept = len(re.findall(r'^old-\d{4} ', text, re.M))
+    assert 1000 < kept < 1600  # base64 compresses to about 3/4, so 1 MiB holds about 1.3 MB of these
 
 
 def test_buffer_keeps_the_newest_line_even_when_it_alone_is_too_big(tmp_path, monkeypatch):
-    out = capture(tmp_path, 'context\nHIT %s\n' % ('y' * 2 * 1024 * 1024), buffer_max_mb=1)
-    text = incident_logs(out)[0].read_text()
-    assert 'context' not in text
-    assert text.count('y' * 1024) >= 2047
+    monkeypatch.setattr(fw, 'MAX_LINE_CHARS', 4 * 1024 * 1024)  # read it as one line
+    big = random_text(2 * 1024 * 1024)
+    out = capture(tmp_path, 'old line\n' * 2000 + 'HIT! ' + big + '\n', pattern='HIT!', buffer_max_mb=1)
+    (cap,) = incident_logs(out)
+    text = cap.read_text()
+    assert big in text
 
+
+def test_context_buffer_memory_stays_bounded():
+    buffer = fw.ContextBuffer(10 ** 9, 1024 * 1024)
+    for seq in range(20000):
+        buffer.append(float(seq), seq, 'line %d %s\n' % (seq, random_text(200)))
+        assert buffer.memory <= 1024 * 1024 + fw.BUFFER_BLOCK_BYTES * 3
+    newest = list(buffer.entries(0))
+    assert newest[-1][1] == 19999
+    assert [seq for _t, seq, _l in newest] == list(range(newest[0][1], 20000))
+    assert buffer.dropped_until is not None
+
+
+def test_context_buffer_ages_out_by_time_and_skips_without_decompressing(monkeypatch):
+    buffer = fw.ContextBuffer(100, 64 * 1024 * 1024)
+    for seq in range(5000):
+        buffer.append(float(seq) / 10, seq, 'line %05d %s\n' % (seq, 'x' * 100))
+    assert buffer.blocks
+    entries = list(buffer.entries(400.0))
+    assert entries[0][1] == 4000 and entries[-1][1] == 4999
+    assert all(line.startswith('line %05d ' % seq) for _t, seq, line in entries)
+    assert [seq for _t, seq, _l in buffer.entries(400.0, skip=[(4000, 4900)])][0] == 4901
+    assert buffer.seq_span(400.0) == (4000, 4999)
+    assert buffer.seq_span(500.0) is None
+    assert fw.ContextBuffer(100, 1024).seq_span(0) is None
+    real = fw.zlib.decompress
+    calls = []
+    monkeypatch.setattr(fw.zlib, 'decompress', lambda data: calls.append(1) or real(data))
+    list(buffer.entries(0, skip=[(0, 4990)]))
+    assert len(calls) <= 1  # only a block that is not wholly skipped
+    buffer.seq_span(0)
+    assert len(calls) <= 1
+    # 500 s on, everything but the newest line has aged out
+    buffer.append(1000.0, 5000, 'newest\n')
+    assert [seq for _t, seq, _l in buffer.entries(0)] == [5000]
 
 def test_overlong_lines_are_read_in_pieces(tmp_path, monkeypatch):
     monkeypatch.setattr(fw, 'MAX_LINE_CHARS', 16)
@@ -1205,3 +1241,223 @@ def test_purge_interval_is_a_setting(tmp_path, monkeypatch):
     clock.t += 61
     guard.headroom(path)
     assert not (out / '2020-02').exists()
+
+
+# --- context already in an earlier capture ---
+
+def numbered(text, kind):
+    return re.findall(r'%s-(\d+)' % kind, text)
+
+
+def test_storm_capture_leaves_out_what_the_previous_one_holds(tmp_path):
+    # the line cap ends the first capture; the next match opens a second within the window
+    body = ''.join('ctx-%03d\n' % i for i in range(50)) + 'HIT 1\n' + ''.join('a-%03d\n' % i for i in range(20)) + 'HIT 2\n' + 'b-000\n'
+    out = capture(tmp_path, body, capture_line_count_max=10)
+    first, second = incident_logs(out)
+    second_text = second.read_text()
+    # 50 context lines, HIT 1, and a-000 to a-010 (the line that crossed the cap)
+    assert '62 lines of this window are left out: they are in %s' % first in second_text
+    assert numbered(second_text, 'ctx') == [] and numbered(second_text, 'a') == ['011', '012', '013', '014', '015', '016', '017', '018', '019']
+    every = re.findall(r'\b((?:ctx|a)-\d+)', first.read_text() + second_text)
+    assert len(every) == len(set(every)) == 70  # each line once, none lost
+
+
+def test_lines_between_captures_are_kept(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    popen = ScriptedPopen([('HIT 1\n', 0), ('in-first\n', 1), ('gap-1\n', 70), ('gap-2\n', 1), ('HIT 2\n', 1)], clock=clock)
+    out = run_scripted(tmp_path, monkeypatch, popen, capture_time=60)
+    first, second = (p.read_text() for p in incident_logs(out))
+    assert 'in-first' in first
+    # the first capture's lines are older than the second's window, so nothing is left out
+    assert 'left out' not in second
+    assert 'gap-1' in second and 'gap-2' in second
+
+
+def test_a_capture_leaves_out_lines_from_several_earlier_ones(tmp_path):
+    body = ('one\n' + 'HIT 1\n' + ''.join('a-%d\n' % i for i in range(4))
+            + 'two\n' + 'HIT 2\n' + ''.join('b-%d\n' % i for i in range(4))
+            + 'three\n' + 'HIT 3\n')
+    out = capture(tmp_path, body, capture_line_count_max=2)
+    caps = incident_logs(out)
+    third = caps[-1].read_text()
+    assert 'left out: they are in %s' % caps[0] in third
+    assert 'left out: they are in %s' % caps[1] in third
+    joined = ''.join(p.read_text() for p in caps)
+    for line in ('one', 'two', 'three', 'a-0', 'a-3', 'b-0', 'b-3'):
+        assert len(re.findall(r'^%s$' % line, joined, re.M)) == 1, line
+
+
+def test_lines_of_an_unsaved_capture_are_not_left_out(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    blocked = tmp_path / 'blocked'
+    blocked.write_text('a file')
+    real_open_capture = fw._open_capture
+    calls = []
+
+    def first_one_unsaved(output_folder, *args, **kwargs):
+        calls.append(1)
+        folder = str(blocked / 'out') if len(calls) == 1 else output_folder
+        return real_open_capture(folder, *args, **kwargs)
+
+    monkeypatch.setattr(fw, '_open_capture', first_one_unsaved)
+    body = 'ctx\n' + 'HIT 1\n' + ''.join('a-%d\n' % i for i in range(5)) + 'HIT 2\n'
+    out = capture(tmp_path, body, capture_line_count_max=3)
+    (only,) = incident_logs(out)
+    text = only.read_text()
+    assert 'left out' not in text
+    assert 'ctx' in text and 'a-0' in text
+
+
+# --- SIGHUP pattern reload ---
+
+class HangupBefore(ScriptedStdout):
+    """Sends the reload request just before returning a line that starts with `marker`."""
+
+    def __init__(self, events, marker):
+        super().__init__(events)
+        self.marker = marker
+
+    def readline(self, size=-1):
+        line = super().readline(size)
+        if isinstance(line, str) and line.startswith(self.marker):
+            fw._request_reload(None, None)
+        return line
+
+
+def _hangup_capture(tmp_path, monkeypatch, lines, marker, **kw):
+    pat = tmp_path / 'p.txt'
+    pat.write_text('OLD\n')
+    popen = ScriptedPopen([])
+    popen.stdout = HangupBefore(lines, marker)
+    patch_popen(monkeypatch, popen)
+    out = tmp_path / 'out'
+    fw.capture_messages(
+        ['unused'], fw.load_patterns([str(pat)]),
+        capture_time=60, output_folder=str(out),
+        compress_after_months=0, delete_after_months=0, **kw)
+    return out
+
+
+def test_sighup_reload_matches_the_next_line_with_the_new_patterns(tmp_path, monkeypatch, capsys):
+    new = tmp_path / 'new.txt'
+    new.write_text('NEW\n')
+    always = tmp_path / 'always.txt'
+    always.write_text('NEW\n')
+    out = _hangup_capture(tmp_path, monkeypatch, ['OLD before\n', 'NEW after\n', 'OLD again\n'], 'NEW',
+                          reload_patterns=lambda: fw._load_pattern_sets([str(new)], [str(always)]))
+    printed = capsys.readouterr().out
+    assert 'reloaded patterns: 0 regex, 1 plain, always_notify too' in printed
+    text = incident_logs(out)[0].read_text()
+    assert '-> NEW after' in text
+    # OLD was dropped by the reload, so a later OLD line is context, not a match
+    assert '-> OLD again' not in text and 'OLD again' in text
+    assert not fw._reload_requested
+
+
+def test_sighup_reload_failure_keeps_the_old_patterns(tmp_path, monkeypatch, capsys):
+    out = _hangup_capture(tmp_path, monkeypatch, ['quiet\n', 'OLD still watched\n'], 'quiet',
+                          reload_patterns=lambda: fw._load_pattern_sets([str(tmp_path / 'gone.txt')], None))
+    printed = capsys.readouterr().out
+    assert 'reloading patterns failed, keeping the old ones: no usable patterns in' in printed
+    assert 'OLD still watched' in incident_logs(out)[0].read_text()
+
+
+def test_sighup_without_a_reloader_changes_nothing(tmp_path, monkeypatch, capsys):
+    out = _hangup_capture(tmp_path, monkeypatch, ['quiet\n', 'OLD still watched\n'], 'quiet')
+    printed = capsys.readouterr().out
+    assert 'reloaded patterns' not in printed and 'reloading patterns' not in printed
+    assert 'OLD still watched' in incident_logs(out)[0].read_text()
+    assert not fw._reload_requested
+
+
+def test_load_pattern_sets_drops_an_empty_always_notify_list(tmp_path, capsys):
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    empty = tmp_path / 'always.txt'
+    empty.write_text('# nothing yet\n')
+    patterns, always = fw._load_pattern_sets([str(tmp_path)], [str(empty)])
+    # the folder holds both files; the comment-only one adds nothing
+    assert patterns == {'fnmatch': {'*HIT*'}}
+    assert always is None
+    assert 'no usable always_notify patterns' in capsys.readouterr().out
+
+
+def test_lines_of_a_capture_that_moved_are_written_again(tmp_path, monkeypatch):
+    # Its lines are split between two files, so the next capture writes them again rather than point at one.
+    journal_records(monkeypatch)
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = tmp_path / 'out'
+    fallback = tmp_path / 'fallback'
+    full = {'out': False}
+    monkeypatch.setattr(fw, '_free_space', lambda path: FULL if full['out'] and str(path).startswith(str(out)) else ROOMY)
+
+    class FillingStdout(ScriptedStdout):
+        def readline(self, size=-1):
+            line = super().readline(size)
+            if line.startswith('fill'):
+                full['out'] = True
+            return line
+
+    popen = ScriptedPopen([])
+    popen.stdout = FillingStdout([('ctx\n', 0), ('HIT 1\n', 0), ('a-0\n', 0), ('fill\n', 0), ('a-1\n', 2),
+                                  ('a-2\n', 0), ('a-3\n', 0), ('HIT 2\n', 0)], clock=clock)
+    run_scripted(tmp_path, monkeypatch, popen, fallback_folder=str(fallback), min_free_percent=1, capture_line_count_max=3)
+    assert 'a-0' in incident_logs(out)[0].read_text()
+    second = [p.read_text() for p in incident_logs(fallback) if 'Matched line:    HIT 2' in p.read_text()][0]
+    assert 'left out' not in second
+    assert 'ctx' in second and 'a-0' in second
+
+
+def test_capture_file_moved_only_after_it_held_a_file(tmp_path):
+    blocked = tmp_path / 'blocked'
+    blocked.write_text('a file where a folder should be')
+    capture = fw.CaptureFile([str(blocked / 'x.log'), str(tmp_path / 'ok' / 'x.log')], 1.0)
+    assert capture.saved and not capture.moved
+    capture.write('line\n')
+    capture._move_on(OSError('lost the server'))
+    assert capture.moved
+    capture.close()
+
+
+def test_capture_file_bounds_text_kept_for_a_move(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'UNSYNCED_MAX', 1000)
+    fsyncs = []
+    real_fsync = fw.os.fsync
+    monkeypatch.setattr(fw.os, 'fsync', lambda fd: fsyncs.append(fd) or real_fsync(fd))
+    capture = fw.CaptureFile(str(tmp_path / 'x.log'), 1.0)
+    for i in range(100):
+        capture.write('line %03d %s\n' % (i, 'x' * 90))
+        assert capture.unsynced_size <= 1000 and sum(map(len, capture.unsynced)) == capture.unsynced_size
+    assert len(fsyncs) >= 9
+    capture.close()
+    assert (tmp_path / 'x.log').read_text().count('line ') == 100
+
+
+def test_storm_captures_do_not_decompress_what_earlier_ones_hold(tmp_path, monkeypatch):
+    real = fw.zlib.decompress
+    calls = []
+    monkeypatch.setattr(fw.zlib, 'decompress', lambda data: calls.append(1) or real(data))
+    body = ''.join('HIT %05d %s\n' % (i, random_text(100)) for i in range(6000))
+    out = capture(tmp_path, body, capture_line_count_max=50)
+    captures = incident_logs(out)
+    assert len(captures) > 100
+    # at most the block still open to new lines, per capture
+    assert len(calls) <= 2 * len(captures)
+    every = re.findall(r'HIT (\d{5})', ''.join(p.read_text().split('Logs since', 1)[1] for p in captures))
+    assert len(every) == len(set(every)) == 6000
+
+
+def test_a_carriage_return_does_not_split_a_line(tmp_path):
+    out = capture(tmp_path, 'x\r2000-01-01T00:00:00Z HIT that looks like its own entry\nafter\n')
+    data = incident_logs(out)[0].read_bytes()
+    assert b'Matched line:    x\r2000-01-01T00:00:00Z HIT' in data
+
+
+def test_context_buffer_compresses_many_short_lines_early():
+    buffer = fw.ContextBuffer(10 ** 9, 1024 * 1024)
+    for seq in range(200000):
+        buffer.append(float(seq), seq, '%d\n' % (seq % 10))
+        assert buffer.lines_memory < fw.BUFFER_OPEN_MEMORY + 200
+    assert buffer.memory <= 1024 * 1024 + fw.BUFFER_OPEN_MEMORY + 64 * 1024

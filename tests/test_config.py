@@ -481,3 +481,28 @@ def test_purge_interval_loads_validates_and_round_trips(tmp_path, monkeypatch):
     src.write_text('x\n')
     assert fw.main(['--filter_only', '--log-file', str(src), '--purge-interval', '90', str(pat)]) == 0
     assert seen['purge_interval'] == 90
+
+
+def test_position_file_and_resume_max_load_validate_and_round_trip(tmp_path):
+    defaults = fw.resolve_settings(parse_cli(['p.txt']), environ={})
+    assert defaults.position_file == fw.DEFAULT_POSITION_FILE
+    assert defaults.resume_max == 3600
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\nposition_file = /srv/fw/position\nresume_max = 600\n')
+    settings = fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+    assert (settings.position_file, settings.resume_max) == ('/srv/fw/position', 600)
+    # an empty value turns resuming off, unlike output_folder
+    conf.write_text('[watch]\nposition_file =\n')
+    assert fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={}).position_file == ''
+    cli = fw.resolve_settings(parse_cli(['--config', str(conf), '--position-file', '/x/pos', '--resume-max', '0', 'p.txt']), environ={})
+    assert (cli.position_file, cli.resume_max) == ('/x/pos', 0)
+    generated = tmp_path / 'generated.conf'
+    fw.write_config_file(str(generated), cli)
+    again = fw.resolve_settings(parse_cli(['--config', str(generated)]), environ={})
+    assert (again.position_file, again.resume_max) == ('/x/pos', 0)
+    assert fw._explicit_cli_args(parse_cli(['--position-file', '', '--resume-max', '60', 'p.txt']))[:4] == [
+        '--position-file', '', '--resume-max', '60']
+    for bad in ('-1', str(30 * 86400 + 1)):
+        conf.write_text('[watch]\nresume_max = %s\n' % bad)
+        with pytest.raises(fw.ConfigError, match='watch.resume_max'):
+            fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})

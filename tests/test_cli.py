@@ -104,7 +104,7 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
     src = open(fw.__file__, encoding='utf-8').read().lower()
     assert 'nebula' not in src
-    assert fw.version == '1.61'
+    assert fw.version == '1.62'
     assert fw.__version__ == fw.version
 
 
@@ -253,6 +253,94 @@ def test_sigterm_finishes_the_open_capture(tmp_path):
     assert 'End of capture' in next(out.rglob('hit_*.log')).read_text()
 
 
+class _Stdin(object):
+    def __init__(self, tty):
+        self.tty = tty
+
+    def isatty(self):
+        if self.tty is None:
+            raise ValueError('I/O operation on closed file')
+        return self.tty
+
+
+def test_main_reloads_pattern_files_on_sighup_and_restores_the_handler(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_capture(command, patterns, **kwargs):
+        seen['sighup'] = signal.getsignal(signal.SIGHUP)
+        pat.write_text('NEW\n')
+        always.write_text('ALWAYS\n')
+        seen['reloaded'] = kwargs['reload_patterns']()
+
+    monkeypatch.setattr(fw, 'capture_messages', fake_capture)
+    monkeypatch.setattr(sys, 'stdin', _Stdin(False))
+    before = signal.getsignal(signal.SIGHUP)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('OLD\n')
+    always = tmp_path / 'always.txt'
+    always.write_text('# none yet\n')
+    src = tmp_path / 'log'
+    src.write_text('x\n')
+    rc = fw.main(['--filter_only', '--log-file', str(src), '--always-notify', str(always), str(pat)])
+    assert rc == 0
+    assert seen['sighup'] is fw._request_reload
+    assert seen['reloaded'] == ({'fnmatch': {'*NEW*'}}, {'fnmatch': {'*ALWAYS*'}})
+    assert signal.getsignal(signal.SIGHUP) == before
+
+
+@pytest.mark.parametrize('tty', [True, None])
+def test_main_leaves_sighup_alone_in_a_terminal(tmp_path, monkeypatch, tty):
+    seen = {}
+    monkeypatch.setattr(fw, 'capture_messages', lambda *a, **k: seen.setdefault('sighup', signal.getsignal(signal.SIGHUP)))
+    # None: a closed stdin, which counts as no terminal
+    monkeypatch.setattr(sys, 'stdin', _Stdin(tty))
+    before = signal.getsignal(signal.SIGHUP)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    src = tmp_path / 'log'
+    src.write_text('x\n')
+    assert fw.main(['--filter_only', '--log-file', str(src), str(pat)]) == 0
+    assert (seen['sighup'] is fw._request_reload) == (tty is None)
+    assert signal.getsignal(signal.SIGHUP) == before
+
+
+def test_sighup_reloads_the_pattern_files_of_a_running_daemon(tmp_path):
+    live = tmp_path / 'live.log'
+    live.write_text('OLD first\n')
+    pat = tmp_path / 'p.txt'
+    pat.write_text('OLD\n')
+    conf = tmp_path / 'empty.conf'
+    conf.write_text('')
+    out = tmp_path / 'out'
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / 'firewatcher.py'), '--config', str(conf), '--log-file', str(live),
+         '-o', str(out), '--fallback-folder', '', str(pat)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+    )
+    try:
+        deadline = time.time() + 20
+        # the first capture exists only after the handler is in place
+        while not list(out.rglob('old_*.log')) and time.time() < deadline:
+            time.sleep(0.05)
+        assert list(out.rglob('old_*.log'))
+        pat.write_text('NEW\n')
+        proc.send_signal(signal.SIGHUP)
+        with live.open('a') as f:
+            f.write('NEW second\n')
+        capture_file = next(out.rglob('old_*.log'))
+        while 'NEW second' not in capture_file.read_text() and time.time() < deadline:
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        output, _ = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 0, output
+    assert 'reloaded patterns: 0 regex, 1 plain' in output
+    assert '-> NEW second' in capture_file.read_text()
+
+
 def test_parser_hides_unimplemented_workers_flag():
     assert '--workers' not in fw.build_parser().format_help()
 
@@ -263,3 +351,21 @@ def test_parser_accepts_hyphenated_spellings():
     assert parsed.filter_only is True
     assert parsed.capture_line_count_max == 7
     assert parse_cli(['--no-filter-only', 'p.txt']).filter_only is False
+
+
+def test_sighup_is_handled_from_the_start(tmp_path, monkeypatch):
+    # a reload right after a start must not end the process while it loads patterns or probes journalctl
+    seen = {}
+
+    def source(resolved):
+        seen['sighup'] = signal.getsignal(signal.SIGHUP)
+        return None
+
+    monkeypatch.setattr(fw, 'log_source_command', source)
+    monkeypatch.setattr(sys, 'stdin', _Stdin(False))
+    before = signal.getsignal(signal.SIGHUP)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    assert fw.main([str(pat)]) == 1
+    assert seen['sighup'] is fw._request_reload
+    assert signal.getsignal(signal.SIGHUP) == before

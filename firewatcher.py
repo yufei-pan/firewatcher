@@ -3,7 +3,11 @@
 # -*- coding: utf-8 -*-
 """Watch logs for incident patterns and persist surrounding context."""
 import argparse
+import array
+import bisect
+import calendar
 import fnmatch
+import hashlib
 import subprocess
 import re
 import shutil
@@ -14,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as ReadTimeout
 import time
 import datetime
 import errno
+import fcntl
+import io
 import os
 import unicodedata
 import configparser
@@ -23,8 +29,9 @@ import socket
 import stat
 import syslog
 import threading
+import zlib
 
-version = '1.61'
+version = '1.62'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -35,14 +42,32 @@ DEFAULT_CAPTURE_TIME_MAX = 3600
 DEFAULT_PATTERNS_DIR = '/etc/firewatcher/patterns.d'
 # Below this much free space, firewatcher deletes its own oldest months, then stops writing there.
 DEFAULT_MIN_FREE_PERCENT = 1.0
-# Memory for the lines kept before a match, on top of the capture_line_count_max line limit.
+# Memory for the lines kept before a match (compressed), which with capture_time bounds that context.
 DEFAULT_BUFFER_MAX_MB = 16
-# Per-line cost in that buffer beyond the str itself (sys.getsizeof): the tuple, the read time, the deque slot.
+# Per-line cost in that buffer's open block beyond the str itself (sys.getsizeof): the tuple, the read time.
 BUFFER_LINE_OVERHEAD = 96
+# Text gathered before a block of that buffer is compressed, and each compressed block's own bookkeeping.
+BUFFER_BLOCK_BYTES = 64 * 1024
+# The open block is also compressed once its lines take this much memory, which many short lines reach first.
+BUFFER_OPEN_MEMORY = 4 * BUFFER_BLOCK_BYTES
+BUFFER_BLOCK_OVERHEAD = 512
 # Longest line read at once; a longer one arrives in pieces, so one huge line cannot fill memory.
 MAX_LINE_CHARS = 1 << 20
 # Reads failing this many times in a row (a closed pipe) end the run instead of spinning on the error.
 MAX_READ_ERRORS = 100
+# journald's socket, there while journald runs, and the folders it keeps journal files in.
+JOURNALD_SOCKET = '/run/systemd/journal/socket'
+JOURNAL_DIRS = ('/var/log/journal', '/run/log/journal')
+# Where firewatcher remembers how far it read the journal, so a restart resumes there.
+DEFAULT_POSITION_FILE = '/var/lib/firewatcher/journal.position'
+# At start, the most seconds of journal read back: lines logged while firewatcher was stopped, and context.
+DEFAULT_RESUME_MAX = 3600
+# The journal position is saved this often while lines arrive, and when firewatcher stops.
+POSITION_SAVE_INTERVAL = 1.0
+# A journal line read this many seconds after its timestamp was logged while firewatcher was stopped.
+BACKLOG_LAG = 2
+# journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
+_ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
 DEFAULT_UNIT_NAME = 'firewatcher'
 SYSTEMD_RUNTIME_DIR = '/run/systemd/system'
 SYSTEMD_UNIT_DIR = '/etc/systemd/system'
@@ -72,6 +97,8 @@ RECENT_MONTH_ACTIVITY = 86400
 PURGE_RETRY = 300
 # Free space is checked at least every this many bytes written, besides the once-a-second check.
 CHECK_EVERY_MAX = 8 * 1024 * 1024
+# A capture fsyncs at least every this many characters written, which bounds the text it keeps for a move.
+UNSYNCED_MAX = 1024 * 1024
 # fsync errors that only mean the filesystem cannot fsync; any other error means written data may be lost.
 _FSYNC_UNSUPPORTED = frozenset((errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS))
 _ANSI_RE = re.compile(rb'\x1b\[[0-9;]*m')
@@ -636,6 +663,8 @@ class Settings(object):
 		self.buffer_max_mb = DEFAULT_BUFFER_MAX_MB
 		self.min_free_percent = DEFAULT_MIN_FREE_PERCENT
 		self.purge_interval = DEFAULT_PURGE_INTERVAL
+		self.position_file = DEFAULT_POSITION_FILE
+		self.resume_max = DEFAULT_RESUME_MAX
 		self.llm_enabled = False
 		self.llm_base_url = ''
 		self.llm_model = ''
@@ -740,6 +769,8 @@ def _read_config_file(path):
 	take('watch', 'buffer_max_mb', 'buffer_max_mb', 'int')
 	take('watch', 'min_free_percent', 'min_free_percent', 'float')
 	take('watch', 'purge_interval', 'purge_interval', 'int')
+	take('watch', 'position_file', 'position_file', 'str')
+	take('watch', 'resume_max', 'resume_max', 'int')
 	take('llm', 'enabled', 'llm_enabled', 'bool')
 	take('llm', 'base_url', 'llm_base_url', 'str')
 	take('llm', 'model', 'llm_model', 'str')
@@ -792,15 +823,17 @@ def resolve_settings(args, environ=None):
 	if 'log_file' in file_values:
 		settings.log_file = file_values['log_file'] or None
 	for key in ('capture_time', 'capture_time_max', 'compress_after_months', 'delete_after_months', 'capture_line_count_max',
-				'buffer_max_mb', 'min_free_percent', 'purge_interval', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
+				'buffer_max_mb', 'min_free_percent', 'purge_interval', 'resume_max', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
 				'filter_only', 'llm_enabled', 'notify_enabled'):
 		if key in file_values:
 			setattr(settings, key, file_values[key])
 	if file_values.get('output_folder'):
 		settings.output_folder = file_values['output_folder']
-	# Unlike output_folder, an empty fallback_folder means no fallback.
+	# Unlike output_folder, an empty fallback_folder means no fallback, and an empty position_file no resuming.
 	if 'fallback_folder' in file_values:
 		settings.fallback_folder = file_values['fallback_folder']
+	if 'position_file' in file_values:
+		settings.position_file = file_values['position_file']
 	if 'always_notify' in file_values:
 		settings.always_notify = list(file_values['always_notify'])
 	if file_values.get('tail_lines'):
@@ -834,6 +867,10 @@ def resolve_settings(args, environ=None):
 		settings.min_free_percent = args.min_free_percent
 	if getattr(args, 'purge_interval', None) is not None:
 		settings.purge_interval = args.purge_interval
+	if getattr(args, 'position_file', None) is not None:
+		settings.position_file = args.position_file
+	if getattr(args, 'resume_max', None) is not None:
+		settings.resume_max = args.resume_max
 	if getattr(args, 'filter_only', None) is not None:
 		settings.filter_only = bool(args.filter_only)
 	if getattr(args, 'llm', None) is not None:
@@ -904,6 +941,8 @@ def validate_settings(settings):
 		raise ConfigError('watch.min_free_percent must be 0 to 50: %s' % settings.min_free_percent)
 	if not 0 <= settings.purge_interval <= 30 * 86400:
 		raise ConfigError('watch.purge_interval must be 0 to %d seconds: %s' % (30 * 86400, settings.purge_interval))
+	if not 0 <= settings.resume_max <= 30 * 86400:
+		raise ConfigError('watch.resume_max must be 0 to %d seconds: %s' % (30 * 86400, settings.resume_max))
 
 
 def _is_http_url(url):
@@ -976,15 +1015,20 @@ def render_config_text(settings):
 		'compress_after_months = %s' % int(settings.compress_after_months),
 		'# Delete monthly capture directories after this many months; 0 disables.',
 		'delete_after_months = %s' % int(settings.delete_after_months),
-		'# Maximum context lines before and after a match.',
+		'# Maximum lines written after a match; the lines before it are bounded by capture_time and buffer_max_mb.',
 		'capture_line_count_max = %s' % int(settings.capture_line_count_max),
-		'# Memory, in MiB, for the lines kept before a match; the oldest are dropped past it.',
+		'# Memory, in MiB, for the lines kept before a match, compressed; the oldest are dropped past it.',
 		'buffer_max_mb = %s' % int(settings.buffer_max_mb),
 		'# Free-space floor in percent (0 to 50; 0 disables). Near it, old months may be deleted (see the README),',
 		'# then captures move to the fallback folder or stop.',
 		'min_free_percent = %g' % settings.min_free_percent,
 		'# Least seconds between two deletions of old months in one folder for free space; 0: no wait.',
 		'purge_interval = %s' % int(settings.purge_interval),
+		'# Where firewatcher remembers how far it read the journal, so a restart resumes there;',
+		'# leave blank to read the last tail_lines lines at every start instead.',
+		'position_file = %s' % _ini_text(settings.position_file),
+		'# At start, the most seconds of journal read back: lines logged while stopped, then context; 0: none.',
+		'resume_max = %s' % int(settings.resume_max),
 		'',
 		'[llm]',
 		'# Set true after configuring your OpenAI-compatible API and model.',
@@ -1062,6 +1106,10 @@ def _explicit_cli_args(raw):
 		parts.extend(['--min-free-percent', '%g' % raw.min_free_percent])
 	if getattr(raw, 'purge_interval', None) is not None:
 		parts.extend(['--purge-interval', str(raw.purge_interval)])
+	if getattr(raw, 'position_file', None) is not None:
+		parts.extend(['--position-file', raw.position_file])
+	if getattr(raw, 'resume_max', None) is not None:
+		parts.extend(['--resume-max', str(raw.resume_max)])
 	if getattr(raw, 'delete_after_months', None) is not None:
 		parts.extend(['--delete-after-months', str(raw.delete_after_months)])
 	if getattr(raw, 'llm', None) is True:
@@ -1469,6 +1517,129 @@ def _start_dispatcher(settings):
 		return None
 	return IncidentDispatcher(settings)
 
+def _covered(ranges, low, high):
+	"""Whether one of the sorted, disjoint (low, high) ranges holds all of low..high."""
+	index = bisect.bisect_right(ranges, (low, float('inf'))) - 1
+	return index >= 0 and ranges[index][0] <= low and high <= ranges[index][1]
+
+def _add_to_ranges(ranges, seq):
+	"""Append seq, the newest number yet, to a list of [low, high] ranges."""
+	if ranges and ranges[-1][1] == seq - 1:
+		ranges[-1][1] = seq
+	else:
+		ranges.append([seq, seq])
+
+class ContextBuffer(object):
+	"""The lines kept before a match: the last max_age seconds, in at most about max_bytes of memory.
+
+	New lines collect in a block; once a block holds BUFFER_BLOCK_BYTES of text it is compressed with
+	zlib, so a busy host keeps several times more context in the same memory. Over max_bytes, the oldest
+	block goes first; the newest block (or open block) always stays. Each line has a sequence number (lines read so far),
+	so a capture can leave out what an earlier capture already holds.
+	"""
+
+	def __init__(self, max_age, max_bytes):
+		self.max_age = max_age
+		self.max_bytes = max_bytes
+		# (first_time, last_time, first_seq, count, read times, encoded lengths, compressed text, memory)
+		self.blocks = deque()
+		self.lines = []  # the open block: (read_time, line)
+		self.first_seq = None  # of self.lines[0]
+		self.text_bytes = 0  # in the open block
+		self.lines_memory = 0  # of the open block
+		self.memory = 0
+		self.dropped_until = None  # read time of the newest line a cap pushed out
+
+	def append(self, read_time, seq, line):
+		lines = self.lines
+		if not lines:
+			self.first_seq = seq
+		lines.append((read_time, line))
+		self.text_bytes += len(line)
+		size = sys.getsizeof(line) + BUFFER_LINE_OVERHEAD
+		self.lines_memory += size
+		self.memory += size
+		# Every line comes through here, so only the cheap checks run each time.
+		if self.text_bytes >= BUFFER_BLOCK_BYTES or self.lines_memory >= BUFFER_OPEN_MEMORY:
+			self._seal()
+			self._trim(read_time)
+		elif self.blocks:
+			if self.blocks[0][1] < read_time - self.max_age:
+				self._trim(read_time)
+		elif lines[0][0] < read_time - self.max_age and len(lines) > 1:
+			self._trim(read_time)
+
+	def _seal(self):
+		strings = [line for _read_time, line in self.lines]
+		times = array.array('d', [read_time for read_time, _line in self.lines])
+		# Lengths in characters: the block is decoded whole before it is split again.
+		lengths = array.array('L', map(len, strings))
+		text = zlib.compress(''.join(strings).encode('utf-8', 'replace'), 1)
+		memory = len(text) + times.itemsize * len(times) + lengths.itemsize * len(lengths) + BUFFER_BLOCK_OVERHEAD
+		self.blocks.append((times[0], times[-1], self.first_seq, len(times), times, lengths, text, memory))
+		self.memory += memory - self.lines_memory
+		self.lines = []
+		self.text_bytes = 0
+		self.lines_memory = 0
+
+	def _trim(self, now):
+		cutoff = now - self.max_age
+		while self.blocks and self.blocks[0][1] < cutoff:
+			self.memory -= self.blocks.popleft()[7]
+		while len(self.lines) > 1 and self.lines[0][0] < cutoff and not self.blocks:
+			# The open block ages out line by line; it is small, so this stays cheap.
+			read_time, line = self.lines.pop(0)
+			self.first_seq += 1
+			self.text_bytes -= len(line)
+			size = sys.getsizeof(line) + BUFFER_LINE_OVERHEAD
+			self.lines_memory -= size
+			self.memory -= size
+		# The newest block stays even over the cap: it holds the newest lines.
+		while self.memory > self.max_bytes and (len(self.blocks) > 1 or (self.blocks and self.lines)):
+			block = self.blocks.popleft()
+			self.dropped_until = block[1]
+			self.memory -= block[7]
+
+	def entries(self, since, skip=()):
+		"""Yields (read_time, seq, line) oldest first, for lines read at or after since whose number is in
+		none of the sorted, disjoint (low, high) ranges in skip; one block is decompressed at a time, and a
+		block wholly in skip is not decompressed at all."""
+		skip = list(skip)
+		for first_time, last_time, first_seq, count, times, lengths, text, _memory in self.blocks:
+			if last_time < since or _covered(skip, first_seq, first_seq + count - 1):
+				continue
+			data = zlib.decompress(text).decode('utf-8', 'replace')
+			offset = 0
+			for index in range(count):
+				end = offset + lengths[index]
+				seq = first_seq + index
+				if times[index] >= since and not _covered(skip, seq, seq):
+					yield times[index], seq, data[offset:end]
+				offset = end
+		for index, (read_time, line) in enumerate(self.lines):
+			seq = self.first_seq + index
+			if read_time >= since and not _covered(skip, seq, seq):
+				yield read_time, seq, line
+
+	def seq_span(self, since):
+		"""(first, last) sequence numbers of the lines read at or after since, or None; without decompressing."""
+		if self.lines:
+			last = self.first_seq + len(self.lines) - 1
+		elif self.blocks:
+			last = self.blocks[-1][2] + self.blocks[-1][3] - 1
+		else:
+			return None
+		for _first_time, last_time, first_seq, count, times, _lengths, _text, _memory in self.blocks:
+			if last_time < since:
+				continue
+			for index in range(count):
+				if times[index] >= since:
+					return first_seq + index, last
+		for index, (read_time, _line) in enumerate(self.lines):
+			if read_time >= since:
+				return self.first_seq + index, last
+		return None
+
 class CaptureFile(object):
 	"""Append handle kept open for one capture.
 
@@ -1504,7 +1675,10 @@ class CaptureFile(object):
 		self.handle = None
 		self.saved = False
 		self.closed = False
+		# Whether the capture left a file it had written to, so its lines are not all in self.path.
+		self.moved = False
 		self.unsynced = []  # text written since the last successful fsync
+		self.unsynced_size = 0  # its characters
 		self.last_sync = None
 		self.dirty = False
 		self._move_on(None)
@@ -1517,6 +1691,8 @@ class CaptureFile(object):
 		"""
 		failed = self.path
 		pending = None
+		if self.saved:
+			self.moved = True
 		if self.handle is not None:
 			try:
 				self.handle.close()
@@ -1561,6 +1737,7 @@ class CaptureFile(object):
 			self.written = pending or 0
 			return
 		self.unsynced = []
+		self.unsynced_size = 0
 		_journal(syslog.LOG_ERR, 'no writable folder with free space left for capture %s; its remaining lines are dropped' % failed)
 
 	def _room_left(self, room):
@@ -1593,10 +1770,14 @@ class CaptureFile(object):
 					return
 			self.written += size
 		self.unsynced.append(text)
+		self.unsynced_size += len(text)
 		try:
 			self.handle.write(text)
 		except OSError as exc:
 			self._move_on(exc)
+		# A capture opens with its whole window before the first commit, so bound what is kept for a move.
+		if self.unsynced_size > UNSYNCED_MAX:
+			self._fsync()
 
 	def _flush(self):
 		while self.handle is not None:
@@ -1623,6 +1804,11 @@ class CaptureFile(object):
 		except OSError:
 			return None
 
+	@property
+	def writing(self):
+		"""Whether what is written now lands in a file."""
+		return self.handle is not None
+
 	def sync_due(self):
 		"""When committed data must be fsynced, or None when nothing is pending."""
 		return self.last_sync + self.sync_interval if self.dirty else None
@@ -1639,6 +1825,7 @@ class CaptureFile(object):
 				# Some filesystems cannot fsync; the data has still been flushed.
 			break
 		self.unsynced = []
+		self.unsynced_size = 0
 
 	def sync(self, now=None):
 		self._fsync()
@@ -1713,25 +1900,24 @@ def _end_capture(capture, captured_line_counter, capture_line_count_max, inciden
 				dispatcher.submit(job)
 
 
-def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB, purge_interval=DEFAULT_PURGE_INTERVAL):
+def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB, purge_interval=DEFAULT_PURGE_INTERVAL, reload_patterns=None, journal_position=None):
 	"""Tail the log file and process lines with buffer management.
 
 	capture_time_max bounds how long one capture runs however often its pattern repeats (0: no bound).
 	fallback_folder is where a capture continues when output_folder cannot be written (None: nowhere).
 	min_free_percent is the free-space floor a capture may not take a filesystem below (0: none).
-	buffer_max_mb bounds the memory for the lines kept before a match.
+	The capture_time seconds before a match are kept compressed in at most buffer_max_mb of memory;
+	capture_line_count_max bounds the lines written after it.
 	A capture with a matched line that also matches always_notify_patterns (load_patterns() output)
-	is pushed even when the LLM says not to notify.
+	is pushed even when the LLM says not to notify. After a SIGHUP, reload_patterns() supplies new
+	(patterns, always_notify_patterns) at the next line; if it raises, the old ones stay.
+	journal_position (a JournalPosition) records each line read, and the lines it says were read
+	before the last stop only refill the context.
 	"""
+	global _reload_requested
 	matcher = _as_matcher(patterns)
 	always_matcher = _as_matcher(always_notify_patterns) if always_notify_patterns else None
-	# Only the newest capture_line_count_max buffered lines are ever written, so hold no more.
-	buffer_cap = max(0, capture_line_count_max)
-	log_buffer = deque(maxlen=buffer_cap)  # Stores tuples of (read_time, line)
-	# Lines are capped by count and by memory: each str's own size plus BUFFER_LINE_OVERHEAD.
-	buffer_bytes = 0
-	buffer_max_bytes = buffer_max_mb * 1024 * 1024
-	dropped_until = None  # read_time of the newest line a cap pushed out of log_buffer
+	context = ContextBuffer(max(0, capture_time), buffer_max_mb * 1024 * 1024)
 	# The guard comes first, so the compressors' first runs already keep to its floor.
 	disk_guard = DiskGuard(min_free_percent, purge_interval=purge_interval)
 	log_compressors = [Log_Compressor(output_folder, compress_after_months, delete_after_months, background=True, guard=disk_guard)]
@@ -1745,12 +1931,21 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	read_errors = 0
 	incident = None
 	dispatcher = _start_dispatcher(notify_settings)
+	# Saved captures whose lines may still be in the window, oldest first: {'path', 'ranges', 'last_time'},
+	# ranges being the [low, high] line numbers written there. A new capture leaves those lines out.
+	earlier = deque()
+	written = None  # the open capture's record
 
 	def end_capture(now):
-		nonlocal capture, capture_until, capture_ends_by, captured_line_counter
+		nonlocal capture, capture_until, capture_ends_by, captured_line_counter, written
 		reached_max = capture_ends_by is not None and now >= capture_ends_by
 		_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher,
 					 capture_time_max=capture_time_max if reached_max else None)
+		# A capture that moved has lines in more than one file, or lost some, so later captures write them again.
+		if capture and capture.saved and not capture.moved and written and written['ranges']:
+			written['path'] = capture.path
+			earlier.append(written)
+		written = None
 		capture = None
 		capture_until = None
 		capture_ends_by = None
@@ -1758,23 +1953,25 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 
 	reached_eof = False
 	try:
-		with subprocess.Popen(
-			command_to_run,
-			stdout=subprocess.PIPE,
-			universal_newlines=True,
-			encoding='utf-8',
-			errors='replace',
-		) as proc, ThreadPoolExecutor(max_workers=1) as reader:
+		with subprocess.Popen(command_to_run, stdout=subprocess.PIPE) as proc, ThreadPoolExecutor(max_workers=1) as reader:
+			# Lines end only at \n. Splitting at a bare \r as well would let a message start a line that looks
+			# like a journal entry of its own, with a timestamp the message chose.
+			stream = proc.stdout
+			if isinstance(stream, io.BufferedIOBase):
+				stream = io.TextIOWrapper(stream, encoding='utf-8', errors='replace', newline='\n')
 			pending_read = None
+			line_in_flight = False
 			try:
 				while True:
+					# Set while a line read from the journal is being handled, so a stop then reads it again after the restart.
+					line_in_flight = False
 					try:
 						if pending_read is None and capture_until is None:
 							# Nothing can time out, so read inline instead of waking the reader thread per line.
-							line = proc.stdout.readline(MAX_LINE_CHARS)
+							line = stream.readline(MAX_LINE_CHARS)
 						else:
 							if pending_read is None:
-								pending_read = reader.submit(proc.stdout.readline, MAX_LINE_CHARS)
+								pending_read = reader.submit(stream.readline, MAX_LINE_CHARS)
 							deadline = capture_until
 							sync_due = capture.sync_due() if capture else None
 							if sync_due is not None and (deadline is None or sync_due < deadline):
@@ -1783,6 +1980,9 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							line = pending_read.result(timeout=remaining)
 							pending_read = None
 					except ReadTimeout:
+						if journal_position is not None:
+							# Saved along with the capture's fsync below, so a quiet journal leaves no line unsaved for long.
+							journal_position.save()
 						# Keep the same pending read while the source is quiet.
 						if capture and capture_until is not None and time.time() < capture_until:
 							capture.sync()
@@ -1805,22 +2005,38 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 						continue
 					read_time = time.time()
 					processed_line_counter += 1
+					if _reload_requested:
+						_reload_requested = False
+						if reload_patterns is not None:
+							try:
+								new_patterns, new_always = reload_patterns()
+							except Exception as exc:
+								_journal(syslog.LOG_ERR, 'reloading patterns failed, keeping the old ones: %s' % exc)
+							else:
+								matcher = _as_matcher(new_patterns)
+								always_matcher = _as_matcher(new_always) if new_always else None
+								_journal(syslog.LOG_INFO, 'reloaded patterns: %d regex, %d plain%s' % (
+									len(matcher.regexes), len(matcher.substrings) + len(matcher.globs),
+									', always_notify too' if always_matcher else ''))
 
-					# Keep capture_time seconds of context, at most buffer_cap lines and buffer_max_bytes of memory
-					while log_buffer and read_time - log_buffer[0][0] > capture_time:
-						buffer_bytes -= sys.getsizeof(log_buffer.popleft()[1]) + BUFFER_LINE_OVERHEAD
-					if len(log_buffer) == buffer_cap:
-						dropped_until = log_buffer[0][0] if log_buffer else read_time
-						if log_buffer:
-							# append() is about to push this one out
-							buffer_bytes -= sys.getsizeof(log_buffer[0][1]) + BUFFER_LINE_OVERHEAD
-					if buffer_cap:
-						log_buffer.append((read_time, line))
-						buffer_bytes += sys.getsizeof(line) + BUFFER_LINE_OVERHEAD
-					# Oldest lines go first; the newest line always stays.
-					while buffer_bytes > buffer_max_bytes and len(log_buffer) > 1:
-						dropped_until = log_buffer[0][0]
-						buffer_bytes -= sys.getsizeof(log_buffer.popleft()[1]) + BUFFER_LINE_OVERHEAD
+					line_time = read_time
+					if journal_position is not None:
+						if journal_position.replaying:
+							replayed_at = journal_position.replay_time(line)
+							if replayed_at is not None:
+								# Read before the last stop: context for a match, never a match itself.
+								context.append(min(replayed_at, read_time), processed_line_counter, line)
+								continue
+						# Before matching, so a line that crashes firewatcher is not read again after the restart.
+						line_in_flight = True
+						journal_position.saw(line, read_time)
+						# Logged while firewatcher was stopped: its own time, so a match in that backlog has the
+						# capture_time before it as context, not the whole backlog read in the same instant.
+						if journal_position.stamp_time is not None and journal_position.stamp_time < read_time - BACKLOG_LAG:
+							line_time = journal_position.stamp_time
+
+					# Keep capture_time seconds of context, compressed, in at most buffer_max_mb of memory
+					context.append(line_time, processed_line_counter, line)
 
 					# A capture whose window (or capture_time_max) ran out before this line ends first,
 					# so a matching line starts a new capture instead of extending a finished one.
@@ -1830,7 +2046,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					# if the current line matches the pattern, capture the logs for the next capture_time seconds
 					matched_pattern = matcher.find(line)
 					if matched_pattern is not None:
-						if capture is None:
+						opened = capture is None
+						if opened:
 							# Before the capture exists, so an interrupt in between cannot hand over the previous incident.
 							incident = {
 								'pattern': matched_pattern,
@@ -1852,15 +2069,41 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							capture.write(f"{bcolors.warning}Captured at:     {datetime.datetime.now().isoformat()}{bcolors.ENDC}\n")
 							print(f"  Captured at:     {datetime.datetime.now().isoformat()}")
 							capture.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
-							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(read_time - capture_time).isoformat()}:{bcolors.ENDC}\n")
-							if dropped_until is not None and read_time - dropped_until <= capture_time:
-								capture.write(f"{bcolors.warning}Older cached in-memory lines were dropped to stay within capture_line_count_max {capture_line_count_max} lines and buffer_max_mb {buffer_max_mb} MiB ...{bcolors.ENDC}\n")
+							since = line_time - max(0, capture_time)
+							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(since).isoformat()}:{bcolors.ENDC}\n")
+							if context.dropped_until is not None and context.dropped_until >= since:
+								capture.write(f"{bcolors.warning}Older cached in-memory lines were dropped to stay within buffer_max_mb {buffer_max_mb} MiB ...{bcolors.ENDC}\n")
+							# Lines of the window an earlier capture already holds are left out, with a note per file.
+							# The window's lines are numbered first..last; a record wholly before that cannot matter.
+							window = context.seq_span(since)
+							while earlier and (window is None or earlier[0]['last_time'] < since or earlier[0]['ranges'][-1][1] < window[0]):
+								earlier.popleft()
+							held = sorted((low, high, record['path']) for record in earlier for low, high in record['ranges'])
+							# Neighbouring captures' ranges merged, so a block they hold between them is not decompressed.
+							skip = []
+							for low, high, _path in held:
+								if skip and low <= skip[-1][1] + 1:
+									skip[-1] = (skip[-1][0], max(skip[-1][1], high))
+								else:
+									skip.append((low, high))
+							if held:
+								counts = {}
+								for low, high, path in held:
+									overlap = min(high, window[1]) - max(low, window[0]) + 1
+									if overlap > 0:
+										counts[path] = counts.get(path, 0) + overlap
+								order = [record['path'] for record in earlier]
+								for path in sorted(counts, key=order.index):
+									capture.write(f"{bcolors.warning}{counts[path]} lines of this window are left out: they are in {path}{bcolors.ENDC}\n")
 							header_end = capture.position()
-							for _buffered_time, buffered_line in log_buffer:
+							written = {'path': None, 'ranges': [], 'last_time': read_time}
+							for _buffered_time, seq, buffered_line in context.entries(since, skip):
 								if matcher.find(buffered_line) is not None:
 									capture.write(f'{bcolors.critical}-> {buffered_line.strip()}{bcolors.ENDC}\n')
 								else:
 									capture.write(buffered_line)
+								if capture.writing:
+									_add_to_ranges(written['ranges'], seq)
 							# Where the context starts and where the line that opened the capture ends, so the
 							# LLM excerpt can be built around the match. Only valid while the file stays the same.
 							match_end = capture.position()
@@ -1870,10 +2113,17 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							# Append the line to the current log file
 							capture.write(f'{bcolors.critical}-> {line.strip()}{bcolors.ENDC}\n')
 							captured_line_counter += 1
+							if capture.writing:
+								_add_to_ranges(written['ranges'], processed_line_counter)
+								written['last_time'] = read_time
 						if always_matcher is not None and 'always_notify' not in incident and always_matcher.first_match(line) is not None:
 							incident['always_notify'] = True
 							incident['always_notify_line'] = line.strip()
 						capture.commit()
+						line_in_flight = False
+						if opened and journal_position is not None:
+							# Now that the capture holds the match, a crash repeats this capture after the restart rather than losing it.
+							journal_position.save(read_time)
 						# If a match is found, set to capture the next capture_time seconds
 						capture_until = read_time + capture_time
 						if capture_ends_by is not None:
@@ -1884,7 +2134,11 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					elif capture:
 						capture.write(line)
 						capture.commit()
+						line_in_flight = False
 						captured_line_counter += 1
+						if capture.writing:
+							_add_to_ranges(written['ranges'], processed_line_counter)
+							written['last_time'] = read_time
 						if captured_line_counter > capture_line_count_max:
 							end_capture(read_time)
 					# if no capture is open, check for log compression
@@ -1894,6 +2148,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					if processed_line_counter % 10000 == 0:
 						print(f"Processed {processed_line_counter} lines.",flush=True)
 			except KeyboardInterrupt:
+				if line_in_flight and journal_position is not None:
+					journal_position.unsee()
 				print("Exiting.")
 			finally:
 				if not reached_eof:
@@ -1910,8 +2166,12 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 			if capture:
 				end_capture(time.time())
 		finally:
-			if dispatcher is not None:
-				dispatcher.close()
+			try:
+				if journal_position is not None:
+					journal_position.save(final=True)
+			finally:
+				if dispatcher is not None:
+					dispatcher.close()
 	if reached_eof:
 		# A run that read its input to the end (--filter-only) finishes compressing before it exits.
 		for log_compressor in log_compressors:
@@ -2045,6 +2305,7 @@ def render_unit_file(args, executable=None, config_exists=None, raw=None):
 		'RestartSec=5',
 		'TimeoutStopSec=%d' % stop_sec,
 		'KillSignal=SIGINT',
+		'ExecReload=/bin/kill -HUP $MAINPID',
 		'StandardOutput=journal',
 		'StandardError=journal',
 		'',
@@ -2186,7 +2447,7 @@ def build_parser():
 					 'Other files load fnmatch (bash like) patterns with * wildcards added at both ends. '
 					 'A directory (such as /etc/firewatcher/patterns.d) loads every non-hidden pattern file inside it. '
 					 'Optional for --install-service / --print-unit (defaults to /etc/firewatcher/patterns.d) and --uninstall-service.')
-	parser.add_argument('--log-file', type=str, help='Path to the log file to monitor. Default: journalctl -> /var/log/syslog -> /var/log/messages.')
+	parser.add_argument('--log-file', type=str, help='Path to the log file to monitor. Default: the journal (journalctl) when journald runs, else /var/log/syslog, else /var/log/messages.')
 	# Never implemented; still accepted so existing units that pass it keep starting.
 	parser.add_argument('--workers', type=int, default=1, help=argparse.SUPPRESS)
 	parser.add_argument('-t','--capture-time', type=int, default=None, help='Time in seconds to capture logs after a match. Default: 300 seconds.')
@@ -2200,10 +2461,12 @@ def build_parser():
 					  'Lines arrive faster than real time, so -t and --capture-time-max do not bound a capture: it runs to --capture_line_count_max lines or the end of the input.')
 	filt.add_argument('--no-filter_only', '--no-filter-only', dest='filter_only', action='store_false', help='Follow new log lines. Overrides filter_only from the config file.')
 	parser.add_argument('--compress-after-months', type=int, default=None, help='Compress logs after this many months. Default: 3 months.')
-	parser.add_argument('--capture_line_count_max', '--capture-line-count-max', type=int, default=None, help='Maximum number of lines to capture before and after in a single log file. Default: 10000 lines. Note: The final file maybe 2 * this number. Also caps how many recent lines are held in memory.')
-	parser.add_argument('--buffer-max-mb', type=int, default=None, help='Memory, in MiB, for the lines kept before a match. The oldest lines are dropped past it. Default: %d.' % DEFAULT_BUFFER_MAX_MB)
+	parser.add_argument('--capture_line_count_max', '--capture-line-count-max', type=int, default=None, help='Maximum number of lines to capture after a match in a single log file. Default: 10000 lines. The lines before the match are bounded by --capture-time and --buffer-max-mb.')
+	parser.add_argument('--buffer-max-mb', type=int, default=None, help='Memory, in MiB, for the lines kept before a match, compressed. The oldest lines are dropped past it. Default: %d.' % DEFAULT_BUFFER_MAX_MB)
 	parser.add_argument('--min-free-percent', type=_percent_arg, default=None, help='Free-space floor, in percent (0 to 50), for the filesystems captures are written to. Near it, old months of captures may be deleted (see the README), then the capture moves to the fallback folder or stops. 0 disables. Default: %g.' % DEFAULT_MIN_FREE_PERCENT)
 	parser.add_argument('--purge-interval', type=int, default=None, metavar='SEC', help='Least seconds between two deletions of old months in one folder to keep the free-space floor, so a disk that something else keeps filling drains the history slowly. 0: no wait. Default: %d.' % DEFAULT_PURGE_INTERVAL)
+	parser.add_argument('--position-file', type=str, default=None, metavar='PATH', help='Where firewatcher remembers how far it read the journal, so a restart resumes there instead of reading the last --tail-lines lines again. Journal only. An empty string disables it. Default: %s' % DEFAULT_POSITION_FILE)
+	parser.add_argument('--resume-max', type=int, default=None, metavar='SEC', help='At start, the most seconds of journal read back from the saved position: lines logged while firewatcher was stopped, and --capture-time of context before them. 0: none. Default: %d.' % DEFAULT_RESUME_MAX)
 	parser.add_argument('--delete-after-months', type=int, default=None, help='Delete logs after this many months. (will only delete files in YYYY-MM format) Default: 0 (never by age; the free-space floor can still delete the oldest months).')
 	svc = parser.add_mutually_exclusive_group()
 	svc.add_argument('--install-service', action='store_true', help='Install and enable a systemd unit for this command line. Warns and exits if systemd is not available.')
@@ -2233,6 +2496,212 @@ def build_parser():
 	return parser
 
 
+def _iso_stamp(line):
+	"""(seconds since the epoch, length of the stamp and its space) for a journalctl -o short-iso line, or None."""
+	matched = _ISO_STAMP_RE.match(line)
+	if not matched:
+		return None
+	year, month, day, hour, minute, second = (int(part) for part in matched.group(1, 2, 3, 4, 5, 6))
+	# Log text can look like a stamp: a bare carriage return in a message starts a new line here.
+	try:
+		datetime.datetime(year, month, day, hour, minute, min(second, 59))
+	except ValueError:
+		return None
+	when = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
+	if matched.group(7):
+		offset = int(matched.group(8)) * 3600 + int(matched.group(9)) * 60
+		when += -offset if matched.group(7) == '+' else offset
+	return when, matched.end()
+
+
+def _line_digest(line, stamp_end):
+	# Without the timestamp, so a changed time zone still finds the line.
+	return hashlib.sha1(line[stamp_end:].rstrip('\n').encode('utf-8', 'replace')).hexdigest()
+
+
+class JournalPosition(object):
+	"""How far the journal was read, kept in a small file so a restart resumes after it.
+
+	The file holds the second of the last line read (from journalctl -o short-iso), which line of
+	that second it was, and a digest of it. At start, journalctl reads from capture_time before
+	that line, at most resume_max seconds back: the lines up to the saved one only refill the
+	context kept before a match, and the lines after it are matched as usual.
+	"""
+
+	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None):
+		import json
+		self.path = path
+		now = time.time() if now is None else now
+		self.since = None
+		self.replaying = False
+		self.saved = None
+		# The last line read in this run with a timestamp, and which line of its second it was.
+		self.stamp = None
+		self.last_line = None
+		self.last_end = 0
+		self.ordinal = 0
+		self.changed = False
+		self.next_save = 0
+		self.save_failed = False
+		# The time of self.stamp, for the context: a line read long after it was logged keeps its own time.
+		self.stamp_time = None
+		# What saw() changed for the line being handled, for unsee().
+		self.before = None
+		# While replaying: lines of the saved second read so far, the time of the last one, and whether the saved line was among them.
+		self.seen_in_second = 0
+		self.replay_at = None
+		self.found = False
+		try:
+			with open(path, 'r', encoding='utf-8') as f:
+				record = json.load(f)
+			saved = (int(record['time']), int(record['line']), str(record['sha1']))
+		except FileNotFoundError:
+			self.note = 'No journal position saved in %s yet; reading the last %s lines.' % (path, tail_lines)
+			return
+		except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+			self.note = 'Cannot read the journal position in %s (%s); reading the last %s lines.' % (path, exc, tail_lines)
+			return
+		saved_time = saved[0]
+		try:
+			shown = datetime.datetime.fromtimestamp(saved_time).isoformat()
+		except (OverflowError, OSError, ValueError) as exc:
+			self.note = 'Cannot read the journal position in %s (%s); reading the last %s lines.' % (path, exc, tail_lines)
+			return
+		if saved_time > now + 60:
+			self.note = 'The journal position in %s, %s, is in the future; reading the last %s lines.' % (path, shown, tail_lines)
+			return
+		self.since = int(max(saved_time - max(0, context_time), now - resume_max))
+		if self.since > saved_time:
+			self.note = 'The journal position in %s, %s, is %d seconds old; reading the last %d seconds.' % (
+				path, shown, now - saved_time, resume_max)
+			return
+		self.saved = saved
+		self.replaying = True
+		self.replay_at = self.since
+		self.note = 'Resuming the journal after %s, %d seconds ago, with %d seconds of context before it.' % (
+			shown, max(0, now - saved_time), saved_time - self.since)
+
+	def journal_command(self, command):
+		"""command with ISO timestamps, and --since instead of --lines when resuming."""
+		command = [command[0], '--output=short-iso'] + command[1:]
+		if self.since is not None:
+			command = ['--since=@%d' % self.since if part.startswith('--lines=') else part for part in command]
+		return command
+
+	def replay_time(self, line):
+		"""While replaying: the time of a line from before the saved position, for the context. None from the first line after it."""
+		stamp = _iso_stamp(line)
+		if stamp is None:
+			# A continuation of the line before, or a journalctl note such as "-- Boot ... --".
+			return self.replay_at
+		when, stamp_end = stamp
+		saved_time, saved_ordinal, saved_digest = self.saved
+		if self.found or when > saved_time:
+			self.replaying = False
+			return None
+		if when == saved_time:
+			self.seen_in_second += 1
+			# Counting from where this run's view of that second starts: the line number and digest must both agree.
+			# A run that started with --lines in the middle of a second numbers that second's lines from there, so
+			# identical lines before the saved one can end the replay early: lines are read again, never skipped.
+			if self.seen_in_second >= saved_ordinal and _line_digest(line, stamp_end) == saved_digest:
+				self.found = True
+				self.stamp = line[:stamp_end]
+				self.stamp_time = when
+				self.ordinal = self.seen_in_second
+		self.replay_at = when
+		return when
+
+	def saw(self, line, now):
+		"""Record a line as read, before it is handled. The periodic save (at most once per POSITION_SAVE_INTERVAL)
+		runs first, so it never covers a line still being handled; unsee() takes the line back."""
+		if self.changed and now >= self.next_save:
+			self.save(now)
+		self.before = (self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed)
+		if self.stamp is not None and line.startswith(self.stamp):
+			self.ordinal += 1
+		else:
+			stamp = _iso_stamp(line)
+			if stamp is None:
+				return
+			self.stamp = line[:stamp[1]]
+			self.stamp_time = stamp[0]
+			self.ordinal = 1
+		self.last_line = line
+		self.last_end = len(self.stamp)
+		self.changed = True
+
+	def unsee(self):
+		"""Take back the line saw() recorded last: a stop came before it was handled, so the next run reads it again."""
+		if self.before is not None:
+			self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed = self.before
+			self.before = None
+
+	def save(self, now=None, final=False):
+		"""Write the position atomically; a failure is logged once and retried at the next save."""
+		import json
+		now = time.time() if now is None else now
+		self.next_save = now + POSITION_SAVE_INTERVAL
+		if not self.changed:
+			return
+		self.changed = False
+		import tempfile
+		record = {
+			'time': _iso_stamp(self.last_line)[0],
+			'line': self.ordinal,
+			'sha1': _line_digest(self.last_line, self.last_end),
+		}
+		folder = os.path.dirname(self.path) or '.'
+		unfinished = None
+		try:
+			os.makedirs(folder, exist_ok=True)
+			# A new file with a name no one can guess, so a link planted in a shared folder is never followed.
+			fd, unfinished = tempfile.mkstemp(prefix=os.path.basename(self.path) + '.', suffix='.tmp', dir=folder)
+			with os.fdopen(fd, 'w', encoding='utf-8') as f:
+				f.write(json.dumps(record) + '\n')
+				if final:
+					f.flush()
+					os.fsync(f.fileno())
+			os.replace(unfinished, self.path)
+		except OSError as exc:
+			self.changed = True
+			if not self.save_failed:
+				_journal(syslog.LOG_ERR, 'cannot save the journal position to %s, so a restart reads the journal again '
+						 'from the last position saved: %s' % (self.path, exc))
+			self.save_failed = True
+			if unfinished is not None:
+				try:
+					os.unlink(unfinished)
+				except OSError:
+					pass
+		else:
+			self.save_failed = False
+
+
+def _journal_can_resume(journalctl):
+	"""True when journalctl takes the ISO output and --since=@seconds that resuming needs."""
+	try:
+		probe = subprocess.run(
+			[journalctl, '--quiet', '--no-pager', '--output=short-iso', '--since=@%d' % int(time.time()), '--lines=0'],
+			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+	except (OSError, subprocess.SubprocessError):
+		return False
+	return probe.returncode == 0
+
+
+def _journald_present():
+	"""True when journald runs here, or its journal files are here (such as a host journal mounted into a container)."""
+	if os.path.exists(JOURNALD_SOCKET):
+		return True
+	for folder in JOURNAL_DIRS:
+		try:
+			if os.listdir(folder):
+				return True
+		except OSError:
+			pass
+	return False
+
+
 def log_source_command(args):
 	"""Return the argv used to read logs, or None if nothing is available."""
 	if not getattr(args, '_resolved', False):
@@ -2243,16 +2712,46 @@ def log_source_command(args):
 		file_pre = ['tail', '-n', str(args.tail_lines), '-F']
 	if args.log_file:
 		return file_pre + [args.log_file]
-	if shutil.which('journalctl'):
-		cmd = ['journalctl', '--all', '--no-pager', '--lines=%s' % args.tail_lines]
-		if not args.filter_only:
-			cmd.append('--follow')
-		return cmd
+	journal = ['journalctl', '--all', '--no-pager', '--lines=%s' % args.tail_lines]
+	if not args.filter_only:
+		journal.append('--follow')
+	has_journalctl = shutil.which('journalctl') is not None
+	# journalctl on PATH alone is not enough: a host can have it installed while another init and syslog run.
+	if has_journalctl and _journald_present():
+		return journal
 	if os.path.exists('/var/log/syslog'):
 		return file_pre + ['/var/log/syslog']
 	if os.path.exists('/var/log/messages'):
 		return file_pre + ['/var/log/messages']
+	# With no syslog file either, journalctl is still the best guess, as before.
+	if has_journalctl:
+		return journal
 	return None
+
+# Set by SIGHUP; the capture loop reloads the pattern files at the next line. A plain flag, not a
+# threading.Event: the handler runs on the main thread, which may hold the Event's lock in clear().
+_reload_requested = False
+
+def _request_reload(signum, frame):
+	global _reload_requested
+	_reload_requested = True
+
+
+def _load_pattern_sets(pattern_sources, always_notify_sources):
+	"""(watch patterns, always_notify patterns or None) from the pattern files; ValueError if no watch pattern loads."""
+	patterns = load_patterns(pattern_sources)
+	# A mistyped path or a file of invalid regexes must not leave a daemon that watches for nothing.
+	if not any(patterns.values()):
+		raise ValueError('no usable patterns in %s' % pattern_sources)
+	always_notify_patterns = None
+	if always_notify_sources:
+		always_notify_patterns = load_patterns(always_notify_sources)
+		if not any(always_notify_patterns.values()):
+			# Capturing matters more than this override, so keep watching, and say so where it will be seen.
+			_journal(syslog.LOG_ERR, 'no usable always_notify patterns in %s; the LLM decides for every capture' % always_notify_sources)
+			always_notify_patterns = None
+	return patterns, always_notify_patterns
+
 
 def _stop_on_sigterm(signum, frame):
 	"""SIGTERM ends the run like Ctrl-C, so the open capture is finished and handed to the dispatcher."""
@@ -2281,6 +2780,20 @@ def main(argv=None):
 	if args.install_service:
 		return install_service(resolved, raw=args)
 	print(f"Starting firewatcher v{version}")
+	# SIGHUP reloads the pattern files, but not in a terminal, where it means the terminal went away. It is
+	# handled from here on, so a reload right after a start does not end the process while it starts up.
+	previous_sighup = None
+	if not _isatty(sys.stdin):
+		previous_sighup = signal.signal(signal.SIGHUP, _request_reload)
+	try:
+		return _watch(resolved)
+	finally:
+		if previous_sighup is not None:
+			signal.signal(signal.SIGHUP, previous_sighup)
+
+
+def _watch(resolved):
+	"""Watch the logs with resolved settings until the input ends or firewatcher is stopped."""
 	command_to_run = log_source_command(resolved)
 	if not command_to_run:
 		print("No log file specified and no journalctl / syslog / messages found. Use --log-file. Exiting.")
@@ -2289,18 +2802,23 @@ def main(argv=None):
 	if not pattern_files:
 		print(f"No pattern files found in {resolved.pattern_file}. Exiting.", file=sys.stderr)
 		return 1
-	patterns = load_patterns(pattern_files)
-	# A mistyped path or a file of invalid regexes must not leave a daemon that watches for nothing.
-	if not any(patterns.values()):
+	try:
+		patterns, always_notify_patterns = _load_pattern_sets(pattern_files, resolved.always_notify)
+	except ValueError:
 		print(f"No usable patterns in {resolved.pattern_file}. Exiting.", file=sys.stderr)
 		return 1
-	always_notify_patterns = None
-	if resolved.always_notify:
-		always_notify_patterns = load_patterns(expand_pattern_sources(resolved.always_notify))
-		if not any(always_notify_patterns.values()):
-			# Capturing matters more than this override, so keep watching, and say so where it will be seen.
-			_journal(syslog.LOG_ERR, 'no usable always_notify patterns in %s; the LLM decides for every capture' % resolved.always_notify)
-			always_notify_patterns = None
+	journal_position = None
+	position_lock = None
+	if resolved.position_file and command_to_run[0] == 'journalctl' and '--follow' in command_to_run:
+		position_lock = _lock_position_file(resolved.position_file)
+		if position_lock is None:
+			print(f"Another firewatcher is using the journal position in {resolved.position_file}; reading the last {resolved.tail_lines} lines, without saving a position.")
+		elif _journal_can_resume(command_to_run[0]):
+			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines)
+			command_to_run = journal_position.journal_command(command_to_run)
+			print(journal_position.note)
+		else:
+			print(f"This journalctl cannot resume from a saved position (that needs -o short-iso and --since=@); reading the last {resolved.tail_lines} lines.")
 	print(f"Monitoring {command_to_run} for patterns: {patterns}")
 	print(f"Capturing logs for {resolved.capture_time} seconds, {resolved.capture_time_max or 'no'} seconds at most.")
 	print(f"Output folder: {resolved.output_folder}")
@@ -2333,11 +2851,40 @@ def main(argv=None):
 			min_free_percent=resolved.min_free_percent,
 			purge_interval=resolved.purge_interval,
 			buffer_max_mb=resolved.buffer_max_mb,
+			reload_patterns=lambda: _load_pattern_sets(resolved.pattern_file, resolved.always_notify),
+			journal_position=journal_position,
 		)
 	finally:
 		if previous_sigterm is not None:
 			signal.signal(signal.SIGTERM, previous_sigterm)
+		if position_lock is not None and position_lock >= 0:
+			os.close(position_lock)
 	return 0
+
+
+def _lock_position_file(path):
+	"""Lock path + '.lock' so two firewatchers never share a journal position; returns the descriptor to close
+	when done, -1 when no lock can be taken there (saving will say why), or None when another process holds it."""
+	try:
+		folder = os.path.dirname(path)
+		if folder:
+			os.makedirs(folder, exist_ok=True)
+		fd = os.open(path + '.lock', os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+	except OSError:
+		return -1
+	try:
+		fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except OSError as exc:
+		os.close(fd)
+		return None if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN) else -1
+	return fd
+
+
+def _isatty(stream):
+	try:
+		return stream.isatty()
+	except (AttributeError, ValueError, OSError):
+		return False
 
 
 if __name__ == '__main__':
