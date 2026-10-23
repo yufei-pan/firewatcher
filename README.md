@@ -60,6 +60,8 @@ sudo firewatcher --uninstall-service
 
 `--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`.
 
+Capture files follow the process umask. A systemd service defaults to `UMask=0022`, so captures are readable by every local user, while the journal they copy from is normally readable only by root and the `adm`/`systemd-journal` groups. On a host with untrusted local users, add `UMask=0027` to the unit, for example with `systemctl edit firewatcher`.
+
 If systemd is not available, `--install-service` and `--uninstall-service` print a warning and exit. `--print-unit` still works so you can copy the unit elsewhere.
 
 Useful flags:
@@ -157,6 +159,8 @@ Both features default off.
 - If the LLM request times out, returns an HTTP error, or is not the expected JSON, and notifications are on, firewatcher still pushes, using the generated title.
 
 The capture window closes even when no further log lines arrive. Analysis runs on a background worker so log following stays live. The queue holds four captures. When the queue is full, that incident skips the model and, if notifications are on, the capture thread sends the generated-title push itself.
+
+A capture that fits in `max_bytes` (default 48000) is sent whole. A bigger one is cut around the line that opened it: the header, then the lines just before the match (a quarter of the budget), the lines just after it (half), and the end of the capture (a quarter), each cut marked `[... N bytes skipped ...]`. Room one side does not need goes to the other. The pieces are read separately, so a large capture is never loaded into memory whole.
 
 Any user or program on the host can write log lines, and those lines reach the model. The request marks the matched line and the excerpt as untrusted data between `BEGIN`/`END` lines that carry a random token, and the system prompt tells the model never to follow instructions inside them. That makes it harder for a log line to talk the model out of notifying, but cannot rule it out. For incidents that must always reach you, list patterns under `[notify] always_notify` (or `--always-notify`): when a line that matched a watch pattern also matches one of them, the capture is pushed even if the model says not to notify. That push uses the generated title and the line that matched, followed by the model's summary, since log text can steer the summary as well. If no always_notify pattern loads, firewatcher logs an error and keeps capturing without it; `--always-notify ''` clears a list set in the config. Only the line that opened the capture and later lines that matched a watch pattern while it was open count. Other lines in the window do not, and neither do matches from an earlier capture that appear as context. The capture's color codes are removed before it is sent to the model.
 

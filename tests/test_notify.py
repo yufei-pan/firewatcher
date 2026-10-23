@@ -538,3 +538,120 @@ def test_always_notify_push_leads_with_the_line_not_the_model(tmp_path, monkeypa
     assert push.headers['Title'] == 'box: HIT'
     body = push.data.decode('utf-8')
     assert body.startswith('kernel: blk_update_request: I/O error, dev sdb / Model summary: Scheduled drill')
+
+
+def capture_layout(path, pre=1000, post=1000):
+    """A capture file shaped like the real ones: header, context, the match, what followed. Returns the marks."""
+    header = b'\x1b[93mMatched pattern: \x1b[91m*HIT*\x1b[0m\n\x1b[93mLogs since then:\x1b[0m\n'
+    context = b''.join(b'pre-%04d %s\n' % (i, b'x' * 60) for i in range(pre)) + b'\x1b[91m-> HIT now\x1b[0m\n'
+    after = b''.join(b'post-%04d %s\n' % (i, b'y' * 60) for i in range(post)) + b'End of capture\n'
+    path.write_bytes(header + context + after)
+    return len(header), len(header) + len(context)
+
+
+def test_excerpt_centers_on_the_match(tmp_path):
+    path = tmp_path / 'cap.log'
+    marks = capture_layout(path)
+    text = fw._capture_excerpt(str(path), 8000, marks=marks)
+    assert len(text.encode('utf-8')) <= 8000
+    assert '\x1b' not in text
+    # the header, the lines right before and after the match, and how the capture ended
+    order = [text.index(s) for s in ('Matched pattern: *HIT*', 'pre-0999', '-> HIT now', 'post-0000', 'post-0999', 'End of capture')]
+    assert order == sorted(order)
+    assert 'pre-0000' not in text
+    assert 'post-0500' not in text
+    assert text.count('bytes skipped ...]') == 2
+    # every piece is whole lines
+    for line in text.splitlines():
+        assert re.fullmatch(r'(pre|post)-\d{4} [xy]{60}|-> HIT now|Matched pattern: \*HIT\*|Logs since then:|End of capture|\[\.\.\. \d+ bytes skipped \.\.\.\]', line), line
+
+
+def test_excerpt_gives_unused_room_to_the_other_side(tmp_path):
+    short_after = tmp_path / 'short-after.log'
+    marks = capture_layout(short_after, pre=1000, post=5)
+    text = fw._capture_excerpt(str(short_after), 8000, marks=marks)
+    assert 'post-0004' in text and 'End of capture' in text
+    assert len(re.findall(r'^pre-', text, re.M)) > 8000 // 4 // 72  # more than its quarter
+    short_before = tmp_path / 'short-before.log'
+    marks = capture_layout(short_before, pre=3, post=1000)
+    text = fw._capture_excerpt(str(short_before), 8000, marks=marks)
+    assert 'pre-0000' in text
+    assert len(re.findall(r'^post-', text, re.M)) > 8000 * 3 // 4 // 72 - 10
+
+
+def test_excerpt_never_reads_more_than_its_budget(tmp_path, monkeypatch):
+    path = tmp_path / 'cap.log'
+    marks = capture_layout(path, pre=20000, post=20000)
+    reads = []
+    real_open = open
+
+    class Recording:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def read(self, n=-1):
+            reads.append(n)
+            return self.handle.read(n)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.handle.close()
+
+    monkeypatch.setattr(fw, 'open', lambda *a, **k: Recording(real_open(*a, **k)), raising=False)
+    for use_marks in (marks, None):
+        reads.clear()
+        fw._capture_excerpt(str(path), 4000, marks=use_marks)
+        assert reads and all(0 <= n <= 4000 for n in reads)
+        assert sum(reads) <= 4000
+
+
+@pytest.mark.parametrize('marks, budget', [((10, 10 ** 9), 8000), ((500, 100), 8000), ((100, 5000), 600)])
+def test_excerpt_falls_back_to_head_and_tail(tmp_path, marks, budget):
+    path = tmp_path / 'cap.log'
+    capture_layout(path)
+    text = fw._capture_excerpt(str(path), budget, marks=marks)
+    assert text.startswith('Matched pattern')
+    assert text.endswith('End of capture\n')
+    assert '\n...\n' in text
+
+
+def test_capture_records_excerpt_marks_for_the_llm(tmp_path, monkeypatch):
+    sent = []
+
+    def urlopen(req, timeout=None):
+        sent.append(json.loads(req.data.decode('utf-8')))
+        return chat('{"title": "T", "summary": "s", "notify": false}')
+
+    silence_syslog(monkeypatch)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
+    resolved = settings_from(tmp_path, '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\nmax_bytes = 6000\n')
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    src = tmp_path / 'src.log'
+    src.write_text(''.join('pre-%04d %s\n' % (i, 'x' * 60) for i in range(500)) + 'HIT now\n'
+                   + ''.join('post-%04d %s\n' % (i, 'y' * 60) for i in range(500)))
+    fw.capture_messages(['cat', str(src)], fw.load_patterns([str(pat)]), capture_time=60,
+                        output_folder=str(tmp_path / 'out'), compress_after_months=0, notify_settings=resolved)
+    excerpt = sent[0]['messages'][1]['content'].split('Excerpt:\n', 1)[1]
+    for expected in ('Matched pattern: *HIT*', 'pre-0499', '-> HIT now', 'post-0000', 'post-0499', 'End of capture'):
+        assert expected in excerpt
+    assert 'pre-0000' not in excerpt
+
+
+def test_excerpt_marks_from_a_moved_capture_are_not_used(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(fw, '_capture_excerpt', lambda path, max_bytes, marks=None: seen.append(marks) or '')
+    monkeypatch.setattr(fw, '_urlopen_bytes', lambda *a: chat('{"title": "T", "summary": "s", "notify": true}').read())
+    settings = settings_from(tmp_path, '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n')
+    moved = incident(tmp_path / 'fallback.log')
+    moved['excerpt_marks'] = (str(tmp_path / 'primary.log'), 10, 20)
+    fw.call_llm(settings, moved)
+    same = incident(tmp_path / 'primary.log')
+    same['excerpt_marks'] = (str(tmp_path / 'primary.log'), 10, 20)
+    fw.call_llm(settings, same)
+    assert seen == [None, (10, 20)]

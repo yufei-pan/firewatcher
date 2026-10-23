@@ -57,6 +57,9 @@ PROGRAMMATIC_TITLE_MAX = 120
 NTFY_TITLE_MAX = 200
 NTFY_BODY_MAX = 4096
 EXCERPT_HEAD_BYTES = 2048
+# Below this budget the excerpt is just the head and tail of the capture.
+EXCERPT_AROUND_MATCH_MIN = 1024
+EXCERPT_MARKER_BYTES = len(b'[... %d bytes skipped ...]\n' % (2 ** 64))
 JOURNAL_LINE_MAX = 8000
 LLM_API_KEY_ENV = 'FIREWATCHER_LLM_API_KEY'
 NTFY_TOKEN_ENV = 'FIREWATCHER_NTFY_TOKEN'
@@ -848,35 +851,98 @@ def _parse_llm_object(content):
 	return {'title': title, 'summary': str(summary), 'notify': obj['notify']}
 
 
-def _capture_excerpt(path, max_bytes):
+def _capture_excerpt(path, max_bytes, marks=None):
+	"""Up to max_bytes of the capture for the model, read in pieces so a large capture never sits in memory.
+
+	marks is (header_end, match_end): byte offsets where the buffered context starts and where the line
+	that opened the capture ends. With them, a capture too big to send whole becomes the header, the lines
+	just before the match (a quarter of the rest), the lines just after it (half), and the end of the
+	capture (a quarter), with each cut marked. Without them it is the head and the tail of the file.
+	"""
 	max_bytes = int(max_bytes)
 	if max_bytes < 1:
 		return ''
 	with open(path, 'rb') as handle:
-		# The capture's color codes mean nothing to the model.
-		data = _ANSI_RE.sub(b'', handle.read())
-	if len(data) <= max_bytes:
-		text = data.decode('utf-8', 'replace')
-	else:
-		head_n = min(EXCERPT_HEAD_BYTES, max(1, max_bytes // 2))
-		sep = b'\n...\n'
-		tail_n = max_bytes - head_n - len(sep)
-		if tail_n < 1:
-			sep = b''
-			tail_n = max(0, max_bytes - head_n)
-		head = data[:head_n]
-		tail = data[-tail_n:] if tail_n else b''
-		text = (head + sep + tail).decode('utf-8', 'replace')
+		size = os.fstat(handle.fileno()).st_size
+		if size <= max_bytes:
+			data = handle.read(max_bytes)
+		elif marks and 0 <= marks[0] <= marks[1] <= size and max_bytes >= EXCERPT_AROUND_MATCH_MIN:
+			data = _excerpt_around_match(handle, size, max_bytes, marks[0], marks[1])
+		else:
+			head_n = min(EXCERPT_HEAD_BYTES, max(1, max_bytes // 2))
+			sep = b'\n...\n'
+			tail_n = max_bytes - head_n - len(sep)
+			if tail_n < 1:
+				sep = b''
+				tail_n = max(0, max_bytes - head_n)
+			head = handle.read(head_n)
+			tail = b''
+			if tail_n:
+				handle.seek(size - tail_n)
+				tail = handle.read(tail_n)
+			data = head + sep + tail
+	# The capture's color codes mean nothing to the model.
+	text = _ANSI_RE.sub(b'', data).decode('utf-8', 'replace')
 	raw = text.encode('utf-8')
 	if len(raw) > max_bytes:
 		text = raw[:max_bytes].decode('utf-8', 'ignore')
 	return text
 
 
+def _excerpt_around_match(handle, size, max_bytes, header_end, match_end):
+	def read(start, end):
+		handle.seek(start)
+		return handle.read(end - start)
+
+	header = read(0, min(header_end, EXCERPT_HEAD_BYTES, max_bytes // 4))
+	# Room for three cut markers: after the header, before the end, and after the last piece.
+	budget = max_bytes - len(header) - 3 * EXCERPT_MARKER_BYTES
+	pre = match_end - header_end
+	post = size - match_end
+	before = min(pre, budget // 4)
+	if post <= budget - before:
+		# Everything after the match fits; what is left goes to the lines before it.
+		after, tail = post, 0
+		before = min(pre, budget - post)
+	else:
+		after = budget // 2 + (budget // 4 - before)
+		tail = budget - before - after
+	# (start, end, trim): partial lines at a cut are dropped, so every piece is whole lines.
+	pieces = [
+		(match_end - before, match_end, match_end - before > header_end and 'start'),
+		(match_end, match_end + after, after < post and 'end'),
+	]
+	if tail:
+		pieces.append((size - tail, size, 'start'))
+	out = []
+	chunk = header
+	if header_end > len(header) and b'\n' in chunk:
+		chunk = chunk[:chunk.rindex(b'\n') + 1]
+	out.append(chunk)
+	position = len(chunk)
+	for start, end, trim in pieces:
+		chunk = read(start, end)
+		if trim == 'start' and b'\n' in chunk:
+			cut = chunk.index(b'\n') + 1
+			chunk, start = chunk[cut:], start + cut
+		elif trim == 'end' and b'\n' in chunk:
+			chunk = chunk[:chunk.rindex(b'\n') + 1]
+		if start > position:
+			out.append(b'[... %d bytes skipped ...]\n' % (start - position))
+		out.append(chunk)
+		position = start + len(chunk)
+	if position < size:
+		out.append(b'[... %d bytes skipped ...]\n' % (size - position))
+	return b''.join(out)
+
+
 def call_llm(settings, incident):
 	import json
 	import secrets
-	excerpt = _capture_excerpt(incident['path'], settings.llm_max_bytes)
+	marks = incident.get('excerpt_marks')
+	# Marks taken in a file the capture later moved away from do not apply to the file it ended in.
+	marks = marks[1:] if marks and marks[0] == incident['path'] else None
+	excerpt = _capture_excerpt(incident['path'], settings.llm_max_bytes, marks=marks)
 	# A random token, so a log line cannot fake the END marker and append its own instructions.
 	marker = 'LOG-DATA-' + secrets.token_hex(8)
 	user = (
@@ -1146,6 +1212,16 @@ class CaptureFile(object):
 		if self.last_sync is None or now - self.last_sync >= self.sync_interval:
 			self.sync(now)
 
+	def position(self):
+		"""(path, bytes written to it so far), or None when no file is open."""
+		self._flush()
+		if self.handle is None:
+			return None
+		try:
+			return self.path, os.fstat(self.handle.fileno()).st_size
+		except OSError:
+			return None
+
 	def sync_due(self):
 		"""When committed data must be fsynced, or None when nothing is pending."""
 		return self.last_sync + self.sync_interval if self.dirty else None
@@ -1349,11 +1425,17 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(read_time - capture_time).isoformat()}:{bcolors.ENDC}\n")
 							if dropped_until is not None and read_time - dropped_until <= capture_time:
 								capture.write(f"{bcolors.warning}Captured line count exceeded capture_line_count_max {capture_line_count_max}. Older cached in-memory lines were dropped ...{bcolors.ENDC}\n")
+							header_end = capture.position()
 							for _buffered_time, buffered_line in log_buffer:
 								if matcher.find(buffered_line) is not None:
 									capture.write(f'{bcolors.critical}-> {buffered_line.strip()}{bcolors.ENDC}\n')
 								else:
 									capture.write(buffered_line)
+							# Where the context starts and where the line that opened the capture ends, so the
+							# LLM excerpt can be built around the match. Only valid while the file stays the same.
+							match_end = capture.position()
+							if header_end and match_end and header_end[0] == match_end[0]:
+								incident['excerpt_marks'] = (match_end[0], header_end[1], match_end[1])
 						else:
 							# Append the line to the current log file
 							capture.write(f'{bcolors.critical}-> {line.strip()}{bcolors.ENDC}\n')
