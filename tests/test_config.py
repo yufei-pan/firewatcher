@@ -318,3 +318,75 @@ def test_log_source_honors_config_filter_only(tmp_path, monkeypatch):
     conf.write_text('[watch]\nfilter_only = true\nlog_file = /tmp/x.log\n')
     settings = fw.resolve_settings(parse_cli(['--config', str(conf)]), environ={})
     assert fw.log_source_command(settings) == ['cat', '/tmp/x.log']
+
+
+def test_new_watch_and_notify_settings_default_and_load(tmp_path):
+    defaults = fw.resolve_settings(parse_cli(['p.txt']), environ={})
+    assert defaults.capture_time_max == fw.DEFAULT_CAPTURE_TIME_MAX
+    assert defaults.fallback_folder == fw.DEFAULT_FALLBACK_FOLDER
+    assert defaults.always_notify == []
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\ncapture_time_max = 600\nfallback_folder =\n[notify]\nalways_notify = /a, /b\n')
+    settings = fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+    assert settings.capture_time_max == 600
+    assert settings.fallback_folder == ''
+    assert settings.always_notify == ['/a', '/b']
+    cli = fw.resolve_settings(parse_cli([
+        '--config', str(conf), '--capture-time-max', '5', '--fallback-folder', '/spool',
+        '--always-notify', '/c', '--always-notify', '/d', 'p.txt',
+    ]), environ={})
+    assert cli.capture_time_max == 5
+    assert cli.fallback_folder == '/spool'
+    assert cli.always_notify == ['/c', '/d']
+
+
+def test_generated_config_round_trips_new_settings(tmp_path):
+    settings = fw.resolve_settings(parse_cli([
+        '--capture-time-max', '900', '--fallback-folder', '', '--always-notify', '/a', '--always-notify', '/b', 'p.txt',
+    ]), environ={})
+    conf = tmp_path / 'generated.conf'
+    fw.write_config_file(str(conf), settings)
+    loaded = fw.resolve_settings(parse_cli(['--config', str(conf)]), environ={})
+    assert loaded.capture_time_max == 900
+    assert loaded.fallback_folder == ''
+    assert loaded.always_notify == ['/a', '/b']
+
+
+@pytest.mark.parametrize('text, message', [
+    ('[notify]\npriority = 6\n', 'notify.priority'),
+    ('[notify]\npriority = 0\n', 'notify.priority'),
+    ('[watch]\ncapture_time = -1\n', 'watch.capture_time'),
+    ('[watch]\ncapture_time_max = -5\n', 'watch.capture_time_max'),
+    ('[watch]\ndelete_after_months = -1\n', 'watch.delete_after_months'),
+    ('[llm]\ntimeout = 0\n', 'llm.timeout'),
+    ('[notify]\ntimeout = -1\n', 'notify.timeout'),
+    ('[llm]\nenabled = true\nbase_url = 127.0.0.1:11434/v1\nmodel = m\n', 'llm.base_url'),
+    ('[notify]\nenabled = true\nntfy_url = ntfy.sh/secret-topic-123\n', 'notify.ntfy_url'),
+])
+def test_startup_rejects_out_of_range_settings(tmp_path, text, message):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text(text)
+    with pytest.raises(fw.ConfigError, match=re.escape(message)) as exc:
+        fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+    assert 'secret-topic' not in str(exc.value)
+
+
+def test_main_does_not_print_the_ntfy_topic(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(fw.syslog, 'openlog', lambda *args, **kwargs: None)
+    monkeypatch.setattr(fw.syslog, 'syslog', lambda *args, **kwargs: None)
+    src = tmp_path / 'src.log'
+    src.write_text('quiet\n')
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    rc = fw.main([
+        '--filter_only', '--log-file', str(src), '-o', str(tmp_path / 'out'),
+        '--llm', '--llm-base-url', 'http://user:hunter2@127.0.0.1:9/v1', '--llm-model', 'm',
+        '--notify', '--ntfy-url', 'https://ntfy.example/secret-topic-123',
+        str(pat),
+    ])
+    assert rc == 0
+    printed = capsys.readouterr().out
+    assert 'Notifications enabled (https://ntfy.example, topic not shown)' in printed
+    assert 'LLM analysis enabled (http://127.0.0.1:9, model m)' in printed
+    assert 'secret-topic-123' not in printed
+    assert 'hunter2' not in printed

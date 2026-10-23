@@ -430,3 +430,11 @@ def test_render_unit_resolves_executable_when_omitted(monkeypatch):
     monkeypatch.setattr(fw, 'resolve_executable', lambda: '/opt/bin/firewatcher')
     unit = fw.render_unit_file(parse_cli(['--print-unit', 'p.txt']))
     assert 'ExecStart=/opt/bin/firewatcher' in unit
+
+
+def test_unit_passes_new_flags_when_config_exists():
+    raw = parse_cli(['--capture-time-max', '600', '--fallback-folder', '', '--always-notify', '/a', '--always-notify', '/b', 'p.txt'])
+    parts = fw._explicit_cli_args(raw)
+    assert parts[:2] == ['--capture-time-max', '600']
+    assert ['--fallback-folder', ''] == parts[2:4]
+    assert parts[4:8] == ['--always-notify', '/a', '--always-notify', '/b']

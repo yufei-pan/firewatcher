@@ -175,13 +175,13 @@ def test_capture_progress_every_10000_lines(tmp_path, capsys):
 
 def test_capture_compresses_on_unmatched_traffic(tmp_path, monkeypatch):
     calls = []
-    orig = fw.Log_Compressor.compressLogs
+    orig = fw.Log_Compressor.startCompressLogs
 
     def spy(self):
         calls.append(1)
         return orig(self)
 
-    monkeypatch.setattr(fw.Log_Compressor, 'compressLogs', spy)
+    monkeypatch.setattr(fw.Log_Compressor, 'startCompressLogs', spy)
     capture(tmp_path, 'noise-a\nnoise-b\n', pattern='HIT')
     assert len(calls) >= 3
 
@@ -345,3 +345,239 @@ def test_capture_survives_filesystems_without_fsync(tmp_path, monkeypatch):
     text = incident_logs(out)[0].read_text()
     assert 'after' in text
     assert 'End of capture' in text
+
+
+class RecordingDispatcher:
+    def __init__(self):
+        self.jobs = []
+
+    def submit(self, job):
+        self.jobs.append(job)
+
+    def close(self):
+        pass
+
+
+def recording_dispatcher(monkeypatch):
+    dispatcher = RecordingDispatcher()
+    monkeypatch.setattr(fw, '_start_dispatcher', lambda settings: dispatcher)
+    return dispatcher
+
+
+def journal_records(monkeypatch):
+    records = []
+    monkeypatch.setattr(fw.syslog, 'syslog', lambda *args: records.append(args))
+    return records
+
+
+# --- capture_time_max ---
+
+def repeating_hits(clock):
+    # a match every 50 s keeps a 60 s window open for as long as it repeats
+    return ScriptedPopen([('HIT 1\n', 0), ('HIT 2\n', 50), ('HIT 3\n', 50), ('HIT 4\n', 50), ('tail\n', 1)], clock=clock)
+
+
+def test_capture_time_max_ends_a_capture_its_pattern_keeps_extending(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = run_scripted(tmp_path, monkeypatch, repeating_hits(clock), capture_time_max=120)
+    first, second = (p.read_text() for p in incident_logs(out))
+    assert '-> HIT 3' in first
+    assert 'HIT 4' not in first
+    assert 'Capture reached capture_time_max of 120 seconds' in first
+    assert 'Matched line:    HIT 4' in second
+    assert 'tail' in second
+    assert 'capture_time_max' not in second
+
+
+def test_capture_time_max_zero_disables_the_bound(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = run_scripted(tmp_path, monkeypatch, repeating_hits(clock), capture_time_max=0)
+    (only,) = incident_logs(out)
+    assert '-> HIT 4' in only.read_text()
+
+
+def test_match_after_the_window_ran_out_starts_a_new_capture(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = run_scripted(tmp_path, monkeypatch, ScriptedPopen([('HIT 1\n', 0), ('HIT 2\n', 70)], clock=clock))
+    first, second = (p.read_text() for p in incident_logs(out))
+    assert 'HIT 2' not in first
+    assert 'Matched line:    HIT 2' in second
+
+
+def test_capture_time_max_default_matches_cli():
+    import inspect
+    defaults = inspect.signature(fw.capture_messages).parameters
+    assert defaults['capture_time_max'].default == fw.DEFAULT_CAPTURE_TIME_MAX == fw.Settings().capture_time_max
+
+
+# --- unwritable output folder ---
+
+def test_unwritable_output_folder_falls_back_and_keeps_running(tmp_path, monkeypatch):
+    records = journal_records(monkeypatch)
+    dispatcher = recording_dispatcher(monkeypatch)
+    blocked = tmp_path / 'blocked'
+    blocked.write_text('a file, so nothing can be created under it')
+    fallback = tmp_path / 'fallback'
+    capture(tmp_path, 'before\nHIT now\nafter\n', output_folder=str(blocked / 'out'), fallback_folder=str(fallback))
+    (cap,) = incident_logs(fallback)
+    text = cap.read_text()
+    assert 'capture moved here from %s' % (blocked / 'out') in text
+    for expected in ('before', 'Matched line:    HIT now', 'after', 'End of capture'):
+        assert expected in text
+    assert str(cap) in (fallback / 'journal.log').read_text()
+    assert [job['path'] for job in dispatcher.jobs] == [str(cap)]
+    assert any('cannot write capture' in record[1] for record in records)
+
+
+def test_capture_with_no_writable_folder_still_reaches_the_dispatcher(tmp_path, monkeypatch):
+    records = journal_records(monkeypatch)
+    dispatcher = recording_dispatcher(monkeypatch)
+    blocked = tmp_path / 'blocked'
+    blocked.write_text('a file')
+    capture(tmp_path, 'HIT now\nafter\nHIT again\n', output_folder=str(blocked / 'out'))
+    assert len(dispatcher.jobs) == 1
+    assert dispatcher.jobs[0]['path'] is None
+    assert dispatcher.jobs[0]['matched_line'] == 'HIT now'
+    assert any('no writable folder left' in record[1] for record in records)
+
+
+class FlakyHandle:
+    """A capture file that stops accepting data once a line containing BREAK is written, like a dying NFS mount."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.failing = False
+
+    def write(self, text):
+        if 'BREAK' in text:
+            self.failing = True
+        return self.handle.write(text)
+
+    def flush(self):
+        if self.failing:
+            raise OSError(5, 'Input/output error')
+        self.handle.flush()
+
+    def fileno(self):
+        return self.handle.fileno()
+
+    def close(self):
+        self.handle.close()
+
+
+def test_write_error_mid_capture_continues_in_the_fallback_folder(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    dispatcher = recording_dispatcher(monkeypatch)
+    out = tmp_path / 'out'
+    fallback = tmp_path / 'fallback'
+    real_open = open
+
+    def flaky_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if str(path).startswith(str(out)) and not str(path).endswith('journal.log'):
+            return FlakyHandle(handle)
+        return handle
+
+    monkeypatch.setattr(fw, 'open', flaky_open, raising=False)
+    capture(tmp_path, 'HIT now\nline-1\nBREAK line-2\nline-3\n', output_folder=str(out), fallback_folder=str(fallback))
+    (primary,) = incident_logs(out)
+    (moved,) = incident_logs(fallback)
+    assert 'Matched line:    HIT now' in primary.read_text()
+    text = moved.read_text()
+    assert 'capture moved here from %s after a write error' % primary in text
+    # lines since the last fsync are written again, so nothing between the two files is lost
+    for expected in ('line-1', 'BREAK line-2', 'line-3', 'End of capture'):
+        assert expected in text
+    assert [job['path'] for job in dispatcher.jobs] == [str(moved)]
+
+
+def test_fsync_error_moves_the_capture_with_its_unsynced_lines(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    calls = []
+
+    def fsync(fd):
+        calls.append(fd)
+        if len(calls) == 1:
+            raise OSError(fw.errno.EIO, 'Input/output error')
+
+    monkeypatch.setattr(fw.os, 'fsync', fsync)
+    fallback = tmp_path / 'fallback'
+    capture(tmp_path, 'before\nHIT now\nafter\n', fallback_folder=str(fallback))
+    text = incident_logs(fallback)[0].read_text()
+    for expected in ('after a write error', 'before', 'Matched line:    HIT now', 'after', 'End of capture'):
+        assert expected in text
+
+
+def test_capture_file_after_close_ignores_writes(tmp_path):
+    cap = fw.CaptureFile(str(tmp_path / 'c.log'), 1.0)
+    cap.write('one\n')
+    cap.close()
+    cap.close()
+    fw._end_capture(cap, 0, 10)
+    assert (tmp_path / 'c.log').read_text() == 'one\n'
+
+
+# --- always_notify ---
+
+def test_always_notify_marks_incidents_whose_matched_lines_match(tmp_path, monkeypatch):
+    dispatcher = recording_dispatcher(monkeypatch)
+    always = {'fnmatch': {'*I/O error*'}}
+    capture(tmp_path, 'HIT first\nHIT then I/O error\n', always_notify_patterns=always)
+    assert dispatcher.jobs[0].get('always_notify') is True
+
+
+def test_always_notify_ignores_context_lines(tmp_path, monkeypatch):
+    dispatcher = recording_dispatcher(monkeypatch)
+    always = {'fnmatch': {'*I/O error*'}}
+    # any program can log an I/O error line; only lines that matched a watch pattern count
+    capture(tmp_path, 'I/O error before\nHIT first\nI/O error after\n', always_notify_patterns=always)
+    assert 'always_notify' not in dispatcher.jobs[0]
+
+
+# --- shutdown ---
+
+def test_interrupt_while_handling_a_line_still_finishes_the_capture(tmp_path, monkeypatch, capsys):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fw, '_hostname', interrupted)
+    popen = ScriptedPopen(['HIT now\n', 'after\n'])
+    out = run_scripted(tmp_path, monkeypatch, popen)
+    assert popen.terminated
+    assert 'Exiting.' in capsys.readouterr().out
+    assert 'End of capture' in incident_logs(out)[0].read_text()
+
+
+def test_eof_does_not_terminate_the_reader(tmp_path, monkeypatch):
+    popen = ScriptedPopen(['HIT now\n'])
+    run_scripted(tmp_path, monkeypatch, popen)
+    assert not popen.terminated
+
+
+def test_write_that_raises_moves_the_capture(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    fallback = tmp_path / 'fallback'
+    real_open = open
+
+    class RaisingHandle(FlakyHandle):
+        def write(self, text):
+            if 'BREAK' in text:
+                raise OSError(28, 'No space left on device')
+            return self.handle.write(text)
+
+    def raising_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if str(path).startswith(str(out)) and not str(path).endswith('journal.log'):
+            return RaisingHandle(handle)
+        return handle
+
+    monkeypatch.setattr(fw, 'open', raising_open, raising=False)
+    capture(tmp_path, 'HIT now\nBREAK line\nlast\n', output_folder=str(out), fallback_folder=str(fallback))
+    text = incident_logs(fallback)[0].read_text()
+    assert 'No space left on device' in text
+    assert 'BREAK line' in text
+    assert 'last' in text

@@ -64,7 +64,11 @@ def test_example_sys_msg_fnmatch_hits():
     patterns = {'fnmatch': {f'*{line}*' for line in fw.EXAMPLE_PATTERNS['sys_msg.txt'].splitlines() if line}}
     assert fw.match_patterns('kernel panic - not syncing', patterns)
     assert fw.match_patterns('sd 1:0:0:0: I/O error', patterns)
-    assert fw.match_patterns('Out of Memory: Kill process', patterns)
+    # the kernel's own wording: the old 'Out of Memory' and 'Hardware error' examples missed these
+    assert fw.match_patterns('kernel: Out of memory: Killed process 4242 (java) total-vm:123kB', patterns)
+    assert fw.match_patterns('kernel: Memory cgroup out of memory: Killed process 4242 (java)', patterns)
+    assert fw.match_patterns('kernel: mce: [Hardware Error]: Machine check events logged', patterns)
+    assert fw.match_patterns('kernel: {1}[Hardware Error]: Hardware error from APEI Generic Hardware Error Source: 0', patterns)
     assert fw.match_patterns('Call Trace:', patterns)
     assert not fw.match_patterns('unrelated info line', patterns)
 

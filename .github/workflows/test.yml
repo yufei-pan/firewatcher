@@ -19,7 +19,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install "pytest<9"
+        if: matrix.python-version != '3.12'
       - run: python -m pytest -q
+        if: matrix.python-version != '3.12'
+      # one job enforces the coverage floor the README documents
+      - run: python -m pip install "pytest<9" "pytest-cov>=4,<6"
+        if: matrix.python-version == '3.12'
+      - run: python -m pytest -q --cov=firewatcher --cov-report=term-missing --cov-fail-under=95
+        if: matrix.python-version == '3.12'
   # setup-python no longer ships 3.6, the oldest Python firewatcher supports: it runs in a container
   pytest-py36:
     runs-on: ubuntu-24.04
