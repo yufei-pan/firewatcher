@@ -694,11 +694,11 @@ class FakeDisk:
 
     def __init__(self, monkeypatch, root, size, other=0, lag=False):
         self.root, self.size, self.other = str(root), size, other
-        self.frozen = fw._disk_bytes(self.root) if lag else None
+        self.frozen = fw._entry_stats(self.root)[0] if lag else None
         monkeypatch.setattr(fw, '_free_space', self)
 
     def used(self):
-        return self.other + (self.frozen if self.frozen is not None else fw._disk_bytes(self.root))
+        return self.other + (self.frozen if self.frozen is not None else fw._entry_stats(self.root)[0])
 
     def headroom_at(self, floor):
         return self.size - self.used() - int(self.size * floor)
@@ -765,26 +765,23 @@ def test_purge_runs_at_most_once_an_hour_per_folder(tmp_path, monkeypatch):
     assert not (out / '2020-02').exists()
 
 
-def test_purge_trusts_what_it_freed_while_statvfs_lags(tmp_path, monkeypatch):
+def test_lagging_statvfs_costs_a_move_never_the_floor(tmp_path, monkeypatch):
     journal_records(monkeypatch)
-    clock = Clock(time.time())
-    monkeypatch.setattr(fw.time, 'time', clock.time)
+    synced = []
+    monkeypatch.setattr(fw.os, 'sync', lambda: synced.append(1))
     out = tmp_path / 'out'
     months(out, **{'2020-01': 300_000, '2020-02': 300_000, '2020-03': 300_000})
-    disk = FakeDisk(monkeypatch, out, 10_000_000, lag=True)  # never sees the deletion
+    disk = FakeDisk(monkeypatch, out, 10_000_000, lag=True)  # never shows the deletion
     disk.set_headroom(-10_000, 0.10)
     guard = guard_for(out)
     path = str(out / '2026-10' / 'hit.log')
-    first = guard.headroom(path)
-    assert first >= 250_000
+    # only what statvfs reports authorizes a write, so this capture moves on
+    assert guard.headroom(path) < fw.MIN_HEADROOM
+    assert synced == [1]
+    # and the lag does not cost more history than the room needed
     assert sorted(p.name for p in out.iterdir()) == ['2020-02', '2020-03']
-    # a second later statvfs still shows the old numbers: the freed room, less what was written since, holds
-    clock.t += 1
-    assert guard.headroom(path, written=100_000) == first - 100_000
+    assert guard.headroom(path) < fw.MIN_HEADROOM
     assert sorted(p.name for p in out.iterdir()) == ['2020-02', '2020-03']
-    clock.t += fw.FREED_SPACE_CREDIT
-    assert guard.headroom(path) < fw.MIN_HEADROOM  # the credit ran out and the hour has not
-
 
 def test_purge_only_touches_what_firewatcher_made_and_nothing_recent(tmp_path, monkeypatch):
     journal_records(monkeypatch)
@@ -801,7 +798,7 @@ def test_purge_only_touches_what_firewatcher_made_and_nothing_recent(tmp_path, m
 
 def test_month_names(tmp_path):
     assert [fw._month_of(n) for n in ('2019-12', '2019-12.tar.xz', '2019-12.3.tar.xz', '2019-12.tar.xz.99.partial')] == ['2019-12'] * 4
-    assert [fw._month_of(n) for n in ('2019-1', '2019-13', '2019-12.bak', '2019-12.tar', 'journal.log', '2019-12x')] == [None] * 6
+    assert [fw._month_of(n) for n in ('2019-1', '2019-13', '2019-12.bak', '2019-12.tar', 'journal.log', '2019-12x', '2019-12\n')] == [None] * 7
 
 
 def test_one_undeletable_month_does_not_block_the_rest(tmp_path, monkeypatch):
@@ -836,21 +833,19 @@ def test_output_folder_inside_the_fallback_purges_its_own_months(tmp_path, monke
     assert (fallback / '2019-01').is_dir()
 
 
-def test_purge_waits_for_a_month_being_compressed(tmp_path, monkeypatch):
+def test_purge_skips_the_month_being_compressed_without_waiting(tmp_path, monkeypatch):
     journal_records(monkeypatch)
     out = tmp_path / 'out'
-    months(out, **{'2020-01': 1000})
+    months(out, **{'2020-01': 200_000, '2020-02': 200_000})
     compressor = fw.Log_Compressor(str(out), 0, 0)
-    compressor.lock.acquire()
-    threading.Timer(0.2, compressor.lock.release).start()
-    assert compressor.deleteMonth('2020-01', ['2020-01'], 'for the test')
-    assert not (out / '2020-01').exists()
-    months(out, **{'2020-02': 1000})
-    monkeypatch.setattr(fw, 'PURGE_LOCK_WAIT', 0.05)
-    with compressor.lock:
-        assert not compressor.deleteMonth('2020-02', ['2020-02'], 'for the test')
-    assert (out / '2020-02').is_dir()
-
+    assert compressor._claim('2020-01')  # tar is on it
+    assert compressor.deleteMonth('2020-01', 'for the test') == 0
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-10_000, 0.10)
+    started = time.time()
+    assert fw.DiskGuard(10, [compressor]).headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert time.time() - started < 1
+    assert sorted(p.name for p in out.iterdir()) == ['2020-01']
 
 def test_compression_keeps_to_the_floor(tmp_path, monkeypatch, capsys):
     journal_records(monkeypatch)
@@ -1051,3 +1046,128 @@ def test_reader_that_keeps_failing_ends_the_run(tmp_path, monkeypatch, capsys):
     assert popen.terminated
     text = incident_logs(out)[0].read_text()
     assert 'End of capture' in text and 'never read' not in text
+
+
+def test_compression_at_startup_already_keeps_to_the_floor(tmp_path, monkeypatch, capsys):
+    out = tmp_path / 'out'
+    months(out, **{'2020-01': 1000})
+    asked = []
+
+    class Refusing(fw.DiskGuard):
+        def can_spend(self, folder, nbytes):
+            asked.append(folder)
+            return False
+
+    # synchronous, so the order is certain; the background thread starts at the same point in __init__
+    fw.Log_Compressor(str(out), 1, 0, guard=Refusing(10))
+    assert asked == [str(out)]
+    assert (out / '2020-01').is_dir()
+
+
+def test_purge_is_sized_for_what_the_caller_needs(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    monkeypatch.setattr(fw.os, 'sync', lambda: None)
+    out = tmp_path / 'out'
+    months(out, **{'2019-01': 30_000, '2019-02': 2_000_000, '2019-03': 2_000_000})
+    disk = FakeDisk(monkeypatch, out, 100_000_000)
+    disk.set_headroom(50_000, 0.10)
+    room = guard_for(out).headroom(str(out / '2026-10' / 'hit.log'), need=200_000)
+    assert room - 200_000 >= fw.MIN_HEADROOM
+    assert sorted(p.name for p in out.iterdir()) == ['2019-03']
+
+
+def test_a_purge_that_cannot_help_is_not_retried_for_every_capture(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    clock = Clock(time.time())
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = tmp_path / 'out'
+    months(out, **{'2020-01': 10_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-1_000_000, 0.10)
+    guard = guard_for(out)
+    walks = []
+    compressor = guard.compressors[str(out)]
+    real = compressor.purgeableMonths
+    monkeypatch.setattr(compressor, 'purgeableMonths', lambda keep: walks.append(1) or real(keep))
+    path = str(out / '2026-10' / 'hit.log')
+    for _ in range(5):
+        assert guard.headroom(path) < fw.MIN_HEADROOM
+    assert walks == [1]
+    clock.t += fw.PURGE_RETRY
+    guard.headroom(path)
+    assert walks == [1, 1]
+    assert (out / '2020-01').is_dir()
+
+
+def test_purge_ignores_entries_of_the_wrong_kind(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    months(out, **{'2019-01': 100_000})
+    (out / '2018-12').write_bytes(os.urandom(100_000))       # a file named like a month folder
+    (out / '2018-11.tar.xz').mkdir()                          # a folder named like an archive
+    for name in ('2018-12', '2018-11.tar.xz'):
+        os.utime(str(out / name), (TWO_DAYS_AGO, TWO_DAYS_AGO))
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-10_000, 0.10)
+    guard_for(out).headroom(str(out / '2026-10' / 'hit.log'))
+    assert sorted(p.name for p in out.iterdir()) == ['2018-11.tar.xz', '2018-12']
+
+
+def test_a_file_still_being_written_protects_its_month(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    months(out, **{'2019-01': 100_000, '2019-02': 100_000})
+    with open(str(out / '2019-01' / 'x.log'), 'ab') as handle:  # another firewatcher appending
+        handle.write(b'more')
+    os.utime(str(out / '2019-01'), (TWO_DAYS_AGO, TWO_DAYS_AGO))  # the folder itself looks old
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-10_000, 0.10)
+    guard_for(out).headroom(str(out / '2026-10' / 'hit.log'))
+    assert sorted(p.name for p in out.iterdir()) == ['2019-01']
+
+
+def test_a_month_with_another_filesystem_mounted_in_it_is_never_deleted(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    months(out, **{'2019-01': 100_000, '2019-02': 100_000})
+    real = fw._entry_stats
+
+    def mounted(path):
+        size, newest, devices = real(path)
+        return (size, newest, devices | {-1}) if str(path).endswith('2019-01') else (size, newest, devices)
+
+    monkeypatch.setattr(fw, '_entry_stats', mounted)
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-10_000, 0.10)
+    guard_for(out).headroom(str(out / '2026-10' / 'hit.log'))
+    assert sorted(p.name for p in out.iterdir()) == ['2019-01']
+    # nor by the age-based deletion
+    (out / '2019-03').mkdir()
+    fw.Log_Compressor(str(out), 0, 1)
+    assert (out / '2019-01').is_dir()
+
+
+def test_age_based_deletion_goes_on_past_a_month_it_cannot_delete(tmp_path, monkeypatch, capsys):
+    out = tmp_path / 'out'
+    months(out, **{'2018-01': 1000, '2018-02': 1000})
+    real_rmtree = fw.shutil.rmtree
+
+    def rmtree(path, *args, **kwargs):
+        if str(path).endswith('2018-01'):
+            raise OSError(16, 'Device or resource busy')
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(fw.shutil, 'rmtree', rmtree)
+    fw.Log_Compressor(str(out), 0, 1)
+    assert sorted(p.name for p in out.iterdir()) == ['2018-01']
+    assert 'Deleting 2018-01 failed' in capsys.readouterr().out
+
+
+def test_writes_check_before_leaving_less_than_the_margin(tmp_path):
+    rooms = {'a': 70_000, 'b': 10 ** 9}
+    cap = fw.CaptureFile([str(tmp_path / 'a.log'), str(tmp_path / 'b.log')], 1.0,
+                         headroom=lambda path, need=0: rooms[os.path.basename(path)[0]])
+    cap.write('x' * 10_000 + '\n')
+    cap.close()
+    assert (tmp_path / 'a.log').read_text() == ''
+    assert 'x' * 10_000 in (tmp_path / 'b.log').read_text()
