@@ -5,7 +5,9 @@
 import argparse
 import array
 import bisect
+import calendar
 import fnmatch
+import hashlib
 import subprocess
 import re
 import shutil
@@ -49,6 +51,14 @@ BUFFER_BLOCK_OVERHEAD = 512
 MAX_LINE_CHARS = 1 << 20
 # Reads failing this many times in a row (a closed pipe) end the run instead of spinning on the error.
 MAX_READ_ERRORS = 100
+# Where firewatcher remembers how far it read the journal, so a restart resumes there.
+DEFAULT_POSITION_FILE = '/var/lib/firewatcher/journal.position'
+# At start, the most seconds of journal read back: lines logged while firewatcher was stopped, and context.
+DEFAULT_RESUME_MAX = 3600
+# The journal position is saved this often while lines arrive, and when firewatcher stops.
+POSITION_SAVE_INTERVAL = 1.0
+# journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
+_ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
 DEFAULT_UNIT_NAME = 'firewatcher'
 SYSTEMD_RUNTIME_DIR = '/run/systemd/system'
 SYSTEMD_UNIT_DIR = '/etc/systemd/system'
@@ -642,6 +652,8 @@ class Settings(object):
 		self.buffer_max_mb = DEFAULT_BUFFER_MAX_MB
 		self.min_free_percent = DEFAULT_MIN_FREE_PERCENT
 		self.purge_interval = DEFAULT_PURGE_INTERVAL
+		self.position_file = DEFAULT_POSITION_FILE
+		self.resume_max = DEFAULT_RESUME_MAX
 		self.llm_enabled = False
 		self.llm_base_url = ''
 		self.llm_model = ''
@@ -746,6 +758,8 @@ def _read_config_file(path):
 	take('watch', 'buffer_max_mb', 'buffer_max_mb', 'int')
 	take('watch', 'min_free_percent', 'min_free_percent', 'float')
 	take('watch', 'purge_interval', 'purge_interval', 'int')
+	take('watch', 'position_file', 'position_file', 'str')
+	take('watch', 'resume_max', 'resume_max', 'int')
 	take('llm', 'enabled', 'llm_enabled', 'bool')
 	take('llm', 'base_url', 'llm_base_url', 'str')
 	take('llm', 'model', 'llm_model', 'str')
@@ -798,15 +812,17 @@ def resolve_settings(args, environ=None):
 	if 'log_file' in file_values:
 		settings.log_file = file_values['log_file'] or None
 	for key in ('capture_time', 'capture_time_max', 'compress_after_months', 'delete_after_months', 'capture_line_count_max',
-				'buffer_max_mb', 'min_free_percent', 'purge_interval', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
+				'buffer_max_mb', 'min_free_percent', 'purge_interval', 'resume_max', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
 				'filter_only', 'llm_enabled', 'notify_enabled'):
 		if key in file_values:
 			setattr(settings, key, file_values[key])
 	if file_values.get('output_folder'):
 		settings.output_folder = file_values['output_folder']
-	# Unlike output_folder, an empty fallback_folder means no fallback.
+	# Unlike output_folder, an empty fallback_folder means no fallback, and an empty position_file no resuming.
 	if 'fallback_folder' in file_values:
 		settings.fallback_folder = file_values['fallback_folder']
+	if 'position_file' in file_values:
+		settings.position_file = file_values['position_file']
 	if 'always_notify' in file_values:
 		settings.always_notify = list(file_values['always_notify'])
 	if file_values.get('tail_lines'):
@@ -840,6 +856,10 @@ def resolve_settings(args, environ=None):
 		settings.min_free_percent = args.min_free_percent
 	if getattr(args, 'purge_interval', None) is not None:
 		settings.purge_interval = args.purge_interval
+	if getattr(args, 'position_file', None) is not None:
+		settings.position_file = args.position_file
+	if getattr(args, 'resume_max', None) is not None:
+		settings.resume_max = args.resume_max
 	if getattr(args, 'filter_only', None) is not None:
 		settings.filter_only = bool(args.filter_only)
 	if getattr(args, 'llm', None) is not None:
@@ -910,6 +930,8 @@ def validate_settings(settings):
 		raise ConfigError('watch.min_free_percent must be 0 to 50: %s' % settings.min_free_percent)
 	if not 0 <= settings.purge_interval <= 30 * 86400:
 		raise ConfigError('watch.purge_interval must be 0 to %d seconds: %s' % (30 * 86400, settings.purge_interval))
+	if not 0 <= settings.resume_max <= 30 * 86400:
+		raise ConfigError('watch.resume_max must be 0 to %d seconds: %s' % (30 * 86400, settings.resume_max))
 
 
 def _is_http_url(url):
@@ -991,6 +1013,11 @@ def render_config_text(settings):
 		'min_free_percent = %g' % settings.min_free_percent,
 		'# Least seconds between two deletions of old months in one folder for free space; 0: no wait.',
 		'purge_interval = %s' % int(settings.purge_interval),
+		'# Where firewatcher remembers how far it read the journal, so a restart resumes there;',
+		'# leave blank to read the last tail_lines lines at every start instead.',
+		'position_file = %s' % _ini_text(settings.position_file),
+		'# At start, the most seconds of journal read back: lines logged while stopped, then context; 0: none.',
+		'resume_max = %s' % int(settings.resume_max),
 		'',
 		'[llm]',
 		'# Set true after configuring your OpenAI-compatible API and model.',
@@ -1068,6 +1095,10 @@ def _explicit_cli_args(raw):
 		parts.extend(['--min-free-percent', '%g' % raw.min_free_percent])
 	if getattr(raw, 'purge_interval', None) is not None:
 		parts.extend(['--purge-interval', str(raw.purge_interval)])
+	if getattr(raw, 'position_file', None) is not None:
+		parts.extend(['--position-file', raw.position_file])
+	if getattr(raw, 'resume_max', None) is not None:
+		parts.extend(['--resume-max', str(raw.resume_max)])
 	if getattr(raw, 'delete_after_months', None) is not None:
 		parts.extend(['--delete-after-months', str(raw.delete_after_months)])
 	if getattr(raw, 'llm', None) is True:
@@ -1840,7 +1871,7 @@ def _end_capture(capture, captured_line_counter, capture_line_count_max, inciden
 				dispatcher.submit(job)
 
 
-def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB, purge_interval=DEFAULT_PURGE_INTERVAL, reload_patterns=None):
+def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB, purge_interval=DEFAULT_PURGE_INTERVAL, reload_patterns=None, journal_position=None):
 	"""Tail the log file and process lines with buffer management.
 
 	capture_time_max bounds how long one capture runs however often its pattern repeats (0: no bound).
@@ -1851,6 +1882,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	A capture with a matched line that also matches always_notify_patterns (load_patterns() output)
 	is pushed even when the LLM says not to notify. After a SIGHUP, reload_patterns() supplies new
 	(patterns, always_notify_patterns) at the next line; if it raises, the old ones stay.
+	journal_position (a JournalPosition) records each line read, and the lines it says were read
+	before the last stop only refill the context.
 	"""
 	matcher = _as_matcher(patterns)
 	always_matcher = _as_matcher(always_notify_patterns) if always_notify_patterns else None
@@ -1914,6 +1947,9 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							line = pending_read.result(timeout=remaining)
 							pending_read = None
 					except ReadTimeout:
+						if journal_position is not None:
+							# Saved along with the capture's fsync below, so a quiet journal leaves no line unsaved for long.
+							journal_position.save()
 						# Keep the same pending read while the source is quiet.
 						if capture and capture_until is not None and time.time() < capture_until:
 							capture.sync()
@@ -1950,6 +1986,16 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 									len(matcher.regexes), len(matcher.substrings) + len(matcher.globs),
 									', always_notify too' if always_matcher else ''))
 
+					if journal_position is not None:
+						if journal_position.replaying:
+							replayed_at = journal_position.replay_time(line)
+							if replayed_at is not None:
+								# Read before the last stop: context for a match, never a match itself.
+								context.append(min(replayed_at, read_time), processed_line_counter, line)
+								continue
+						# Before matching, so a line that crashes firewatcher is not read again after the restart.
+						journal_position.saw(line, read_time)
+
 					# Keep capture_time seconds of context, compressed, in at most buffer_max_mb of memory
 					context.append(read_time, processed_line_counter, line)
 
@@ -1961,7 +2007,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					# if the current line matches the pattern, capture the logs for the next capture_time seconds
 					matched_pattern = matcher.find(line)
 					if matched_pattern is not None:
-						if capture is None:
+						opened = capture is None
+						if opened:
 							# Before the capture exists, so an interrupt in between cannot hand over the previous incident.
 							incident = {
 								'pattern': matched_pattern,
@@ -2025,6 +2072,9 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							incident['always_notify'] = True
 							incident['always_notify_line'] = line.strip()
 						capture.commit()
+						if opened and journal_position is not None:
+							# Now that the capture holds the match, a crash repeats this capture after the restart rather than losing it.
+							journal_position.save(read_time)
 						# If a match is found, set to capture the next capture_time seconds
 						capture_until = read_time + capture_time
 						if capture_ends_by is not None:
@@ -2064,8 +2114,12 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 			if capture:
 				end_capture(time.time())
 		finally:
-			if dispatcher is not None:
-				dispatcher.close()
+			try:
+				if journal_position is not None:
+					journal_position.save(final=True)
+			finally:
+				if dispatcher is not None:
+					dispatcher.close()
 	if reached_eof:
 		# A run that read its input to the end (--filter-only) finishes compressing before it exits.
 		for log_compressor in log_compressors:
@@ -2359,6 +2413,8 @@ def build_parser():
 	parser.add_argument('--buffer-max-mb', type=int, default=None, help='Memory, in MiB, for the lines kept before a match, compressed. The oldest lines are dropped past it. Default: %d.' % DEFAULT_BUFFER_MAX_MB)
 	parser.add_argument('--min-free-percent', type=_percent_arg, default=None, help='Free-space floor, in percent (0 to 50), for the filesystems captures are written to. Near it, old months of captures may be deleted (see the README), then the capture moves to the fallback folder or stops. 0 disables. Default: %g.' % DEFAULT_MIN_FREE_PERCENT)
 	parser.add_argument('--purge-interval', type=int, default=None, metavar='SEC', help='Least seconds between two deletions of old months in one folder to keep the free-space floor, so a disk that something else keeps filling drains the history slowly. 0: no wait. Default: %d.' % DEFAULT_PURGE_INTERVAL)
+	parser.add_argument('--position-file', type=str, default=None, metavar='PATH', help='Where firewatcher remembers how far it read the journal, so a restart resumes there instead of reading the last --tail-lines lines again. Journal only. An empty string disables it. Default: %s' % DEFAULT_POSITION_FILE)
+	parser.add_argument('--resume-max', type=int, default=None, metavar='SEC', help='At start, the most seconds of journal read back from the saved position: lines logged while firewatcher was stopped, and --capture-time of context before them. 0: none. Default: %d.' % DEFAULT_RESUME_MAX)
 	parser.add_argument('--delete-after-months', type=int, default=None, help='Delete logs after this many months. (will only delete files in YYYY-MM format) Default: 0 (never by age; the free-space floor can still delete the oldest months).')
 	svc = parser.add_mutually_exclusive_group()
 	svc.add_argument('--install-service', action='store_true', help='Install and enable a systemd unit for this command line. Warns and exits if systemd is not available.')
@@ -2386,6 +2442,174 @@ def build_parser():
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version}')
 	parser.set_defaults(filter_only=None, llm=None, notify=None)
 	return parser
+
+
+def _iso_stamp(line):
+	"""(seconds since the epoch, length of the stamp and its space) for a journalctl -o short-iso line, or None."""
+	matched = _ISO_STAMP_RE.match(line)
+	if not matched:
+		return None
+	year, month, day, hour, minute, second = (int(part) for part in matched.group(1, 2, 3, 4, 5, 6))
+	when = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
+	if matched.group(7):
+		offset = int(matched.group(8)) * 3600 + int(matched.group(9)) * 60
+		when += -offset if matched.group(7) == '+' else offset
+	return when, matched.end()
+
+
+def _line_digest(line, stamp_end):
+	# Without the timestamp, so a changed time zone still finds the line.
+	return hashlib.sha1(line[stamp_end:].rstrip('\n').encode('utf-8', 'replace')).hexdigest()
+
+
+class JournalPosition(object):
+	"""How far the journal was read, kept in a small file so a restart resumes after it.
+
+	The file holds the second of the last line read (from journalctl -o short-iso), which line of
+	that second it was, and a digest of it. At start, journalctl reads from capture_time before
+	that line, at most resume_max seconds back: the lines up to the saved one only refill the
+	context kept before a match, and the lines after it are matched as usual.
+	"""
+
+	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None):
+		import json
+		self.path = path
+		now = time.time() if now is None else now
+		self.since = None
+		self.replaying = False
+		self.saved = None
+		# The last line read in this run with a timestamp, and which line of its second it was.
+		self.stamp = None
+		self.last_line = None
+		self.last_end = 0
+		self.ordinal = 0
+		self.changed = False
+		self.next_save = 0
+		self.save_failed = False
+		# While replaying: lines of the saved second read so far, the time of the last one, and whether the saved line was among them.
+		self.seen_in_second = 0
+		self.replay_at = None
+		self.found = False
+		try:
+			with open(path, 'r', encoding='utf-8') as f:
+				record = json.load(f)
+			saved = (int(record['time']), int(record['line']), str(record['sha1']))
+		except FileNotFoundError:
+			self.note = 'No journal position saved in %s yet; reading the last %s lines.' % (path, tail_lines)
+			return
+		except (OSError, ValueError, TypeError, KeyError) as exc:
+			self.note = 'Cannot read the journal position in %s (%s); reading the last %s lines.' % (path, exc, tail_lines)
+			return
+		saved_time = saved[0]
+		try:
+			shown = datetime.datetime.fromtimestamp(saved_time).isoformat()
+		except (OverflowError, OSError, ValueError) as exc:
+			self.note = 'Cannot read the journal position in %s (%s); reading the last %s lines.' % (path, exc, tail_lines)
+			return
+		if saved_time > now + 60:
+			self.note = 'The journal position in %s, %s, is in the future; reading the last %s lines.' % (path, shown, tail_lines)
+			return
+		self.since = int(max(saved_time - max(0, context_time), now - resume_max))
+		if self.since > saved_time:
+			self.note = 'The journal position in %s, %s, is %d seconds old; reading the last %d seconds.' % (
+				path, shown, now - saved_time, resume_max)
+			return
+		self.saved = saved
+		self.replaying = True
+		self.replay_at = self.since
+		self.note = 'Resuming the journal after %s, %d seconds ago, with %d seconds of context before it.' % (
+			shown, max(0, now - saved_time), saved_time - self.since)
+
+	def journal_command(self, command):
+		"""command with ISO timestamps, and --since instead of --lines when resuming."""
+		command = [command[0], '--output=short-iso'] + command[1:]
+		if self.since is not None:
+			command = ['--since=@%d' % self.since if part.startswith('--lines=') else part for part in command]
+		return command
+
+	def replay_time(self, line):
+		"""While replaying: the time of a line from before the saved position, for the context. None from the first line after it."""
+		stamp = _iso_stamp(line)
+		if stamp is None:
+			# A continuation of the line before, or a journalctl note such as "-- Boot ... --".
+			return self.replay_at
+		when, stamp_end = stamp
+		saved_time, saved_ordinal, saved_digest = self.saved
+		if self.found or when > saved_time:
+			self.replaying = False
+			return None
+		if when == saved_time:
+			self.seen_in_second += 1
+			# Counting from where this run's view of that second starts: the line number and digest must both agree.
+			if self.seen_in_second >= saved_ordinal and _line_digest(line, stamp_end) == saved_digest:
+				self.found = True
+				self.stamp = line[:stamp_end]
+				self.ordinal = self.seen_in_second
+		self.replay_at = when
+		return when
+
+	def saw(self, line, now):
+		"""Record a line as read; saves the position at most once per POSITION_SAVE_INTERVAL."""
+		if self.stamp is not None and line.startswith(self.stamp):
+			self.ordinal += 1
+		else:
+			stamp = _iso_stamp(line)
+			if stamp is None:
+				return
+			self.stamp = line[:stamp[1]]
+			self.ordinal = 1
+		self.last_line = line
+		self.last_end = len(self.stamp)
+		self.changed = True
+		if now >= self.next_save:
+			self.save(now)
+
+	def save(self, now=None, final=False):
+		"""Write the position atomically; a failure is logged once and retried at the next save."""
+		import json
+		now = time.time() if now is None else now
+		self.next_save = now + POSITION_SAVE_INTERVAL
+		if not self.changed:
+			return
+		self.changed = False
+		record = {
+			'time': _iso_stamp(self.last_line)[0],
+			'line': self.ordinal,
+			'sha1': _line_digest(self.last_line, self.last_end),
+		}
+		partial = '%s.%d.tmp' % (self.path, os.getpid())
+		try:
+			folder = os.path.dirname(self.path)
+			if folder:
+				os.makedirs(folder, exist_ok=True)
+			with open(partial, 'w', encoding='utf-8') as f:
+				f.write(json.dumps(record) + '\n')
+				if final:
+					f.flush()
+					os.fsync(f.fileno())
+			os.replace(partial, self.path)
+		except OSError as exc:
+			self.changed = True
+			if not self.save_failed:
+				_journal(syslog.LOG_ERR, 'cannot save the journal position to %s, so a restart reads the last lines again: %s' % (self.path, exc))
+			self.save_failed = True
+			try:
+				os.unlink(partial)
+			except OSError:
+				pass
+		else:
+			self.save_failed = False
+
+
+def _journal_can_resume(journalctl):
+	"""True when journalctl takes the ISO output and --since=@seconds that resuming needs."""
+	try:
+		probe = subprocess.run(
+			[journalctl, '--quiet', '--no-pager', '--output=short-iso', '--since=@%d' % int(time.time()), '--lines=0'],
+			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+	except (OSError, subprocess.SubprocessError):
+		return False
+	return probe.returncode == 0
 
 
 def log_source_command(args):
@@ -2472,6 +2696,14 @@ def main(argv=None):
 	except ValueError:
 		print(f"No usable patterns in {resolved.pattern_file}. Exiting.", file=sys.stderr)
 		return 1
+	journal_position = None
+	if resolved.position_file and command_to_run[0] == 'journalctl' and '--follow' in command_to_run:
+		if _journal_can_resume(command_to_run[0]):
+			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines)
+			command_to_run = journal_position.journal_command(command_to_run)
+			print(journal_position.note)
+		else:
+			print(f"This journalctl cannot resume from a saved position (that needs -o short-iso and --since=@); reading the last {resolved.tail_lines} lines.")
 	print(f"Monitoring {command_to_run} for patterns: {patterns}")
 	print(f"Capturing logs for {resolved.capture_time} seconds, {resolved.capture_time_max or 'no'} seconds at most.")
 	print(f"Output folder: {resolved.output_folder}")
@@ -2509,6 +2741,7 @@ def main(argv=None):
 			purge_interval=resolved.purge_interval,
 			buffer_max_mb=resolved.buffer_max_mb,
 			reload_patterns=lambda: _load_pattern_sets(resolved.pattern_file, resolved.always_notify),
+			journal_position=journal_position,
 		)
 	finally:
 		if previous_sigterm is not None:

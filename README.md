@@ -52,6 +52,14 @@ The fallback needs the failure to come back as an error. On an NFS mount with th
 
 SIGHUP reloads the pattern files and the `--always-notify` files from the paths given at startup, so after editing `/etc/firewatcher/patterns.d/`, run `sudo systemctl reload firewatcher`. The new patterns apply from the next log line, and the journal says how many loaded. If no watch pattern loads, the old ones stay and the error is logged. The config file and other settings are not re-read; restart for those. In a terminal, SIGHUP keeps its usual meaning (the terminal went away) and ends `firewatcher`.
 
+### Resuming after a restart
+
+When firewatcher follows the journal, it saves how far it has read in `--position-file` (default `/var/lib/firewatcher/journal.position`): about once a second while lines arrive or a capture is open, as soon as a match opens a capture, and when it stops. After a restart it reads on from there instead of the last `--tail-lines` lines; after a crash or `kill -9`, that can be up to about a second before the last line it read. Lines logged while it was stopped, such as during a reboot, are still matched, and an incident it already captured is not captured again. The `--capture-time` seconds before the saved line are read again only to refill the context kept before a match. At most `--resume-max` seconds (default 3600) are read back, so after a longer stop only the last hour is matched.
+
+To tell where it stopped, firewatcher reads the journal with `journalctl -o short-iso`, so journal lines in captures carry the year and time zone: `2026-10-23T17:52:41+00:00 host sshd[812]: …` instead of `Oct 23 17:52:41 host sshd[812]: …`. Lines logged while firewatcher was stopped arrive all at once, so a capture opened by one of them holds the ones after it, up to `--capture-line-count-max`.
+
+The position is the second of the last line read, which line of that second it was, and a digest of that line. If the clock is set back after a position is saved, for example at a boot with a wrong hardware clock, new lines stamped before that second count as already read. A position more than a minute in the future is ignored. Give each firewatcher instance its own position file. An empty `--position-file` turns resuming off, and so does a journalctl that does not accept `-o short-iso` and `--since=@`, which firewatcher checks at start.
+
 ### Disk and memory limits
 
 firewatcher keeps the filesystems it writes captures to above `--min-free-percent` free (default 1%, counted as `df` does, so the root-reserved blocks are left alone). Only what the filesystem reports authorizes a write. firewatcher checks when a capture opens, about once a second, and again before what it has written since the last check could bring it within 64 KiB of the floor (and at least every 8 MiB), fsyncing first so the filesystem, an NFS server included, counts every byte. A line that would cross that margin is not written there. Another program filling the same disk between two checks can still push it past the floor; firewatcher's own writes do not.
@@ -109,7 +117,7 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--capture-time-max` | Longest one capture may run, in seconds (default: 3600; 0 = no limit) |
 | `-o`, `--output-folder` | Where to write captures (default: `/var/log/captured_messages/`) |
 | `--fallback-folder` | Where a capture continues when the output folder cannot be written (default: `/var/lib/firewatcher/captured_messages/`; `''` disables) |
-| `--tail-lines` | Lines to start with (default: 20; `+N` from line N, not with journalctl) |
+| `--tail-lines` | Lines to start with (default: 20; `+N` from line N, not with journalctl). Not used when the journal resumes from a saved position |
 | `--filter-only` | Filter existing logs only (`cat` instead of `tail -F`, or `journalctl` without `--follow`). Windows are measured in read time, not log time, and existing logs are read far faster than they were written, so `-t` and `--capture-time-max` barely limit a capture: it usually runs to `--capture-line-count-max` lines or the end of the input |
 | `--compress-after-months` | Tar.xz monthly dirs after N months (default: 3) |
 | `--delete-after-months` | Delete `YYYY-MM` dirs after N months (default: 0 = never by age; the free-space floor can still delete the oldest months) |
@@ -117,6 +125,8 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--buffer-max-mb` | Memory, in MiB, for the lines kept before a match, compressed (default: 16). The oldest are dropped past it |
 | `--min-free-percent` | Free-space floor, 0–50%, for the filesystems captures go to (default: 1; 0 disables). See [Disk and memory limits](#disk-and-memory-limits) |
 | `--purge-interval SEC` | Least time between two deletions of old months in one folder for free space (default: 3600; 0: no wait) |
+| `--position-file PATH` | Where firewatcher saves how far it read the journal, so a restart resumes there (default: `/var/lib/firewatcher/journal.position`; `''` disables). See [Resuming after a restart](#resuming-after-a-restart) |
+| `--resume-max SEC` | Most seconds of journal read back at start: lines logged while stopped, and context before them (default: 3600; 0: none) |
 | `--config PATH` | INI config file. Default: `/etc/firewatcher/firewatcher.conf` when that file exists. An explicit path must exist |
 | `--llm` / `--no-llm` | Enable or disable LLM analysis of each finished capture |
 | `--llm-base-url URL` | OpenAI-compatible API root, such as `http://127.0.0.1:11434/v1` |
@@ -167,7 +177,7 @@ always_notify =
 
 `patterns` and `always_notify` are one path per line, or comma-separated. Positional pattern arguments replace the `patterns` list.
 
-Out-of-range values stop `firewatcher` at startup: a negative time or count, `capture_time` over 7 days or `capture_time_max` over 30 days, `min_free_percent` outside 0–50, `buffer_max_mb` below 1, a timeout of 0 or less or over a day, an ntfy priority outside 1–5, or an LLM or ntfy URL that does not start with `http://` or `https://` or that contains spaces.
+Out-of-range values stop `firewatcher` at startup: a negative time or count, `capture_time` over 7 days or `capture_time_max` over 30 days, `min_free_percent` outside 0–50, `purge_interval` or `resume_max` over 30 days, `buffer_max_mb` below 1, a timeout of 0 or less or over a day, an ntfy priority outside 1–5, or an LLM or ntfy URL that does not start with `http://` or `https://` or that contains spaces.
 
 `api_key` under `[llm]` and `token` under `[notify]` are not command-line flags. `FIREWATCHER_LLM_API_KEY` and `FIREWATCHER_NTFY_TOKEN` override them when set. `--install-service` creates `/etc/firewatcher/firewatcher.conf` with mode `0600` only when it is missing, and the unit runs `firewatcher --config` that path. An existing file is left as it is. Flags passed to a later install are appended on `ExecStart` so they override the file.
 
