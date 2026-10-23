@@ -3,6 +3,7 @@
 # -*- coding: utf-8 -*-
 """Watch logs for incident patterns and persist surrounding context."""
 import argparse
+import array
 import fnmatch
 import subprocess
 import re
@@ -23,6 +24,7 @@ import socket
 import stat
 import syslog
 import threading
+import zlib
 
 version = '1.61'
 __version__ = version
@@ -35,10 +37,13 @@ DEFAULT_CAPTURE_TIME_MAX = 3600
 DEFAULT_PATTERNS_DIR = '/etc/firewatcher/patterns.d'
 # Below this much free space, firewatcher deletes its own oldest months, then stops writing there.
 DEFAULT_MIN_FREE_PERCENT = 1.0
-# Memory for the lines kept before a match, on top of the capture_line_count_max line limit.
+# Memory for the lines kept before a match (compressed), which with capture_time bounds that context.
 DEFAULT_BUFFER_MAX_MB = 16
-# Per-line cost in that buffer beyond the str itself (sys.getsizeof): the tuple, the read time, the deque slot.
+# Per-line cost in that buffer's open block beyond the str itself (sys.getsizeof): the tuple, the read time.
 BUFFER_LINE_OVERHEAD = 96
+# Text gathered before a block of that buffer is compressed, and each compressed block's own bookkeeping.
+BUFFER_BLOCK_BYTES = 64 * 1024
+BUFFER_BLOCK_OVERHEAD = 512
 # Longest line read at once; a longer one arrives in pieces, so one huge line cannot fill memory.
 MAX_LINE_CHARS = 1 << 20
 # Reads failing this many times in a row (a closed pipe) end the run instead of spinning on the error.
@@ -976,9 +981,9 @@ def render_config_text(settings):
 		'compress_after_months = %s' % int(settings.compress_after_months),
 		'# Delete monthly capture directories after this many months; 0 disables.',
 		'delete_after_months = %s' % int(settings.delete_after_months),
-		'# Maximum context lines before and after a match.',
+		'# Maximum lines written after a match; the lines before it are bounded by capture_time and buffer_max_mb.',
 		'capture_line_count_max = %s' % int(settings.capture_line_count_max),
-		'# Memory, in MiB, for the lines kept before a match; the oldest are dropped past it.',
+		'# Memory, in MiB, for the lines kept before a match, compressed; the oldest are dropped past it.',
 		'buffer_max_mb = %s' % int(settings.buffer_max_mb),
 		'# Free-space floor in percent (0 to 50; 0 disables). Near it, old months may be deleted (see the README),',
 		'# then captures move to the fallback folder or stop.',
@@ -1469,6 +1474,114 @@ def _start_dispatcher(settings):
 		return None
 	return IncidentDispatcher(settings)
 
+class ContextBuffer(object):
+	"""The lines kept before a match: the last max_age seconds, in at most about max_bytes of memory.
+
+	New lines collect in a block; once a block holds BUFFER_BLOCK_BYTES of text it is compressed with
+	zlib, so a busy host keeps several times more context in the same memory. Over max_bytes, the oldest
+	block goes first; the newest block (or open block) always stays. Each line has a sequence number (lines read so far),
+	so a capture can leave out what an earlier capture already holds.
+	"""
+
+	def __init__(self, max_age, max_bytes):
+		self.max_age = max_age
+		self.max_bytes = max_bytes
+		# (first_time, last_time, first_seq, count, read times, encoded lengths, compressed text, memory)
+		self.blocks = deque()
+		self.lines = []  # the open block: (read_time, line)
+		self.first_seq = None  # of self.lines[0]
+		self.text_bytes = 0  # in the open block
+		self.lines_memory = 0  # of the open block
+		self.memory = 0
+		self.dropped_until = None  # read time of the newest line a cap pushed out
+
+	def append(self, read_time, seq, line):
+		lines = self.lines
+		if not lines:
+			self.first_seq = seq
+		lines.append((read_time, line))
+		self.text_bytes += len(line)
+		size = sys.getsizeof(line) + BUFFER_LINE_OVERHEAD
+		self.lines_memory += size
+		self.memory += size
+		# Every line comes through here, so only the cheap checks run each time.
+		if self.text_bytes >= BUFFER_BLOCK_BYTES:
+			self._seal()
+			self._trim(read_time)
+		elif self.blocks:
+			if self.blocks[0][1] < read_time - self.max_age:
+				self._trim(read_time)
+		elif lines[0][0] < read_time - self.max_age and len(lines) > 1:
+			self._trim(read_time)
+
+	def _seal(self):
+		strings = [line for _read_time, line in self.lines]
+		times = array.array('d', [read_time for read_time, _line in self.lines])
+		# Lengths in characters: the block is decoded whole before it is split again.
+		lengths = array.array('L', map(len, strings))
+		text = zlib.compress(''.join(strings).encode('utf-8', 'replace'), 1)
+		memory = len(text) + times.itemsize * len(times) + lengths.itemsize * len(lengths) + BUFFER_BLOCK_OVERHEAD
+		self.blocks.append((times[0], times[-1], self.first_seq, len(times), times, lengths, text, memory))
+		self.memory += memory - self.lines_memory
+		self.lines = []
+		self.text_bytes = 0
+		self.lines_memory = 0
+
+	def _trim(self, now):
+		cutoff = now - self.max_age
+		while self.blocks and self.blocks[0][1] < cutoff:
+			self.memory -= self.blocks.popleft()[7]
+		while len(self.lines) > 1 and self.lines[0][0] < cutoff and not self.blocks:
+			# The open block ages out line by line; it is small, so this stays cheap.
+			read_time, line = self.lines.pop(0)
+			self.first_seq += 1
+			self.text_bytes -= len(line)
+			size = sys.getsizeof(line) + BUFFER_LINE_OVERHEAD
+			self.lines_memory -= size
+			self.memory -= size
+		# The newest block stays even over the cap: it holds the newest lines.
+		while self.memory > self.max_bytes and (len(self.blocks) > 1 or (self.blocks and self.lines)):
+			block = self.blocks.popleft()
+			self.dropped_until = block[1]
+			self.memory -= block[7]
+
+	def entries(self, since, after_seq=None):
+		"""Yields (read_time, seq, line) oldest first, for lines read at or after since and, given
+		after_seq, numbered above it; one block is decompressed at a time."""
+		for first_time, last_time, first_seq, count, times, lengths, text, _memory in self.blocks:
+			if last_time < since or (after_seq is not None and first_seq + count - 1 <= after_seq):
+				continue
+			data = zlib.decompress(text).decode('utf-8', 'replace')
+			offset = 0
+			for index in range(count):
+				end = offset + lengths[index]
+				seq = first_seq + index
+				if times[index] >= since and (after_seq is None or seq > after_seq):
+					yield times[index], seq, data[offset:end]
+				offset = end
+		for index, (read_time, line) in enumerate(self.lines):
+			seq = self.first_seq + index
+			if read_time >= since and (after_seq is None or seq > after_seq):
+				yield read_time, seq, line
+
+	def count(self, since, through_seq):
+		"""How many lines read at or after since are numbered through_seq or below, without decompressing."""
+		total = 0
+		for _first_time, last_time, first_seq, count, times, _lengths, _text, _memory in self.blocks:
+			if last_time < since:
+				continue
+			for index in range(count):
+				if first_seq + index > through_seq:
+					return total
+				if times[index] >= since:
+					total += 1
+		for index, (read_time, _line) in enumerate(self.lines):
+			if self.first_seq + index > through_seq:
+				break
+			if read_time >= since:
+				total += 1
+		return total
+
 class CaptureFile(object):
 	"""Append handle kept open for one capture.
 
@@ -1719,19 +1832,14 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	capture_time_max bounds how long one capture runs however often its pattern repeats (0: no bound).
 	fallback_folder is where a capture continues when output_folder cannot be written (None: nowhere).
 	min_free_percent is the free-space floor a capture may not take a filesystem below (0: none).
-	buffer_max_mb bounds the memory for the lines kept before a match.
+	The capture_time seconds before a match are kept compressed in at most buffer_max_mb of memory;
+	capture_line_count_max bounds the lines written after it.
 	A capture with a matched line that also matches always_notify_patterns (load_patterns() output)
 	is pushed even when the LLM says not to notify.
 	"""
 	matcher = _as_matcher(patterns)
 	always_matcher = _as_matcher(always_notify_patterns) if always_notify_patterns else None
-	# Only the newest capture_line_count_max buffered lines are ever written, so hold no more.
-	buffer_cap = max(0, capture_line_count_max)
-	log_buffer = deque(maxlen=buffer_cap)  # Stores tuples of (read_time, line)
-	# Lines are capped by count and by memory: each str's own size plus BUFFER_LINE_OVERHEAD.
-	buffer_bytes = 0
-	buffer_max_bytes = buffer_max_mb * 1024 * 1024
-	dropped_until = None  # read_time of the newest line a cap pushed out of log_buffer
+	context = ContextBuffer(max(0, capture_time), buffer_max_mb * 1024 * 1024)
 	# The guard comes first, so the compressors' first runs already keep to its floor.
 	disk_guard = DiskGuard(min_free_percent, purge_interval=purge_interval)
 	log_compressors = [Log_Compressor(output_folder, compress_after_months, delete_after_months, background=True, guard=disk_guard)]
@@ -1806,21 +1914,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					read_time = time.time()
 					processed_line_counter += 1
 
-					# Keep capture_time seconds of context, at most buffer_cap lines and buffer_max_bytes of memory
-					while log_buffer and read_time - log_buffer[0][0] > capture_time:
-						buffer_bytes -= sys.getsizeof(log_buffer.popleft()[1]) + BUFFER_LINE_OVERHEAD
-					if len(log_buffer) == buffer_cap:
-						dropped_until = log_buffer[0][0] if log_buffer else read_time
-						if log_buffer:
-							# append() is about to push this one out
-							buffer_bytes -= sys.getsizeof(log_buffer[0][1]) + BUFFER_LINE_OVERHEAD
-					if buffer_cap:
-						log_buffer.append((read_time, line))
-						buffer_bytes += sys.getsizeof(line) + BUFFER_LINE_OVERHEAD
-					# Oldest lines go first; the newest line always stays.
-					while buffer_bytes > buffer_max_bytes and len(log_buffer) > 1:
-						dropped_until = log_buffer[0][0]
-						buffer_bytes -= sys.getsizeof(log_buffer.popleft()[1]) + BUFFER_LINE_OVERHEAD
+					# Keep capture_time seconds of context, compressed, in at most buffer_max_mb of memory
+					context.append(read_time, processed_line_counter, line)
 
 					# A capture whose window (or capture_time_max) ran out before this line ends first,
 					# so a matching line starts a new capture instead of extending a finished one.
@@ -1852,11 +1947,12 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							capture.write(f"{bcolors.warning}Captured at:     {datetime.datetime.now().isoformat()}{bcolors.ENDC}\n")
 							print(f"  Captured at:     {datetime.datetime.now().isoformat()}")
 							capture.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
-							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(read_time - capture_time).isoformat()}:{bcolors.ENDC}\n")
-							if dropped_until is not None and read_time - dropped_until <= capture_time:
-								capture.write(f"{bcolors.warning}Older cached in-memory lines were dropped to stay within capture_line_count_max {capture_line_count_max} lines and buffer_max_mb {buffer_max_mb} MiB ...{bcolors.ENDC}\n")
+							since = read_time - max(0, capture_time)
+							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(since).isoformat()}:{bcolors.ENDC}\n")
+							if context.dropped_until is not None and context.dropped_until >= since:
+								capture.write(f"{bcolors.warning}Older cached in-memory lines were dropped to stay within buffer_max_mb {buffer_max_mb} MiB ...{bcolors.ENDC}\n")
 							header_end = capture.position()
-							for _buffered_time, buffered_line in log_buffer:
+							for _buffered_time, _seq, buffered_line in context.entries(since):
 								if matcher.find(buffered_line) is not None:
 									capture.write(f'{bcolors.critical}-> {buffered_line.strip()}{bcolors.ENDC}\n')
 								else:
@@ -2200,8 +2296,8 @@ def build_parser():
 					  'Lines arrive faster than real time, so -t and --capture-time-max do not bound a capture: it runs to --capture_line_count_max lines or the end of the input.')
 	filt.add_argument('--no-filter_only', '--no-filter-only', dest='filter_only', action='store_false', help='Follow new log lines. Overrides filter_only from the config file.')
 	parser.add_argument('--compress-after-months', type=int, default=None, help='Compress logs after this many months. Default: 3 months.')
-	parser.add_argument('--capture_line_count_max', '--capture-line-count-max', type=int, default=None, help='Maximum number of lines to capture before and after in a single log file. Default: 10000 lines. Note: The final file maybe 2 * this number. Also caps how many recent lines are held in memory.')
-	parser.add_argument('--buffer-max-mb', type=int, default=None, help='Memory, in MiB, for the lines kept before a match. The oldest lines are dropped past it. Default: %d.' % DEFAULT_BUFFER_MAX_MB)
+	parser.add_argument('--capture_line_count_max', '--capture-line-count-max', type=int, default=None, help='Maximum number of lines to capture after a match in a single log file. Default: 10000 lines. The lines before the match are bounded by --capture-time and --buffer-max-mb.')
+	parser.add_argument('--buffer-max-mb', type=int, default=None, help='Memory, in MiB, for the lines kept before a match, compressed. The oldest lines are dropped past it. Default: %d.' % DEFAULT_BUFFER_MAX_MB)
 	parser.add_argument('--min-free-percent', type=_percent_arg, default=None, help='Free-space floor, in percent (0 to 50), for the filesystems captures are written to. Near it, old months of captures may be deleted (see the README), then the capture moves to the fallback folder or stops. 0 disables. Default: %g.' % DEFAULT_MIN_FREE_PERCENT)
 	parser.add_argument('--purge-interval', type=int, default=None, metavar='SEC', help='Least seconds between two deletions of old months in one folder to keep the free-space floor, so a disk that something else keeps filling drains the history slowly. 0: no wait. Default: %d.' % DEFAULT_PURGE_INTERVAL)
 	parser.add_argument('--delete-after-months', type=int, default=None, help='Delete logs after this many months. (will only delete files in YYYY-MM format) Default: 0 (never by age; the free-space floor can still delete the oldest months).')

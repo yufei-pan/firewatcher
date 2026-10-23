@@ -160,15 +160,13 @@ def test_capture_nonmatch_lines_can_hit_line_cap(tmp_path):
     assert 'line4' not in text
 
 
-def test_capture_skips_excess_pre_match_buffer(tmp_path):
-    body = ''.join(f'pre-{i}\n' for i in range(10)) + 'HIT\n'
+def test_line_cap_limits_only_the_lines_after_the_match(tmp_path):
+    body = ''.join(f'pre-{i}\n' for i in range(10)) + 'HIT\n' + ''.join(f'post-{i}\n' for i in range(10))
     out = capture(tmp_path, body, capture_line_count_max=3)
     text = incident_logs(out)[0].read_text()
-    assert 'Older cached in-memory lines were dropped' in text
-    assert 'pre-0' not in text
-    assert 'pre-8' in text
-    assert 'pre-9' in text
-    assert 'HIT' in text
+    assert all('pre-%d' % i in text for i in range(10))
+    assert 'post-2' in text and 'post-4' not in text
+    assert 'Older cached in-memory lines were dropped' not in text
 
 
 def test_capture_progress_every_10000_lines(tmp_path, capsys):
@@ -243,17 +241,11 @@ def run_scripted(tmp_path, monkeypatch, popen, **kw):
     return tmp_path / 'out'
 
 
-def test_pre_match_buffer_is_capped_at_capture_line_count_max(tmp_path, monkeypatch):
-    class RecordingDeque(collections.deque):
-        peak = 0
-
-        def append(self, item):
-            super().append(item)
-            RecordingDeque.peak = max(RecordingDeque.peak, len(self))
-
-    monkeypatch.setattr(fw, 'deque', RecordingDeque)
-    capture(tmp_path, ''.join(f'noise-{i}\n' for i in range(50)), capture_line_count_max=5)
-    assert 0 < RecordingDeque.peak <= 5
+def test_full_window_of_context_is_kept_past_ten_thousand_lines(tmp_path):
+    body = ''.join('pre-%05d some context\n' % i for i in range(30000)) + 'HIT\n'
+    text = incident_logs(capture(tmp_path, body))[0].read_text()
+    assert 'pre-00000' in text and 'pre-29999' in text
+    assert text.count('some context') == 30000
 
 
 def test_capture_does_not_report_dropped_lines_that_aged_out(tmp_path, monkeypatch):
@@ -1012,22 +1004,59 @@ def test_capture_with_no_room_anywhere_is_not_saved(tmp_path, monkeypatch):
 
 # --- memory ---
 
-def test_buffer_drops_the_oldest_lines_past_its_memory_limit(tmp_path, monkeypatch):
-    monkeypatch.setattr(fw, 'BUFFER_LINE_OVERHEAD', 0)
-    # 1 MiB of buffer: twelve 100 KiB lines do not fit, the newest ten (1,024,080 bytes) do
-    body = ''.join('old-%02d %s\n' % (i, 'x' * 100 * 1024) for i in range(12)) + 'HIT\n'
-    out = capture(tmp_path, body, buffer_max_mb=1)
-    text = incident_logs(out)[0].read_text()
-    assert 'Older cached in-memory lines were dropped' in text
-    assert 'old-00' not in text and 'old-01' not in text
-    assert 'old-02' in text and 'old-11' in text and 'HIT' in text
+def random_text(n):
+    import base64
+    return base64.b64encode(os.urandom(n * 3 // 4)).decode()[:n]
+
+
+def test_buffer_drops_the_oldest_lines_past_its_memory_limit(tmp_path):
+    # incompressible lines: 3 MB of them do not fit in 1 MiB
+    lines = ['old-%04d %s\n' % (i, random_text(1000)) for i in range(3000)]
+    # '!' never occurs in base64, so only the last line can match
+    out = capture(tmp_path, ''.join(lines) + 'HIT!\n', pattern='HIT!', buffer_max_mb=1)
+    (cap,) = incident_logs(out)
+    text = cap.read_text()
+    assert 'Older cached in-memory lines were dropped to stay within buffer_max_mb 1 MiB' in text
+    assert 'old-0000 ' not in text
+    assert 'old-2999 ' in text and 'Matched line:    HIT!' in text
+    kept = len(re.findall(r'^old-\d{4} ', text, re.M))
+    assert 1000 < kept < 1600  # base64 compresses to about 3/4, so 1 MiB holds about 1.3 MB of these
 
 
 def test_buffer_keeps_the_newest_line_even_when_it_alone_is_too_big(tmp_path, monkeypatch):
-    out = capture(tmp_path, 'context\nHIT %s\n' % ('y' * 2 * 1024 * 1024), buffer_max_mb=1)
-    text = incident_logs(out)[0].read_text()
-    assert 'context' not in text
-    assert text.count('y' * 1024) >= 2047
+    monkeypatch.setattr(fw, 'MAX_LINE_CHARS', 4 * 1024 * 1024)  # read it as one line
+    big = random_text(2 * 1024 * 1024)
+    out = capture(tmp_path, 'old line\n' * 2000 + 'HIT! ' + big + '\n', pattern='HIT!', buffer_max_mb=1)
+    (cap,) = incident_logs(out)
+    text = cap.read_text()
+    assert big in text
+
+
+def test_context_buffer_memory_stays_bounded():
+    buffer = fw.ContextBuffer(10 ** 9, 1024 * 1024)
+    for seq in range(20000):
+        buffer.append(float(seq), seq, 'line %d %s\n' % (seq, random_text(200)))
+        assert buffer.memory <= 1024 * 1024 + fw.BUFFER_BLOCK_BYTES * 3
+    newest = list(buffer.entries(0))
+    assert newest[-1][1] == 19999
+    assert [seq for _t, seq, _l in newest] == list(range(newest[0][1], 20000))
+    assert buffer.dropped_until is not None
+
+
+def test_context_buffer_ages_out_by_time_and_counts_without_decompressing(monkeypatch):
+    buffer = fw.ContextBuffer(100, 64 * 1024 * 1024)
+    for seq in range(5000):
+        buffer.append(float(seq) / 10, seq, 'line %05d %s\n' % (seq, 'x' * 100))
+    assert buffer.blocks
+    entries = list(buffer.entries(400.0))
+    assert entries[0][1] == 4000 and entries[-1][1] == 4999
+    assert all(line.startswith('line %05d ' % seq) for _t, seq, line in entries)
+    assert [seq for _t, seq, _l in buffer.entries(400.0, after_seq=4900)][0] == 4901
+    monkeypatch.setattr(fw.zlib, 'decompress', lambda data: (_ for _ in ()).throw(AssertionError('decompressed')))
+    assert buffer.count(400.0, 4900) == 901
+    # 500 s on, everything but the newest line has aged out
+    buffer.append(1000.0, 5000, 'newest\n')
+    assert [seq for _t, seq, _l in buffer.entries(0)] == [5000]
 
 
 def test_overlong_lines_are_read_in_pieces(tmp_path, monkeypatch):
