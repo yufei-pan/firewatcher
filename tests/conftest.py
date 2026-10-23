@@ -23,6 +23,9 @@ def isolated_firewatcher_config(tmp_path, monkeypatch):
     monkeypatch.setattr(fw, 'DEFAULT_FALLBACK_FOLDER', str(tmp_path / 'fallback') + os.sep)
     monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(tmp_path / 'patterns.d'))
     monkeypatch.setattr(fw, 'DEFAULT_POSITION_FILE', str(tmp_path / 'journal.position'))
+    # no journald unless a test says so, whatever runs on the machine running the tests
+    monkeypatch.setattr(fw, 'JOURNALD_SOCKET', str(tmp_path / 'journald.socket'))
+    monkeypatch.setattr(fw, 'JOURNAL_DIRS', (str(tmp_path / 'journal'),))
     monkeypatch.delenv(fw.LLM_API_KEY_ENV, raising=False)
     monkeypatch.delenv(fw.NTFY_TOKEN_ENV, raising=False)
     # a SIGHUP flag left set by one test must not reload patterns in the next
@@ -47,6 +50,12 @@ def systemctl_recorder(calls, returncode=0):
         R.returncode = returncode if not callable(returncode) else returncode(cmd)
         return R()
     return fake
+
+
+def use_journal(monkeypatch):
+    """A host with journalctl on PATH and journald running."""
+    monkeypatch.setattr(fw.shutil, 'which', lambda name: '/usr/bin/journalctl' if name == 'journalctl' else None)
+    monkeypatch.setattr(fw, '_journald_present', lambda: True)
 
 
 def write_log(tmp_path, text, name='src.log'):

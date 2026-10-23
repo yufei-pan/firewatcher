@@ -51,6 +51,9 @@ BUFFER_BLOCK_OVERHEAD = 512
 MAX_LINE_CHARS = 1 << 20
 # Reads failing this many times in a row (a closed pipe) end the run instead of spinning on the error.
 MAX_READ_ERRORS = 100
+# journald's socket, there while journald runs, and the folders it keeps journal files in.
+JOURNALD_SOCKET = '/run/systemd/journal/socket'
+JOURNAL_DIRS = ('/var/log/journal', '/run/log/journal')
 # Where firewatcher remembers how far it read the journal, so a restart resumes there.
 DEFAULT_POSITION_FILE = '/var/lib/firewatcher/journal.position'
 # At start, the most seconds of journal read back: lines logged while firewatcher was stopped, and context.
@@ -2395,7 +2398,7 @@ def build_parser():
 					 'Other files load fnmatch (bash like) patterns with * wildcards added at both ends. '
 					 'A directory (such as /etc/firewatcher/patterns.d) loads every non-hidden pattern file inside it. '
 					 'Optional for --install-service / --print-unit (defaults to /etc/firewatcher/patterns.d) and --uninstall-service.')
-	parser.add_argument('--log-file', type=str, help='Path to the log file to monitor. Default: journalctl -> /var/log/syslog -> /var/log/messages.')
+	parser.add_argument('--log-file', type=str, help='Path to the log file to monitor. Default: the journal (journalctl) when journald runs, else /var/log/syslog, else /var/log/messages.')
 	# Never implemented; still accepted so existing units that pass it keep starting.
 	parser.add_argument('--workers', type=int, default=1, help=argparse.SUPPRESS)
 	parser.add_argument('-t','--capture-time', type=int, default=None, help='Time in seconds to capture logs after a match. Default: 300 seconds.')
@@ -2612,6 +2615,19 @@ def _journal_can_resume(journalctl):
 	return probe.returncode == 0
 
 
+def _journald_present():
+	"""True when journald runs here, or its journal files are here (such as a host journal mounted into a container)."""
+	if os.path.exists(JOURNALD_SOCKET):
+		return True
+	for folder in JOURNAL_DIRS:
+		try:
+			if os.listdir(folder):
+				return True
+		except OSError:
+			pass
+	return False
+
+
 def log_source_command(args):
 	"""Return the argv used to read logs, or None if nothing is available."""
 	if not getattr(args, '_resolved', False):
@@ -2622,15 +2638,20 @@ def log_source_command(args):
 		file_pre = ['tail', '-n', str(args.tail_lines), '-F']
 	if args.log_file:
 		return file_pre + [args.log_file]
-	if shutil.which('journalctl'):
-		cmd = ['journalctl', '--all', '--no-pager', '--lines=%s' % args.tail_lines]
-		if not args.filter_only:
-			cmd.append('--follow')
-		return cmd
+	journal = ['journalctl', '--all', '--no-pager', '--lines=%s' % args.tail_lines]
+	if not args.filter_only:
+		journal.append('--follow')
+	has_journalctl = shutil.which('journalctl') is not None
+	# journalctl on PATH alone is not enough: a host can have it installed while another init and syslog run.
+	if has_journalctl and _journald_present():
+		return journal
 	if os.path.exists('/var/log/syslog'):
 		return file_pre + ['/var/log/syslog']
 	if os.path.exists('/var/log/messages'):
 		return file_pre + ['/var/log/messages']
+	# With no syslog file either, journalctl is still the best guess, as before.
+	if has_journalctl:
+		return journal
 	return None
 
 # Set by SIGHUP; the capture loop reloads the pattern files at the next line.

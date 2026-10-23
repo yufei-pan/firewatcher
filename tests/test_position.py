@@ -8,7 +8,7 @@ import time
 import pytest
 
 import firewatcher as fw
-from conftest import ROOT, ScriptedPopen, incident_logs, parse_cli, patch_popen
+from conftest import ROOT, ScriptedPopen, fake_exists, incident_logs, parse_cli, patch_popen, use_journal
 
 # --- resuming the journal after a restart ---
 
@@ -224,7 +224,7 @@ def _main_with(monkeypatch, argv, can_resume=True):
         seen.update(kwargs)
 
     monkeypatch.setattr(fw, 'capture_messages', fake_capture)
-    monkeypatch.setattr(fw.shutil, 'which', lambda name: '/usr/bin/journalctl' if name == 'journalctl' else None)
+    use_journal(monkeypatch)
     monkeypatch.setattr(fw, '_journal_can_resume', lambda journalctl: can_resume)
     assert fw.main(argv) == 0
     return seen
@@ -252,6 +252,30 @@ def test_main_reads_the_last_lines_without_resuming(tmp_path, monkeypatch, capsy
     assert '--output=short-iso' not in seen['command'] and '--lines=20' in seen['command']
     if note:
         assert note in capsys.readouterr().out
+
+
+def test_a_host_without_journald_tails_syslog_without_resuming(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake_capture(command, patterns, **kwargs):
+        seen['command'] = command
+        seen.update(kwargs)
+
+    def no_probe(journalctl):
+        raise AssertionError('journalctl probed on a host without journald')
+
+    monkeypatch.setattr(fw, 'capture_messages', fake_capture)
+    monkeypatch.setattr(fw.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(fw.os.path, 'exists', fake_exists(syslog=True))
+    monkeypatch.setattr(fw, '_journal_can_resume', no_probe)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    assert fw.main([str(pat)]) == 0
+    assert seen['command'] == ['tail', '-n', '20', '-F', '/var/log/syslog']
+    assert seen['journal_position'] is None
+    # the pattern reload works whatever the source
+    assert seen['reload_patterns']()[0] == {'fnmatch': {'*HIT*'}}
+    assert 'journal position' not in capsys.readouterr().out
 
 
 def test_journal_can_resume_probes_journalctl(tmp_path):
@@ -310,7 +334,10 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
 
     def run_until(done):
         proc = subprocess.Popen(
-            [sys.executable, str(ROOT / 'firewatcher.py'), '--config', str(conf), '-o', str(out), '-t', '60',
+            # as on a journald host, whatever runs on the machine running the tests
+            [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import firewatcher as fw; '
+             'fw._journald_present = lambda: True; sys.exit(fw.main(sys.argv[2:]))', str(ROOT),
+             '--config', str(conf), '-o', str(out), '-t', '60',
              '--fallback-folder', '', '--position-file', str(position_file), str(pat)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=env,
         )

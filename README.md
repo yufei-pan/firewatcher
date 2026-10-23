@@ -2,7 +2,9 @@
 
 Watch a log stream (journald, syslog, or any file) for incident patterns, then persist a window of surrounding messages to a durable location — including a network filesystem — so the record survives even if the machine later dies.
 
-The watcher prefers `journalctl --follow` when `journalctl` is on PATH. On hosts without journald it falls back to `/var/log/syslog`, then `/var/log/messages`, or `--log-file`. Running the daemon does not require systemd; only `--install-service` / `--uninstall-service` do.
+The watcher reads the journal with `journalctl --follow` when journald runs on the host (or its journal files are there, such as a host journal mounted into a container). Otherwise it follows `/var/log/syslog`, then `/var/log/messages`, even when `journalctl` is installed; `--log-file` picks a file. With no syslog file either, it falls back to `journalctl`. Running the daemon does not require systemd; only `--install-service` / `--uninstall-service` do.
+
+Everything but [resuming after a restart](#resuming-after-a-restart) works with every source: the compressed context before a match, leaving out context already captured, the free-space floor, SIGHUP reload, and LLM analysis and pushes. Resuming needs the journal; with a log file, firewatcher reads the last `--tail-lines` lines at every start, as before.
 
 ## Install
 
@@ -54,7 +56,7 @@ SIGHUP reloads the pattern files and the `--always-notify` files from the paths 
 
 ### Resuming after a restart
 
-When firewatcher follows the journal, it saves how far it has read in `--position-file` (default `/var/lib/firewatcher/journal.position`): about once a second while lines arrive or a capture is open, as soon as a match opens a capture, and when it stops. After a restart it reads on from there instead of the last `--tail-lines` lines; after a crash or `kill -9`, that can be up to about a second before the last line it read. Lines logged while it was stopped, such as during a reboot, are still matched, and an incident it already captured is not captured again. The `--capture-time` seconds before the saved line are read again only to refill the context kept before a match. At most `--resume-max` seconds (default 3600) are read back, so after a longer stop only the last hour is matched.
+When firewatcher follows the journal (not a log file), it saves how far it has read in `--position-file` (default `/var/lib/firewatcher/journal.position`): about once a second while lines arrive or a capture is open, as soon as a match opens a capture, and when it stops. After a restart it reads on from there instead of the last `--tail-lines` lines; after a crash or `kill -9`, that can be up to about a second before the last line it read. Lines logged while it was stopped, such as during a reboot, are still matched, and an incident it already captured is not captured again. The `--capture-time` seconds before the saved line are read again only to refill the context kept before a match. At most `--resume-max` seconds (default 3600) are read back, so after a longer stop only the last hour is matched.
 
 To tell where it stopped, firewatcher reads the journal with `journalctl -o short-iso`, so journal lines in captures carry the year and time zone: `2026-10-23T17:52:41+00:00 host sshd[812]: …` instead of `Oct 23 17:52:41 host sshd[812]: …`. Lines logged while firewatcher was stopped arrive all at once, so a capture opened by one of them holds the ones after it, up to `--capture-line-count-max`.
 
@@ -112,7 +114,7 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | Flag | Description |
 |------|-------------|
 | `pattern_file …` | Pattern files or directories |
-| `--log-file` | Log file to follow (default: journalctl / syslog / messages) |
+| `--log-file` | Log file to follow (default: the journal when journald runs, else `/var/log/syslog`, else `/var/log/messages`) |
 | `-t`, `--capture-time` | Seconds of context after a match (default: 300) |
 | `--capture-time-max` | Longest one capture may run, in seconds (default: 3600; 0 = no limit) |
 | `-o`, `--output-folder` | Where to write captures (default: `/var/log/captured_messages/`) |
