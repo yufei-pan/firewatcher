@@ -405,3 +405,47 @@ def test_empty_always_notify_flag_clears_the_config_list(tmp_path):
     conf.write_text('[notify]\nalways_notify = /a\n')
     settings = fw.resolve_settings(parse_cli(['--config', str(conf), '--always-notify', '', 'p.txt']), environ={})
     assert settings.always_notify == []
+
+
+def test_disk_and_memory_limits_load_and_validate(tmp_path):
+    defaults = fw.resolve_settings(parse_cli(['p.txt']), environ={})
+    assert defaults.min_free_percent == fw.DEFAULT_MIN_FREE_PERCENT == 1
+    assert defaults.buffer_max_mb == fw.DEFAULT_BUFFER_MAX_MB
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\nmin_free_percent = 0.5%\nbuffer_max_mb = 4\n')
+    settings = fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+    assert settings.min_free_percent == 0.5
+    assert settings.buffer_max_mb == 4
+    cli = fw.resolve_settings(parse_cli(['--config', str(conf), '--min-free-percent', '2', '--buffer-max-mb', '8', 'p.txt']), environ={})
+    assert (cli.min_free_percent, cli.buffer_max_mb) == (2, 8)
+    generated = tmp_path / 'generated.conf'
+    fw.write_config_file(str(generated), cli)
+    again = fw.resolve_settings(parse_cli(['--config', str(generated)]), environ={})
+    assert (again.min_free_percent, again.buffer_max_mb) == (2, 8)
+    assert fw._explicit_cli_args(parse_cli(['--min-free-percent', '0.5', '--buffer-max-mb', '8', 'p.txt']))[:4] == [
+        '--buffer-max-mb', '8', '--min-free-percent', '0.5']
+
+
+@pytest.mark.parametrize('text, message', [
+    ('[watch]\nmin_free_percent = 100\n', 'watch.min_free_percent'),
+    ('[watch]\nmin_free_percent = -1\n', 'watch.min_free_percent'),
+    ('[watch]\nmin_free_percent = lots\n', 'invalid number for watch.min_free_percent'),
+    ('[watch]\nbuffer_max_mb = 0\n', 'watch.buffer_max_mb'),
+])
+def test_disk_and_memory_limits_reject_bad_values(tmp_path, text, message):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text(text)
+    with pytest.raises(fw.ConfigError, match=re.escape(message)):
+        fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+
+
+def test_main_passes_the_disk_and_memory_limits(tmp_path, monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(fw, 'capture_messages', lambda command, patterns, **kwargs: seen.update(kwargs))
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    src = tmp_path / 'log'
+    src.write_text('x\n')
+    assert fw.main(['--filter_only', '--log-file', str(src), '--min-free-percent', '3', '--buffer-max-mb', '2', str(pat)]) == 0
+    assert (seen['min_free_percent'], seen['buffer_max_mb']) == (3, 2)
+    assert 'Keeping at least 3% free' in capsys.readouterr().out

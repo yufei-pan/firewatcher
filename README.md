@@ -48,6 +48,12 @@ The fallback needs the failure to come back as an error. On an NFS mount with th
 
 `firewatcher` finishes the open capture on SIGINT and on SIGTERM. A second SIGTERM ends it at once.
 
+### Disk and memory limits
+
+firewatcher never takes a filesystem below `--min-free-percent` free (default 1%, counted as `df` does, so the root-reserved blocks are left alone). It checks when a capture opens, about once a second while one is written, and whenever half the room it last saw has been written, so even a capture written faster than that stops at the floor, give or take one line. Near the floor, it deletes its own oldest months in that folder, archives and directories alike, never the current month or the one being written, and logs each deletion. If that is not enough, the capture moves to the fallback folder, or stops being written there, with a note; the incident is still logged and pushed. Since everything else on the disk fills it first, firewatcher's captures are the last thing to go.
+
+Memory is bounded too. The lines kept before a match are capped at `--capture-line-count-max` lines and `--buffer-max-mb` (default 16 MiB, counting the text plus about 128 bytes of bookkeeping per line); past either, the oldest lines are dropped and the capture says so. A line longer than 1 MiB is read in pieces. The LLM excerpt reads at most `max_bytes` of a capture.
+
 Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`. The directory is removed only after `tar` succeeds and the archive is synced to disk. An existing archive is never overwritten: the new one becomes `YYYY-MM.1.tar.xz`, and so on.
 
 ## systemd service
@@ -93,6 +99,8 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--compress-after-months` | Tar.xz monthly dirs after N months (default: 3) |
 | `--delete-after-months` | Delete `YYYY-MM` dirs after N months (default: 0 = never) |
 | `--capture-line-count-max` | Max lines before/after a match (default: 10000). Also caps how many recent lines are held in memory |
+| `--buffer-max-mb` | Memory, in MiB, for the lines kept before a match (default: 16). The oldest lines are dropped past it |
+| `--min-free-percent` | Free-space floor for the filesystems captures go to (default: 1; 0 disables). See below |
 | `--config PATH` | INI config file. Default: `/etc/firewatcher/firewatcher.conf` when that file exists. An explicit path must exist |
 | `--llm` / `--no-llm` | Enable or disable LLM analysis of each finished capture |
 | `--llm-base-url URL` | OpenAI-compatible API root, such as `http://127.0.0.1:11434/v1` |

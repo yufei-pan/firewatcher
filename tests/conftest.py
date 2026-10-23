@@ -73,7 +73,11 @@ def capture(tmp_path, lines, pattern='HIT', regex=False, **kw):
 
 
 def incident_logs(out):
-    return sorted(p for p in out.rglob('*.log') if p.name != 'journal.log')
+    # in the order they were opened: name_SECOND.log, then name_SECOND-1.log, name_SECOND-2.log, ...
+    def opened(path):
+        base, _, n = path.stem.rpartition('-')
+        return (str(path.parent), base, int(n)) if n.isdigit() and base.count('T') else (str(path.parent), path.stem, 0)
+    return sorted((p for p in out.rglob('*.log') if p.name != 'journal.log'), key=opened)
 
 
 def fake_exists(syslog=False, messages=False):
@@ -102,7 +106,7 @@ class ScriptedStdout:
         self.events = list(events)
         self.clock = clock
 
-    def readline(self):
+    def readline(self, size=-1):
         if not self.events:
             return ''
         ev = self.events.pop(0)

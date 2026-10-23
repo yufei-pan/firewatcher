@@ -1,12 +1,13 @@
 import collections
 import datetime
+import re
 import threading
 import time
 
 import pytest
 
 import firewatcher as fw
-from conftest import Clock, capture, incident_logs, ScriptedPopen, patch_popen, REAL_OUTPUT_FOLDER
+from conftest import Clock, capture, incident_logs, ScriptedPopen, ScriptedStdout, patch_popen, REAL_OUTPUT_FOLDER
 
 # --- capture loop ---
 
@@ -276,9 +277,9 @@ def test_idle_reads_stay_on_the_calling_thread(tmp_path, monkeypatch):
             super().__init__(events)
             readline = self.stdout.readline
 
-            def recording_readline():
+            def recording_readline(*args):
                 threads.append(threading.current_thread())
-                return readline()
+                return readline(*args)
 
             self.stdout.readline = recording_readline
 
@@ -325,7 +326,7 @@ def test_capture_fsyncs_pending_lines_when_source_goes_quiet(tmp_path, monkeypat
         def __init__(self):
             self.lines = ['HIT now\n', 'more\n']
 
-        def readline(self):
+        def readline(self, size=-1):
             if self.lines:
                 return self.lines.pop(0)
             time.sleep(0.5)
@@ -443,7 +444,7 @@ def test_capture_with_no_writable_folder_still_reaches_the_dispatcher(tmp_path, 
     assert len(dispatcher.jobs) == 1
     assert dispatcher.jobs[0]['path'] is None
     assert dispatcher.jobs[0]['matched_line'] == 'HIT now'
-    assert any('no writable folder left' in record[1] for record in records)
+    assert any('no writable folder with free space left' in record[1] for record in records)
 
 
 class FlakyHandle:
@@ -660,3 +661,189 @@ def test_write_that_raises_moves_the_capture(tmp_path, monkeypatch):
     assert 'No space left on device' in text
     assert 'BREAK line' in text
     assert 'last' in text
+
+
+# --- free space ---
+
+FULL = (10 ** 6, 10 ** 12)       # 1 MB free of 1 TB: far below a 1% floor
+ROOMY = (5 * 10 ** 11, 10 ** 12)
+
+
+def low_until(monkeypatch, deletions_needed):
+    """_free_space reports a nearly full disk until purgeOldestMonth has deleted enough."""
+    state = {'deleted': 0}
+    real_purge = fw.Log_Compressor.purgeOldestMonth
+
+    def purge(self, keep):
+        done = real_purge(self, keep)
+        state['deleted'] += done
+        return done
+
+    monkeypatch.setattr(fw.Log_Compressor, 'purgeOldestMonth', purge)
+    monkeypatch.setattr(fw, '_free_space', lambda path: ROOMY if state['deleted'] >= deletions_needed else FULL)
+    return state
+
+
+def months(root, *names):
+    root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        if name.endswith('.tar.xz'):
+            (root / name).write_bytes(b'archive')
+        else:
+            (root / name).mkdir()
+            (root / name / 'x.log').write_text('x')
+
+
+def test_low_space_deletes_the_oldest_months_first(tmp_path, monkeypatch):
+    records = journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    current = datetime.datetime.now().strftime('%Y-%m')
+    months(out, '2020-01', '2020-01.tar.xz', '2020-02.tar.xz', '2020-03', current)
+    low_until(monkeypatch, 2)
+    guard = fw.DiskGuard(1, [fw.Log_Compressor(str(out), 0, 0)])
+    assert guard.headroom(str(out / current / 'hit.log')) >= fw.MIN_HEADROOM
+    assert sorted(p.name for p in out.iterdir()) == ['2020-03', current]
+    assert sum('deleted' in record[1] for record in records) == 2
+
+
+def test_low_space_never_deletes_the_current_month_or_the_one_written(tmp_path, monkeypatch):
+    records = journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    current = datetime.datetime.now().strftime('%Y-%m')
+    months(out, '2020-01', current)
+    low_until(monkeypatch, 99)
+    guard = fw.DiskGuard(1, [fw.Log_Compressor(str(out), 0, 0)])
+    assert guard.headroom(str(out / '2020-01' / 'late.log')) < fw.MIN_HEADROOM
+    assert sorted(p.name for p in out.iterdir()) == ['2020-01', current]
+    assert any('free space below 1%' in record[1] for record in records)
+
+
+def test_purge_waits_for_compression(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    months(out, '2020-01')
+    compressor = fw.Log_Compressor(str(out), 0, 0)
+    with compressor.lock:
+        assert not compressor.purgeOldestMonth(set())
+    assert (out / '2020-01').is_dir()
+    assert compressor.purgeOldestMonth(set())
+    assert not (out / '2020-01').exists()
+
+
+def test_zero_floor_never_checks(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, '_free_space', lambda path: (_ for _ in ()).throw(AssertionError('checked')))
+    assert fw.DiskGuard(0, []).headroom(str(tmp_path / 'x.log')) is None
+
+
+def test_free_space_reads_the_nearest_existing_folder(tmp_path):
+    available, size = fw._free_space(str(tmp_path / 'not' / 'yet' / 'there.log'))
+    assert 0 < available <= size
+
+
+def test_capture_skips_a_full_output_folder_for_the_fallback(tmp_path, monkeypatch):
+    records = journal_records(monkeypatch)
+    dispatcher = recording_dispatcher(monkeypatch)
+    out = tmp_path / 'out'
+    fallback = tmp_path / 'fallback'
+    monkeypatch.setattr(fw, '_free_space', lambda path: FULL if str(path).startswith(str(out)) else ROOMY)
+    capture(tmp_path, 'before\nHIT now\nafter\n', output_folder=str(out), fallback_folder=str(fallback), min_free_percent=1)
+    assert incident_logs(out) == []
+    text = incident_logs(fallback)[0].read_text()
+    assert 'because free space there fell below the floor' in text
+    assert 'after' in text and 'End of capture' in text
+    assert dispatcher.jobs[0]['path'] == str(incident_logs(fallback)[0])
+    assert any('free space below 1%' in record[1] for record in records)
+
+
+def test_capture_moves_when_its_folder_fills_up(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = tmp_path / 'out'
+    fallback = tmp_path / 'fallback'
+    full = {'out': False}
+    monkeypatch.setattr(fw, '_free_space', lambda path: FULL if full['out'] and str(path).startswith(str(out)) else ROOMY)
+
+    class FillingStdout(ScriptedStdout):
+        def readline(self, size=-1):
+            line = super().readline(size)
+            if line.startswith('fill'):
+                full['out'] = True
+            return line
+
+    popen = ScriptedPopen([])
+    popen.stdout = FillingStdout([('HIT now\n', 0), ('a\n', 2), ('fill\n', 2), ('b\n', 2)], clock=clock)
+    run_scripted(tmp_path, monkeypatch, popen, fallback_folder=str(fallback), min_free_percent=1)
+    primary = incident_logs(tmp_path / 'out')[0].read_text()
+    moved = incident_logs(fallback)[0].read_text()
+    assert 'HIT now' in primary and 'a\n' in primary
+    assert 'capture moved here from' in moved and 'b\n' in moved and 'End of capture' in moved
+
+
+def test_fast_capture_never_runs_past_the_floor(tmp_path, monkeypatch):
+    # A 1 MB filesystem with a 10% floor and 300 KB free, written far faster than the once-a-second fsync.
+    journal_records(monkeypatch)
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    out = tmp_path / 'out'
+    fallback = tmp_path / 'fallback'
+    size, already_used = 1_000_000, 700_000
+
+    def used():
+        return already_used + sum(p.stat().st_size for p in out.rglob('*') if p.is_file())
+
+    monkeypatch.setattr(fw, '_free_space', lambda path: (size - used(), size) if str(path).startswith(str(out)) else ROOMY)
+    lines = [('HIT now\n', 0)] + [('post %04d %s\n' % (i, 'y' * 60), 0) for i in range(6000)]
+    run_scripted(tmp_path, monkeypatch, ScriptedPopen(lines, clock=clock),
+                 fallback_folder=str(fallback), min_free_percent=10, capture_line_count_max=20000)
+    assert size - used() >= size // 10  # the floor held
+    text = ''.join(p.read_text() for p in incident_logs(out) + incident_logs(fallback))
+    assert 'because free space there fell below the floor' in text
+    assert set(re.findall(r'post (\d+)', text)) == {'%04d' % i for i in range(6000)}
+
+
+def test_capture_with_no_room_anywhere_is_not_saved(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    dispatcher = recording_dispatcher(monkeypatch)
+    monkeypatch.setattr(fw, '_free_space', lambda path: FULL)
+    out = capture(tmp_path, 'HIT now\nafter\n', min_free_percent=1)
+    assert incident_logs(out) == []
+    assert dispatcher.jobs[0]['path'] is None
+
+
+# --- memory ---
+
+def test_buffer_drops_the_oldest_lines_past_its_memory_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'BUFFER_LINE_OVERHEAD', 0)
+    # 1 MiB of buffer: twelve 100 KiB lines do not fit, the newest ten (1,024,080 bytes) do
+    body = ''.join('old-%02d %s\n' % (i, 'x' * 100 * 1024) for i in range(12)) + 'HIT\n'
+    out = capture(tmp_path, body, buffer_max_mb=1)
+    text = incident_logs(out)[0].read_text()
+    assert 'Older cached in-memory lines were dropped' in text
+    assert 'old-00' not in text and 'old-01' not in text
+    assert 'old-02' in text and 'old-11' in text and 'HIT' in text
+
+
+def test_buffer_keeps_the_newest_line_even_when_it_alone_is_too_big(tmp_path, monkeypatch):
+    out = capture(tmp_path, 'context\nHIT %s\n' % ('y' * 2 * 1024 * 1024), buffer_max_mb=1)
+    text = incident_logs(out)[0].read_text()
+    assert 'context' not in text
+    assert text.count('y' * 1024) >= 2047
+
+
+def test_overlong_lines_are_read_in_pieces(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'MAX_LINE_CHARS', 16)
+    out = capture(tmp_path, 'noise\nHIT ' + 'z' * 40 + '\nafter\n')
+    text = incident_logs(out)[0].read_text()
+    assert 'z' * 40 in text.replace('\n', '').replace('\x1b[0m', '').replace('\x1b[91m-> ', '')
+    assert 'after' in text
+
+
+def test_reader_that_keeps_failing_ends_the_run(tmp_path, monkeypatch, capsys):
+    popen = ScriptedPopen(['HIT now\n'] + [OSError('pipe closed')] * fw.MAX_READ_ERRORS + ['never read\n'])
+    out = run_scripted(tmp_path, monkeypatch, popen)
+    printed = capsys.readouterr().out
+    assert 'Giving up after %d read errors in a row.' % fw.MAX_READ_ERRORS in printed
+    assert popen.terminated
+    text = incident_logs(out)[0].read_text()
+    assert 'End of capture' in text and 'never read' not in text

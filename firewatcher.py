@@ -32,6 +32,16 @@ DEFAULT_FALLBACK_FOLDER = '/var/lib/firewatcher/captured_messages/'
 # A pattern that keeps matching keeps extending its capture; this bounds one capture's length.
 DEFAULT_CAPTURE_TIME_MAX = 3600
 DEFAULT_PATTERNS_DIR = '/etc/firewatcher/patterns.d'
+# Below this much free space, firewatcher deletes its own oldest months, then stops writing there.
+DEFAULT_MIN_FREE_PERCENT = 1.0
+# Memory for the lines kept before a match, on top of the capture_line_count_max line limit.
+DEFAULT_BUFFER_MAX_MB = 16
+# Rough per-line cost in that buffer beyond the text itself: the str and tuple objects and the read time.
+BUFFER_LINE_OVERHEAD = 128
+# Longest line read at once; a longer one arrives in pieces, so one huge line cannot fill memory.
+MAX_LINE_CHARS = 1 << 20
+# Reads failing this many times in a row (a closed pipe) end the run instead of spinning on the error.
+MAX_READ_ERRORS = 100
 DEFAULT_UNIT_NAME = 'firewatcher'
 SYSTEMD_RUNTIME_DIR = '/run/systemd/system'
 SYSTEMD_UNIT_DIR = '/etc/systemd/system'
@@ -49,6 +59,9 @@ SELF_MARKER = 'firewatcher-self'
 ANALYSIS_QUEUE_MAX = 4
 CAPTURE_SYNC_INTERVAL = 1.0
 COMPRESS_INTERVAL = 172800
+LOW_SPACE_REASON = 'because free space there fell below the floor'
+# Room above the free-space floor below which old months are deleted, and then a capture moves on.
+MIN_HEADROOM = 64 * 1024
 # fsync errors that only mean the filesystem cannot fsync; any other error means written data may be lost.
 _FSYNC_UNSUPPORTED = frozenset((errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS))
 _ANSI_RE = re.compile(rb'\x1b\[[0-9;]*m')
@@ -94,6 +107,8 @@ class Log_Compressor:
 		self.deleteLogAfterMonths = deleteLogAfterMonths
 		self.lastProcessTime = 0
 		self.worker = None
+		# Held while compressing, so a purge for free space never deletes a month tar is reading.
+		self.lock = threading.Lock()
 		if background:
 			self.startCompressLogs()
 		else:
@@ -118,10 +133,45 @@ class Log_Compressor:
 			return
 		# Set first: a run that fails waits for the next interval instead of retrying on every line.
 		self.lastProcessTime = time.time()
+		with self.lock:
+			try:
+				self._compressLogs()
+			except Exception as e:
+				print(f"Compressing logs in {self.logsDir} failed: {e}")
+
+	def purgeOldestMonth(self, keep):
+		'''Delete the oldest month (directory and archives) whose YYYY-MM is not in keep.
+
+		Returns False when nothing was deleted: no such month, an error, or compression running.
+		'''
+		if not self.lock.acquire(blocking=False):
+			return False
 		try:
-			self._compressLogs()
-		except Exception as e:
-			print(f"Compressing logs in {self.logsDir} failed: {e}")
+			months = {}
+			for name in os.listdir(self.logsDir):
+				month = name.partition('.')[0]
+				try:
+					datetime.datetime.strptime(month, '%Y-%m')
+				except ValueError:
+					continue
+				if month not in keep:
+					months.setdefault(month, []).append(name)
+			if not months:
+				return False
+			oldest = min(months)
+			for name in sorted(months[oldest]):
+				full = os.path.join(self.logsDir, name)
+				if os.path.isdir(full) and not os.path.islink(full):
+					shutil.rmtree(full)
+				else:
+					os.remove(full)
+			_journal(syslog.LOG_WARNING, 'free space low: deleted %s from %s' % (', '.join(sorted(months[oldest])), self.logsDir))
+			return True
+		except OSError as exc:
+			_journal(syslog.LOG_ERR, 'free space low: cannot delete old months in %s: %s' % (self.logsDir, exc))
+			return False
+		finally:
+			self.lock.release()
 
 	def _compressLogs(self):
 		# Get the list of files and directories in the logsDir
@@ -172,6 +222,61 @@ class Log_Compressor:
 		_fsync_path(archive)
 		_fsync_path(self.logsDir)
 		shutil.rmtree(os.path.join(self.logsDir, dirName))
+
+def _free_space(path):
+	"""(bytes unprivileged users could still write, filesystem size) for path, or None when unknown."""
+	# The nearest folder that exists: a capture's month folder may not be created yet.
+	while not os.path.isdir(path):
+		parent = os.path.dirname(path)
+		if parent == path:
+			return None
+		path = parent
+	try:
+		st = os.statvfs(path)
+	except OSError:
+		return None
+	if not st.f_blocks:
+		return None
+	# f_bavail leaves out the root-reserved blocks, so firewatcher, running as root, never eats into them.
+	return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+
+
+class DiskGuard(object):
+	"""Keeps captures from taking a filesystem below min_free_percent free.
+
+	headroom() is how much may still be written to a path before its filesystem reaches the floor.
+	Within MIN_HEADROOM of it, the oldest months in that folder are deleted first, never the current
+	month or the one being written. If that is not enough, the capture moves to the next folder or
+	stops being written.
+	"""
+
+	def __init__(self, min_free_percent, compressors):
+		self.min_free = float(min_free_percent) / 100
+		self.min_free_percent = min_free_percent
+		self.compressors = list(compressors)
+
+	def headroom(self, path):
+		"""Bytes left above the floor where path goes, after deleting old months if needed; None: no limit known."""
+		if self.min_free <= 0:
+			return None
+		path = os.path.abspath(path)
+		compressor = None
+		for candidate in self.compressors:
+			if path.startswith(os.path.join(os.path.abspath(candidate.logsDir), '')):
+				compressor = candidate
+		keep = {datetime.datetime.now().strftime('%Y-%m'), os.path.basename(os.path.dirname(path))}
+		while True:
+			space = _free_space(path)
+			if space is None:
+				return None
+			available, size = space
+			headroom = available - int(size * self.min_free)
+			if headroom >= MIN_HEADROOM:
+				return headroom
+			if compressor is None or not compressor.purgeOldestMonth(keep):
+				_journal(syslog.LOG_ERR, 'free space below %g%% for %s; not writing it there' % (self.min_free_percent, path))
+				return headroom
+
 
 def print(*args, **kwargs):
 	'''Print with flush=True by default.'''
@@ -328,6 +433,8 @@ class Settings(object):
 		self.compress_after_months = 3
 		self.delete_after_months = 0
 		self.capture_line_count_max = 10000
+		self.buffer_max_mb = DEFAULT_BUFFER_MAX_MB
+		self.min_free_percent = DEFAULT_MIN_FREE_PERCENT
 		self.llm_enabled = False
 		self.llm_base_url = ''
 		self.llm_model = ''
@@ -378,6 +485,13 @@ def _coerce_bool(value, key):
 	raise ConfigError('invalid boolean for %s: %s' % (key, value))
 
 
+def _coerce_float(value, key):
+	try:
+		return float(str(value).strip().rstrip('%'))
+	except (TypeError, ValueError):
+		raise ConfigError('invalid number for %s: %s' % (key, value))
+
+
 def _coerce_int(value, key):
 	try:
 		return int(str(value).strip())
@@ -404,6 +518,8 @@ def _read_config_file(path):
 			values[dest] = _split_patterns(raw)
 		elif kind == 'int':
 			values[dest] = _coerce_int(raw, label)
+		elif kind == 'float':
+			values[dest] = _coerce_float(raw, label)
 		elif kind == 'bool':
 			values[dest] = _coerce_bool(raw, label)
 		else:
@@ -420,6 +536,8 @@ def _read_config_file(path):
 	take('watch', 'compress_after_months', 'compress_after_months', 'int')
 	take('watch', 'delete_after_months', 'delete_after_months', 'int')
 	take('watch', 'capture_line_count_max', 'capture_line_count_max', 'int')
+	take('watch', 'buffer_max_mb', 'buffer_max_mb', 'int')
+	take('watch', 'min_free_percent', 'min_free_percent', 'float')
 	take('llm', 'enabled', 'llm_enabled', 'bool')
 	take('llm', 'base_url', 'llm_base_url', 'str')
 	take('llm', 'model', 'llm_model', 'str')
@@ -472,7 +590,7 @@ def resolve_settings(args, environ=None):
 	if 'log_file' in file_values:
 		settings.log_file = file_values['log_file'] or None
 	for key in ('capture_time', 'capture_time_max', 'compress_after_months', 'delete_after_months', 'capture_line_count_max',
-				'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
+				'buffer_max_mb', 'min_free_percent', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
 				'filter_only', 'llm_enabled', 'notify_enabled'):
 		if key in file_values:
 			setattr(settings, key, file_values[key])
@@ -508,6 +626,10 @@ def resolve_settings(args, environ=None):
 		settings.delete_after_months = args.delete_after_months
 	if getattr(args, 'capture_line_count_max', None) is not None:
 		settings.capture_line_count_max = args.capture_line_count_max
+	if getattr(args, 'buffer_max_mb', None) is not None:
+		settings.buffer_max_mb = args.buffer_max_mb
+	if getattr(args, 'min_free_percent', None) is not None:
+		settings.min_free_percent = args.min_free_percent
 	if getattr(args, 'filter_only', None) is not None:
 		settings.filter_only = bool(args.filter_only)
 	if getattr(args, 'llm', None) is not None:
@@ -571,6 +693,10 @@ def validate_settings(settings):
 			raise ConfigError('%s must be at most %d: %s' % (label, most, getattr(settings, key)))
 	if not 1 <= settings.ntfy_priority <= 5:
 		raise ConfigError('notify.priority must be 1 to 5: %s' % settings.ntfy_priority)
+	if not 1 <= settings.buffer_max_mb <= 65536:
+		raise ConfigError('watch.buffer_max_mb must be 1 to 65536: %s' % settings.buffer_max_mb)
+	if not 0 <= settings.min_free_percent < 100:
+		raise ConfigError('watch.min_free_percent must be at least 0 and below 100: %s' % settings.min_free_percent)
 
 
 def _is_http_url(url):
@@ -645,6 +771,10 @@ def render_config_text(settings):
 		'delete_after_months = %s' % int(settings.delete_after_months),
 		'# Maximum context lines before and after a match.',
 		'capture_line_count_max = %s' % int(settings.capture_line_count_max),
+		'# Memory, in MiB, for the lines kept before a match; the oldest are dropped past it.',
+		'buffer_max_mb = %s' % int(settings.buffer_max_mb),
+		'# Below this much free space (percent), delete the oldest months of captures, then stop writing; 0 disables.',
+		'min_free_percent = %g' % settings.min_free_percent,
 		'',
 		'[llm]',
 		'# Set true after configuring your OpenAI-compatible API and model.',
@@ -716,6 +846,10 @@ def _explicit_cli_args(raw):
 		parts.extend(['--compress-after-months', str(raw.compress_after_months)])
 	if getattr(raw, 'capture_line_count_max', None) is not None:
 		parts.extend(['--capture_line_count_max', str(raw.capture_line_count_max)])
+	if getattr(raw, 'buffer_max_mb', None) is not None:
+		parts.extend(['--buffer-max-mb', str(raw.buffer_max_mb)])
+	if getattr(raw, 'min_free_percent', None) is not None:
+		parts.extend(['--min-free-percent', '%g' % raw.min_free_percent])
 	if getattr(raw, 'delete_after_months', None) is not None:
 		parts.extend(['--delete-after-months', str(raw.delete_after_months)])
 	if getattr(raw, 'llm', None) is True:
@@ -1135,14 +1269,22 @@ class CaptureFile(object):
 	everything written since the last successful fsync, so a dead NFS mount or a
 	full disk does not lose the incident. With no path left, writes are dropped so
 	the capture can still finish; saved stays False if no file was ever opened.
+
+	headroom(path), when given, says how much may be written to path before its filesystem reaches
+	its free-space floor (None: no limit). It is asked before a path is used, after each fsync, and
+	whenever half the room it last reported has been written, so a fast capture cannot run past the
+	floor between fsyncs. With less than MIN_HEADROOM left, the capture moves on the same way.
 	"""
 
-	def __init__(self, paths, sync_interval):
+	def __init__(self, paths, sync_interval, headroom=None):
 		if isinstance(paths, str):
 			paths = [paths]
 		self.remaining = list(paths)
 		self.path = self.remaining[0]
 		self.sync_interval = sync_interval
+		self.headroom = headroom
+		self.written = 0  # since free space was last checked
+		self.check_after = float('inf')
 		self.handle = None
 		self.saved = False
 		self.closed = False
@@ -1152,7 +1294,10 @@ class CaptureFile(object):
 		self._move_on(None)
 
 	def _move_on(self, error):
-		"""Continue in the next path after error from the current one (None when first opening)."""
+		"""Continue in the next path after error from the current one (None when first opening).
+
+		error is the exception that stopped the current file, or a string saying why it was left.
+		"""
 		failed = self.path
 		if self.handle is not None:
 			try:
@@ -1163,13 +1308,18 @@ class CaptureFile(object):
 		while self.remaining:
 			path = self.remaining.pop(0)
 			handle = None
+			room = self.headroom(path) if self.headroom is not None else None
+			if room is not None and room < MIN_HEADROOM:
+				failed, error = path, LOW_SPACE_REASON
+				continue
 			try:
 				directory = os.path.dirname(path)
 				if directory:
 					os.makedirs(directory, exist_ok=True)
 				handle = open(path, 'a', encoding='utf-8')
 				if error is not None:
-					handle.write(f"{SELF_MARKER} capture moved here from {failed} after a write error: {error}\n")
+					why = error if isinstance(error, str) else 'after a write error: %s' % error
+					handle.write(f"{SELF_MARKER} capture moved here from {failed} {why}\n")
 				handle.write(''.join(self.unsynced))
 				handle.flush()
 			except OSError as exc:
@@ -1184,13 +1334,33 @@ class CaptureFile(object):
 			if error is not None:
 				_journal(syslog.LOG_WARNING, 'capture continues in %s' % path)
 			self.handle, self.path, self.saved = handle, path, True
+			self._room_left(room)
 			return
 		self.unsynced = []
-		_journal(syslog.LOG_ERR, 'no writable folder left for capture %s; its remaining lines are dropped' % failed)
+		_journal(syslog.LOG_ERR, 'no writable folder with free space left for capture %s; its remaining lines are dropped' % failed)
+
+	def _room_left(self, room):
+		self.written = 0
+		self.check_after = float('inf') if room is None else room // 2
+
+	def _check_room(self):
+		self._flush()
+		if self.handle is None:
+			return
+		room = self.headroom(self.path)
+		if room is not None and room < MIN_HEADROOM:
+			self._move_on(LOW_SPACE_REASON)
+		else:
+			self._room_left(room)
 
 	def write(self, text):
 		if self.handle is None:
 			return
+		if self.headroom is not None and self.written + len(text) > self.check_after:
+			self._check_room()
+			if self.handle is None:
+				return
+		self.written += len(text)
 		self.unsynced.append(text)
 		try:
 			self.handle.write(text)
@@ -1240,6 +1410,9 @@ class CaptureFile(object):
 		self.unsynced = []
 		self.dirty = False
 		self.last_sync = time.time() if now is None else now
+		# Other programs fill disks too, so check at least as often as the fsync.
+		if self.handle is not None and self.headroom is not None and not self.closed:
+			self._check_room()
 
 	def close(self):
 		if self.closed:
@@ -1255,7 +1428,7 @@ class CaptureFile(object):
 				except OSError as exc:
 					_journal(syslog.LOG_ERR, 'closing capture %s failed: %s' % (self.path, exc))
 
-def _open_capture(output_folder, fallback_folder, read_time, matched_pattern):
+def _open_capture(output_folder, fallback_folder, read_time, matched_pattern, headroom=None):
 	"""CaptureFile for a new incident under output_folder, continuing under fallback_folder when that cannot be written."""
 	stamp = datetime.datetime.fromtimestamp(read_time)
 	month = stamp.strftime('%Y-%m')
@@ -1270,7 +1443,7 @@ def _open_capture(output_folder, fallback_folder, read_time, matched_pattern):
 	while any(os.path.lexists(os.path.join(root, month, name)) for root in roots):
 		n += 1
 		name = f"{base}-{n}.log"
-	capture = CaptureFile([os.path.abspath(os.path.join(root, month, name)) for root in roots], CAPTURE_SYNC_INTERVAL)
+	capture = CaptureFile([os.path.abspath(os.path.join(root, month, name)) for root in roots], CAPTURE_SYNC_INTERVAL, headroom=headroom)
 	if capture.saved:
 		# also record a journal of all logs captured in {folder}/journal.log, next to the month folders
 		journal_file_name = os.path.join(os.path.dirname(os.path.dirname(capture.path)), 'journal.log')
@@ -1306,11 +1479,13 @@ def _end_capture(capture, captured_line_counter, capture_line_count_max, inciden
 				dispatcher.submit(job)
 
 
-def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None):
+def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB):
 	"""Tail the log file and process lines with buffer management.
 
 	capture_time_max bounds how long one capture runs however often its pattern repeats (0: no bound).
 	fallback_folder is where a capture continues when output_folder cannot be written (None: nowhere).
+	min_free_percent is the free-space floor a capture may not take a filesystem below (0: none).
+	buffer_max_mb bounds the memory for the lines kept before a match.
 	A capture with a matched line that also matches always_notify_patterns (load_patterns() output)
 	is pushed even when the LLM says not to notify.
 	"""
@@ -1319,15 +1494,20 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	# Only the newest capture_line_count_max buffered lines are ever written, so hold no more.
 	buffer_cap = max(0, capture_line_count_max)
 	log_buffer = deque(maxlen=buffer_cap)  # Stores tuples of (read_time, line)
-	dropped_until = None  # read_time of the newest line the cap pushed out of log_buffer
+	# Lines are capped by count and by memory, roughly: the text plus BUFFER_LINE_OVERHEAD each.
+	buffer_bytes = 0
+	buffer_max_bytes = buffer_max_mb * 1024 * 1024
+	dropped_until = None  # read_time of the newest line a cap pushed out of log_buffer
 	log_compressors = [Log_Compressor(output_folder, compress_after_months, delete_after_months, background=True)]
 	if fallback_folder and os.path.abspath(fallback_folder) != os.path.abspath(output_folder):
 		log_compressors.append(Log_Compressor(fallback_folder, compress_after_months, delete_after_months, background=True))
+	disk_guard = DiskGuard(min_free_percent, log_compressors)
 	capture_until = None
 	capture_ends_by = None  # capture_time_max after the capture opened; capture_until never passes it
 	capture = None
 	captured_line_counter = 0
 	processed_line_counter = 0
+	read_errors = 0
 	incident = None
 	dispatcher = _start_dispatcher(notify_settings)
 
@@ -1356,10 +1536,10 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					try:
 						if pending_read is None and capture_until is None:
 							# Nothing can time out, so read inline instead of waking the reader thread per line.
-							line = proc.stdout.readline()
+							line = proc.stdout.readline(MAX_LINE_CHARS)
 						else:
 							if pending_read is None:
-								pending_read = reader.submit(proc.stdout.readline)
+								pending_read = reader.submit(proc.stdout.readline, MAX_LINE_CHARS)
 							deadline = capture_until
 							sync_due = capture.sync_due() if capture else None
 							if sync_due is not None and (deadline is None or sync_due < deadline):
@@ -1376,8 +1556,13 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 						continue
 					except Exception as e:
 						pending_read = None
+						read_errors += 1
 						print(f"Error reading line: {e}")
+						if read_errors >= MAX_READ_ERRORS:
+							print(f"Giving up after {read_errors} read errors in a row.")
+							break
 						continue
+					read_errors = 0
 					if line == '':
 						reached_eof = True
 						break
@@ -1386,12 +1571,21 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					read_time = time.time()
 					processed_line_counter += 1
 
-					# Keep capture_time seconds of context, at most buffer_cap lines
+					# Keep capture_time seconds of context, at most buffer_cap lines and buffer_max_bytes of memory
 					while log_buffer and read_time - log_buffer[0][0] > capture_time:
-						log_buffer.popleft()
+						buffer_bytes -= len(log_buffer.popleft()[1]) + BUFFER_LINE_OVERHEAD
 					if len(log_buffer) == buffer_cap:
 						dropped_until = log_buffer[0][0] if log_buffer else read_time
-					log_buffer.append((read_time, line))
+						if log_buffer:
+							# append() is about to push this one out
+							buffer_bytes -= len(log_buffer[0][1]) + BUFFER_LINE_OVERHEAD
+					if buffer_cap:
+						log_buffer.append((read_time, line))
+						buffer_bytes += len(line) + BUFFER_LINE_OVERHEAD
+					# Oldest lines go first; the newest line always stays.
+					while buffer_bytes > buffer_max_bytes and len(log_buffer) > 1:
+						dropped_until = log_buffer[0][0]
+						buffer_bytes -= len(log_buffer.popleft()[1]) + BUFFER_LINE_OVERHEAD
 
 					# A capture whose window (or capture_time_max) ran out before this line ends first,
 					# so a matching line starts a new capture instead of extending a finished one.
@@ -1409,7 +1603,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 								'hostname': _hostname(),
 							}
 							# Dump the buffer to file at output_folder/{Year-Month}/{pattern}_{Year-Month-DayTHour_Minute_Second}.log
-							capture = _open_capture(output_folder, fallback_folder, read_time, matched_pattern)
+							capture = _open_capture(output_folder, fallback_folder, read_time, matched_pattern, headroom=disk_guard.headroom)
 							print(f"Capturing logs to {capture.path}" if capture.saved else "Capture not saved: no output folder could be written")
 							if capture_time_max > 0:
 								capture_ends_by = read_time + capture_time_max
@@ -1424,7 +1618,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							capture.write(bcolors.warning + '-'*80 +bcolors.ENDC + '\n')
 							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(read_time - capture_time).isoformat()}:{bcolors.ENDC}\n")
 							if dropped_until is not None and read_time - dropped_until <= capture_time:
-								capture.write(f"{bcolors.warning}Captured line count exceeded capture_line_count_max {capture_line_count_max}. Older cached in-memory lines were dropped ...{bcolors.ENDC}\n")
+								capture.write(f"{bcolors.warning}Older cached in-memory lines were dropped to stay within capture_line_count_max {capture_line_count_max} lines and buffer_max_mb {buffer_max_mb} MiB ...{bcolors.ENDC}\n")
 							header_end = capture.position()
 							for _buffered_time, buffered_line in log_buffer:
 								if matcher.find(buffered_line) is not None:
@@ -1764,6 +1958,8 @@ def build_parser():
 	filt.add_argument('--no-filter_only', '--no-filter-only', dest='filter_only', action='store_false', help='Follow new log lines. Overrides filter_only from the config file.')
 	parser.add_argument('--compress-after-months', type=int, default=None, help='Compress logs after this many months. Default: 3 months.')
 	parser.add_argument('--capture_line_count_max', '--capture-line-count-max', type=int, default=None, help='Maximum number of lines to capture before and after in a single log file. Default: 10000 lines. Note: The final file maybe 2 * this number. Also caps how many recent lines are held in memory.')
+	parser.add_argument('--buffer-max-mb', type=int, default=None, help='Memory, in MiB, for the lines kept before a match. The oldest lines are dropped past it. Default: %d.' % DEFAULT_BUFFER_MAX_MB)
+	parser.add_argument('--min-free-percent', type=float, default=None, help='Free-space floor, in percent, for the filesystems captures are written to. Below it the oldest months of captures are deleted (never the current month), then writing stops. 0 disables. Default: %g.' % DEFAULT_MIN_FREE_PERCENT)
 	parser.add_argument('--delete-after-months', type=int, default=None, help='Delete logs after this many months. (will only delete files in YYYY-MM format) Default: 0 (never).')
 	svc = parser.add_mutually_exclusive_group()
 	svc.add_argument('--install-service', action='store_true', help='Install and enable a systemd unit for this command line. Warns and exits if systemd is not available.')
@@ -1866,6 +2062,8 @@ def main(argv=None):
 	print(f"Output folder: {resolved.output_folder}")
 	if resolved.fallback_folder:
 		print(f"Fallback folder: {resolved.fallback_folder}")
+	if resolved.min_free_percent:
+		print(f"Keeping at least {resolved.min_free_percent:g}% free where captures are written.")
 	print(f"Compress logs after {resolved.compress_after_months} months.")
 	print(f"Delete logs after {resolved.delete_after_months} months.")
 	if resolved.llm_enabled:
@@ -1888,6 +2086,8 @@ def main(argv=None):
 			capture_time_max=resolved.capture_time_max,
 			fallback_folder=resolved.fallback_folder or None,
 			always_notify_patterns=always_notify_patterns,
+			min_free_percent=resolved.min_free_percent,
+			buffer_max_mb=resolved.buffer_max_mb,
 		)
 	finally:
 		if previous_sigterm is not None:
