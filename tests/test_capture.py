@@ -383,7 +383,7 @@ def test_capture_time_max_ends_a_capture_its_pattern_keeps_extending(tmp_path, m
     assert 'Capture reached capture_time_max of 120 seconds' in first
     assert 'Matched line:    HIT 4' in second
     assert 'tail' in second
-    assert 'capture_time_max' not in second
+    assert 'Capture reached capture_time_max' not in second
 
 
 def test_capture_time_max_zero_disables_the_bound(tmp_path, monkeypatch):
@@ -1043,7 +1043,7 @@ def test_context_buffer_memory_stays_bounded():
     assert buffer.dropped_until is not None
 
 
-def test_context_buffer_ages_out_by_time_and_counts_without_decompressing(monkeypatch):
+def test_context_buffer_ages_out_by_time_and_skips_without_decompressing(monkeypatch):
     buffer = fw.ContextBuffer(100, 64 * 1024 * 1024)
     for seq in range(5000):
         buffer.append(float(seq) / 10, seq, 'line %05d %s\n' % (seq, 'x' * 100))
@@ -1051,13 +1051,18 @@ def test_context_buffer_ages_out_by_time_and_counts_without_decompressing(monkey
     entries = list(buffer.entries(400.0))
     assert entries[0][1] == 4000 and entries[-1][1] == 4999
     assert all(line.startswith('line %05d ' % seq) for _t, seq, line in entries)
-    assert [seq for _t, seq, _l in buffer.entries(400.0, after_seq=4900)][0] == 4901
-    monkeypatch.setattr(fw.zlib, 'decompress', lambda data: (_ for _ in ()).throw(AssertionError('decompressed')))
-    assert buffer.count(400.0, 4900) == 901
+    assert [seq for _t, seq, _l in buffer.entries(400.0, skip=[(4000, 4900)])][0] == 4901
+    assert list(buffer.seqs(400.0)) == list(range(4000, 5000))
+    real = fw.zlib.decompress
+    calls = []
+    monkeypatch.setattr(fw.zlib, 'decompress', lambda data: calls.append(1) or real(data))
+    list(buffer.entries(0, skip=[(0, 4990)]))
+    assert len(calls) <= 1  # only a block that is not wholly skipped
+    list(buffer.seqs(0))
+    assert len(calls) <= 1
     # 500 s on, everything but the newest line has aged out
     buffer.append(1000.0, 5000, 'newest\n')
     assert [seq for _t, seq, _l in buffer.entries(0)] == [5000]
-
 
 def test_overlong_lines_are_read_in_pieces(tmp_path, monkeypatch):
     monkeypatch.setattr(fw, 'MAX_LINE_CHARS', 16)
@@ -1234,3 +1239,69 @@ def test_purge_interval_is_a_setting(tmp_path, monkeypatch):
     clock.t += 61
     guard.headroom(path)
     assert not (out / '2020-02').exists()
+
+
+# --- context already in an earlier capture ---
+
+def numbered(text, kind):
+    return re.findall(r'%s-(\d+)' % kind, text)
+
+
+def test_storm_capture_leaves_out_what_the_previous_one_holds(tmp_path):
+    # the line cap ends the first capture; the next match opens a second within the window
+    body = ''.join('ctx-%03d\n' % i for i in range(50)) + 'HIT 1\n' + ''.join('a-%03d\n' % i for i in range(20)) + 'HIT 2\n' + 'b-000\n'
+    out = capture(tmp_path, body, capture_line_count_max=10)
+    first, second = incident_logs(out)
+    second_text = second.read_text()
+    # 50 context lines, HIT 1, and a-000 to a-010 (the line that crossed the cap)
+    assert '62 lines of this window are left out: they are in %s' % first in second_text
+    assert numbered(second_text, 'ctx') == [] and numbered(second_text, 'a') == ['011', '012', '013', '014', '015', '016', '017', '018', '019']
+    every = re.findall(r'\b((?:ctx|a)-\d+)', first.read_text() + second_text)
+    assert len(every) == len(set(every)) == 70  # each line once, none lost
+
+
+def test_lines_between_captures_are_kept(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    popen = ScriptedPopen([('HIT 1\n', 0), ('in-first\n', 1), ('gap-1\n', 70), ('gap-2\n', 1), ('HIT 2\n', 1)], clock=clock)
+    out = run_scripted(tmp_path, monkeypatch, popen, capture_time=60)
+    first, second = (p.read_text() for p in incident_logs(out))
+    assert 'in-first' in first
+    # the first capture's lines are older than the second's window, so nothing is left out
+    assert 'left out' not in second
+    assert 'gap-1' in second and 'gap-2' in second
+
+
+def test_a_capture_leaves_out_lines_from_several_earlier_ones(tmp_path):
+    body = ('one\n' + 'HIT 1\n' + ''.join('a-%d\n' % i for i in range(4))
+            + 'two\n' + 'HIT 2\n' + ''.join('b-%d\n' % i for i in range(4))
+            + 'three\n' + 'HIT 3\n')
+    out = capture(tmp_path, body, capture_line_count_max=2)
+    caps = incident_logs(out)
+    third = caps[-1].read_text()
+    assert 'left out: they are in %s' % caps[0] in third
+    assert 'left out: they are in %s' % caps[1] in third
+    joined = ''.join(p.read_text() for p in caps)
+    for line in ('one', 'two', 'three', 'a-0', 'a-3', 'b-0', 'b-3'):
+        assert len(re.findall(r'^%s$' % line, joined, re.M)) == 1, line
+
+
+def test_lines_of_an_unsaved_capture_are_not_left_out(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    blocked = tmp_path / 'blocked'
+    blocked.write_text('a file')
+    real_open_capture = fw._open_capture
+    calls = []
+
+    def first_one_unsaved(output_folder, *args, **kwargs):
+        calls.append(1)
+        folder = str(blocked / 'out') if len(calls) == 1 else output_folder
+        return real_open_capture(folder, *args, **kwargs)
+
+    monkeypatch.setattr(fw, '_open_capture', first_one_unsaved)
+    body = 'ctx\n' + 'HIT 1\n' + ''.join('a-%d\n' % i for i in range(5)) + 'HIT 2\n'
+    out = capture(tmp_path, body, capture_line_count_max=3)
+    (only,) = incident_logs(out)
+    text = only.read_text()
+    assert 'left out' not in text
+    assert 'ctx' in text and 'a-0' in text

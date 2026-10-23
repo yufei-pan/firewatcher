@@ -4,6 +4,7 @@
 """Watch logs for incident patterns and persist surrounding context."""
 import argparse
 import array
+import bisect
 import fnmatch
 import subprocess
 import re
@@ -1474,6 +1475,18 @@ def _start_dispatcher(settings):
 		return None
 	return IncidentDispatcher(settings)
 
+def _covered(ranges, low, high):
+	"""Whether one of the sorted, disjoint (low, high) ranges holds all of low..high."""
+	index = bisect.bisect_right(ranges, (low, float('inf'))) - 1
+	return index >= 0 and ranges[index][0] <= low and high <= ranges[index][1]
+
+def _add_to_ranges(ranges, seq):
+	"""Append seq, the newest number yet, to a list of [low, high] ranges."""
+	if ranges and ranges[-1][1] == seq - 1:
+		ranges[-1][1] = seq
+	else:
+		ranges.append([seq, seq])
+
 class ContextBuffer(object):
 	"""The lines kept before a match: the last max_age seconds, in at most about max_bytes of memory.
 
@@ -1545,42 +1558,38 @@ class ContextBuffer(object):
 			self.dropped_until = block[1]
 			self.memory -= block[7]
 
-	def entries(self, since, after_seq=None):
-		"""Yields (read_time, seq, line) oldest first, for lines read at or after since and, given
-		after_seq, numbered above it; one block is decompressed at a time."""
+	def entries(self, since, skip=()):
+		"""Yields (read_time, seq, line) oldest first, for lines read at or after since whose number is in
+		none of the sorted, disjoint (low, high) ranges in skip; one block is decompressed at a time, and a
+		block wholly in skip is not decompressed at all."""
+		skip = list(skip)
 		for first_time, last_time, first_seq, count, times, lengths, text, _memory in self.blocks:
-			if last_time < since or (after_seq is not None and first_seq + count - 1 <= after_seq):
+			if last_time < since or _covered(skip, first_seq, first_seq + count - 1):
 				continue
 			data = zlib.decompress(text).decode('utf-8', 'replace')
 			offset = 0
 			for index in range(count):
 				end = offset + lengths[index]
 				seq = first_seq + index
-				if times[index] >= since and (after_seq is None or seq > after_seq):
+				if times[index] >= since and not _covered(skip, seq, seq):
 					yield times[index], seq, data[offset:end]
 				offset = end
 		for index, (read_time, line) in enumerate(self.lines):
 			seq = self.first_seq + index
-			if read_time >= since and (after_seq is None or seq > after_seq):
+			if read_time >= since and not _covered(skip, seq, seq):
 				yield read_time, seq, line
 
-	def count(self, since, through_seq):
-		"""How many lines read at or after since are numbered through_seq or below, without decompressing."""
-		total = 0
+	def seqs(self, since):
+		"""Yields the sequence numbers of the lines read at or after since, oldest first, without decompressing."""
 		for _first_time, last_time, first_seq, count, times, _lengths, _text, _memory in self.blocks:
 			if last_time < since:
 				continue
 			for index in range(count):
-				if first_seq + index > through_seq:
-					return total
 				if times[index] >= since:
-					total += 1
+					yield first_seq + index
 		for index, (read_time, _line) in enumerate(self.lines):
-			if self.first_seq + index > through_seq:
-				break
 			if read_time >= since:
-				total += 1
-		return total
+				yield self.first_seq + index
 
 class CaptureFile(object):
 	"""Append handle kept open for one capture.
@@ -1736,6 +1745,11 @@ class CaptureFile(object):
 		except OSError:
 			return None
 
+	@property
+	def writing(self):
+		"""Whether what is written now lands in a file."""
+		return self.handle is not None
+
 	def sync_due(self):
 		"""When committed data must be fsynced, or None when nothing is pending."""
 		return self.last_sync + self.sync_interval if self.dirty else None
@@ -1853,12 +1867,20 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	read_errors = 0
 	incident = None
 	dispatcher = _start_dispatcher(notify_settings)
+	# Saved captures whose lines may still be in the window, oldest first: {'path', 'ranges', 'last_time'},
+	# ranges being the [low, high] line numbers written there. A new capture leaves those lines out.
+	earlier = deque()
+	written = None  # the open capture's record
 
 	def end_capture(now):
-		nonlocal capture, capture_until, capture_ends_by, captured_line_counter
+		nonlocal capture, capture_until, capture_ends_by, captured_line_counter, written
 		reached_max = capture_ends_by is not None and now >= capture_ends_by
 		_end_capture(capture, captured_line_counter, capture_line_count_max, incident=incident, dispatcher=dispatcher,
 					 capture_time_max=capture_time_max if reached_max else None)
+		if capture and capture.saved and written and written['ranges']:
+			written['path'] = capture.path
+			earlier.append(written)
+		written = None
 		capture = None
 		capture_until = None
 		capture_ends_by = None
@@ -1951,12 +1973,28 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							capture.write(f"{bcolors.warning}Logs since {datetime.datetime.fromtimestamp(since).isoformat()}:{bcolors.ENDC}\n")
 							if context.dropped_until is not None and context.dropped_until >= since:
 								capture.write(f"{bcolors.warning}Older cached in-memory lines were dropped to stay within buffer_max_mb {buffer_max_mb} MiB ...{bcolors.ENDC}\n")
+							# Lines of the window an earlier capture already holds are left out, with a note per file.
+							while earlier and earlier[0]['last_time'] < since:
+								earlier.popleft()
+							held = sorted((low, high, record['path']) for record in earlier for low, high in record['ranges'])
+							skip = [(low, high) for low, high, _path in held]
+							if held:
+								counts = {}
+								for seq in context.seqs(since):
+									index = bisect.bisect_right(skip, (seq, float('inf'))) - 1
+									if index >= 0 and skip[index][0] <= seq <= skip[index][1]:
+										counts[held[index][2]] = counts.get(held[index][2], 0) + 1
+								for path in sorted(counts, key=lambda path: [r['path'] for r in earlier].index(path)):
+									capture.write(f"{bcolors.warning}{counts[path]} lines of this window are left out: they are in {path}{bcolors.ENDC}\n")
 							header_end = capture.position()
-							for _buffered_time, _seq, buffered_line in context.entries(since):
+							written = {'path': None, 'ranges': [], 'last_time': read_time}
+							for _buffered_time, seq, buffered_line in context.entries(since, skip):
 								if matcher.find(buffered_line) is not None:
 									capture.write(f'{bcolors.critical}-> {buffered_line.strip()}{bcolors.ENDC}\n')
 								else:
 									capture.write(buffered_line)
+								if capture.writing:
+									_add_to_ranges(written['ranges'], seq)
 							# Where the context starts and where the line that opened the capture ends, so the
 							# LLM excerpt can be built around the match. Only valid while the file stays the same.
 							match_end = capture.position()
@@ -1966,6 +2004,9 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							# Append the line to the current log file
 							capture.write(f'{bcolors.critical}-> {line.strip()}{bcolors.ENDC}\n')
 							captured_line_counter += 1
+							if capture.writing:
+								_add_to_ranges(written['ranges'], processed_line_counter)
+								written['last_time'] = read_time
 						if always_matcher is not None and 'always_notify' not in incident and always_matcher.first_match(line) is not None:
 							incident['always_notify'] = True
 							incident['always_notify_line'] = line.strip()
@@ -1981,6 +2022,9 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 						capture.write(line)
 						capture.commit()
 						captured_line_counter += 1
+						if capture.writing:
+							_add_to_ranges(written['ranges'], processed_line_counter)
+							written['last_time'] = read_time
 						if captured_line_counter > capture_line_count_max:
 							end_capture(read_time)
 					# if no capture is open, check for log compression
