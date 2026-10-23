@@ -50,6 +50,8 @@ The fallback needs the failure to come back as an error. On an NFS mount with th
 
 `firewatcher` finishes the open capture on SIGINT and on SIGTERM. A second SIGTERM ends it at once.
 
+SIGHUP reloads the pattern files and the `--always-notify` files from the paths given at startup, so after editing `/etc/firewatcher/patterns.d/`, run `sudo systemctl reload firewatcher`. The new patterns apply from the next log line, and the journal says how many loaded. If no watch pattern loads, the old ones stay and the error is logged. The config file and other settings are not re-read; restart for those. In a terminal, SIGHUP keeps its usual meaning (the terminal went away) and ends `firewatcher`.
+
 ### Disk and memory limits
 
 firewatcher keeps the filesystems it writes captures to above `--min-free-percent` free (default 1%, counted as `df` does, so the root-reserved blocks are left alone). Only what the filesystem reports authorizes a write. firewatcher checks when a capture opens, about once a second, and again before what it has written since the last check could bring it within 64 KiB of the floor (and at least every 8 MiB), fsyncing first so the filesystem, an NFS server included, counts every byte. A line that would cross that margin is not written there. Another program filling the same disk between two checks can still push it past the floor; firewatcher's own writes do not.
@@ -76,6 +78,8 @@ sudo firewatcher --uninstall-service
 ```
 
 `--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`.
+
+`systemctl reload firewatcher` reloads the pattern files without a restart; see SIGHUP above.
 
 Capture files follow the process umask. A systemd service defaults to `UMask=0022`, so captures are readable by every local user, while the journal they copy from is normally readable only by root and the `adm`/`systemd-journal` groups. On a host with untrusted local users, add `UMask=0027` to the unit, for example with `systemctl edit firewatcher`.
 

@@ -1305,3 +1305,77 @@ def test_lines_of_an_unsaved_capture_are_not_left_out(tmp_path, monkeypatch):
     text = only.read_text()
     assert 'left out' not in text
     assert 'ctx' in text and 'a-0' in text
+
+
+# --- SIGHUP pattern reload ---
+
+class HangupBefore(ScriptedStdout):
+    """Sends the reload request just before returning a line that starts with `marker`."""
+
+    def __init__(self, events, marker):
+        super().__init__(events)
+        self.marker = marker
+
+    def readline(self, size=-1):
+        line = super().readline(size)
+        if isinstance(line, str) and line.startswith(self.marker):
+            fw._request_reload(None, None)
+        return line
+
+
+def _hangup_capture(tmp_path, monkeypatch, lines, marker, **kw):
+    pat = tmp_path / 'p.txt'
+    pat.write_text('OLD\n')
+    popen = ScriptedPopen([])
+    popen.stdout = HangupBefore(lines, marker)
+    patch_popen(monkeypatch, popen)
+    out = tmp_path / 'out'
+    fw.capture_messages(
+        ['unused'], fw.load_patterns([str(pat)]),
+        capture_time=60, output_folder=str(out),
+        compress_after_months=0, delete_after_months=0, **kw)
+    return out
+
+
+def test_sighup_reload_matches_the_next_line_with_the_new_patterns(tmp_path, monkeypatch, capsys):
+    new = tmp_path / 'new.txt'
+    new.write_text('NEW\n')
+    always = tmp_path / 'always.txt'
+    always.write_text('NEW\n')
+    out = _hangup_capture(tmp_path, monkeypatch, ['OLD before\n', 'NEW after\n', 'OLD again\n'], 'NEW',
+                          reload_patterns=lambda: fw._load_pattern_sets([str(new)], [str(always)]))
+    printed = capsys.readouterr().out
+    assert 'reloaded patterns: 0 regex, 1 plain, always_notify too' in printed
+    text = incident_logs(out)[0].read_text()
+    assert '-> NEW after' in text
+    # OLD was dropped by the reload, so a later OLD line is context, not a match
+    assert '-> OLD again' not in text and 'OLD again' in text
+    assert not fw._reload_requested.is_set()
+
+
+def test_sighup_reload_failure_keeps_the_old_patterns(tmp_path, monkeypatch, capsys):
+    out = _hangup_capture(tmp_path, monkeypatch, ['quiet\n', 'OLD still watched\n'], 'quiet',
+                          reload_patterns=lambda: fw._load_pattern_sets([str(tmp_path / 'gone.txt')], None))
+    printed = capsys.readouterr().out
+    assert 'reloading patterns failed, keeping the old ones: no usable patterns in' in printed
+    assert 'OLD still watched' in incident_logs(out)[0].read_text()
+
+
+def test_sighup_without_a_reloader_changes_nothing(tmp_path, monkeypatch, capsys):
+    out = _hangup_capture(tmp_path, monkeypatch, ['quiet\n', 'OLD still watched\n'], 'quiet')
+    printed = capsys.readouterr().out
+    assert 'reloaded patterns' not in printed and 'reloading patterns' not in printed
+    assert 'OLD still watched' in incident_logs(out)[0].read_text()
+    assert not fw._reload_requested.is_set()
+
+
+def test_load_pattern_sets_drops_an_empty_always_notify_list(tmp_path, capsys):
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    empty = tmp_path / 'always.txt'
+    empty.write_text('# nothing yet\n')
+    patterns, always = fw._load_pattern_sets([str(tmp_path)], [str(empty)])
+    # the folder holds both files; the comment-only one adds nothing
+    assert patterns == {'fnmatch': {'*HIT*'}}
+    assert always is None
+    assert 'no usable always_notify patterns' in capsys.readouterr().out

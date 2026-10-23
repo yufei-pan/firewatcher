@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -16,13 +17,15 @@ REAL_OUTPUT_FOLDER = fw.DEFAULT_OUTPUT_FOLDER
 
 @pytest.fixture(autouse=True)
 def isolated_firewatcher_config(tmp_path, monkeypatch):
-    """Keep tests off the host config, output and pattern folders, and any secret environment variables."""
+    """Keep tests off the host config, output and pattern folders, any secret environment variables, and each other's SIGHUP."""
     monkeypatch.setattr(fw, 'DEFAULT_CONFIG_PATH', str(tmp_path / 'firewatcher.conf'))
     monkeypatch.setattr(fw, 'DEFAULT_OUTPUT_FOLDER', str(tmp_path / 'captured_messages') + os.sep)
     monkeypatch.setattr(fw, 'DEFAULT_FALLBACK_FOLDER', str(tmp_path / 'fallback') + os.sep)
     monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(tmp_path / 'patterns.d'))
     monkeypatch.delenv(fw.LLM_API_KEY_ENV, raising=False)
     monkeypatch.delenv(fw.NTFY_TOKEN_ENV, raising=False)
+    # a SIGHUP flag left set by one test must not reload patterns in the next
+    monkeypatch.setattr(fw, '_reload_requested', threading.Event())
 
 
 def parse_cli(argv):

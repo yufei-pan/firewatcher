@@ -1840,7 +1840,7 @@ def _end_capture(capture, captured_line_counter, capture_line_count_max, inciden
 				dispatcher.submit(job)
 
 
-def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB, purge_interval=DEFAULT_PURGE_INTERVAL):
+def capture_messages(command_to_run, patterns, capture_time=300, output_folder=DEFAULT_OUTPUT_FOLDER, compress_after_months=3, delete_after_months=0,capture_line_count_max=10000, notify_settings=None, capture_time_max=DEFAULT_CAPTURE_TIME_MAX, fallback_folder=None, always_notify_patterns=None, min_free_percent=0, buffer_max_mb=DEFAULT_BUFFER_MAX_MB, purge_interval=DEFAULT_PURGE_INTERVAL, reload_patterns=None):
 	"""Tail the log file and process lines with buffer management.
 
 	capture_time_max bounds how long one capture runs however often its pattern repeats (0: no bound).
@@ -1849,7 +1849,8 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	The capture_time seconds before a match are kept compressed in at most buffer_max_mb of memory;
 	capture_line_count_max bounds the lines written after it.
 	A capture with a matched line that also matches always_notify_patterns (load_patterns() output)
-	is pushed even when the LLM says not to notify.
+	is pushed even when the LLM says not to notify. After a SIGHUP, reload_patterns() supplies new
+	(patterns, always_notify_patterns) at the next line; if it raises, the old ones stay.
 	"""
 	matcher = _as_matcher(patterns)
 	always_matcher = _as_matcher(always_notify_patterns) if always_notify_patterns else None
@@ -1935,6 +1936,19 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 						continue
 					read_time = time.time()
 					processed_line_counter += 1
+					if _reload_requested.is_set():
+						_reload_requested.clear()
+						if reload_patterns is not None:
+							try:
+								new_patterns, new_always = reload_patterns()
+							except Exception as exc:
+								_journal(syslog.LOG_ERR, 'reloading patterns failed, keeping the old ones: %s' % exc)
+							else:
+								matcher = _as_matcher(new_patterns)
+								always_matcher = _as_matcher(new_always) if new_always else None
+								_journal(syslog.LOG_INFO, 'reloaded patterns: %d regex, %d plain%s' % (
+									len(matcher.regexes), len(matcher.substrings) + len(matcher.globs),
+									', always_notify too' if always_matcher else ''))
 
 					# Keep capture_time seconds of context, compressed, in at most buffer_max_mb of memory
 					context.append(read_time, processed_line_counter, line)
@@ -2185,6 +2199,7 @@ def render_unit_file(args, executable=None, config_exists=None, raw=None):
 		'RestartSec=5',
 		'TimeoutStopSec=%d' % stop_sec,
 		'KillSignal=SIGINT',
+		'ExecReload=/bin/kill -HUP $MAINPID',
 		'StandardOutput=journal',
 		'StandardError=journal',
 		'',
@@ -2394,6 +2409,29 @@ def log_source_command(args):
 		return file_pre + ['/var/log/messages']
 	return None
 
+# Set by SIGHUP; the capture loop reloads the pattern files at the next line.
+_reload_requested = threading.Event()
+
+def _request_reload(signum, frame):
+	_reload_requested.set()
+
+
+def _load_pattern_sets(pattern_sources, always_notify_sources):
+	"""(watch patterns, always_notify patterns or None) from the pattern files; ValueError if no watch pattern loads."""
+	patterns = load_patterns(pattern_sources)
+	# A mistyped path or a file of invalid regexes must not leave a daemon that watches for nothing.
+	if not any(patterns.values()):
+		raise ValueError('no usable patterns in %s' % pattern_sources)
+	always_notify_patterns = None
+	if always_notify_sources:
+		always_notify_patterns = load_patterns(always_notify_sources)
+		if not any(always_notify_patterns.values()):
+			# Capturing matters more than this override, so keep watching, and say so where it will be seen.
+			_journal(syslog.LOG_ERR, 'no usable always_notify patterns in %s; the LLM decides for every capture' % always_notify_sources)
+			always_notify_patterns = None
+	return patterns, always_notify_patterns
+
+
 def _stop_on_sigterm(signum, frame):
 	"""SIGTERM ends the run like Ctrl-C, so the open capture is finished and handed to the dispatcher."""
 	# A second SIGTERM gets the default action and ends the process at once.
@@ -2429,18 +2467,11 @@ def main(argv=None):
 	if not pattern_files:
 		print(f"No pattern files found in {resolved.pattern_file}. Exiting.", file=sys.stderr)
 		return 1
-	patterns = load_patterns(pattern_files)
-	# A mistyped path or a file of invalid regexes must not leave a daemon that watches for nothing.
-	if not any(patterns.values()):
+	try:
+		patterns, always_notify_patterns = _load_pattern_sets(pattern_files, resolved.always_notify)
+	except ValueError:
 		print(f"No usable patterns in {resolved.pattern_file}. Exiting.", file=sys.stderr)
 		return 1
-	always_notify_patterns = None
-	if resolved.always_notify:
-		always_notify_patterns = load_patterns(expand_pattern_sources(resolved.always_notify))
-		if not any(always_notify_patterns.values()):
-			# Capturing matters more than this override, so keep watching, and say so where it will be seen.
-			_journal(syslog.LOG_ERR, 'no usable always_notify patterns in %s; the LLM decides for every capture' % resolved.always_notify)
-			always_notify_patterns = None
 	print(f"Monitoring {command_to_run} for patterns: {patterns}")
 	print(f"Capturing logs for {resolved.capture_time} seconds, {resolved.capture_time_max or 'no'} seconds at most.")
 	print(f"Output folder: {resolved.output_folder}")
@@ -2458,6 +2489,10 @@ def main(argv=None):
 	if always_notify_patterns:
 		print(f"Always notify for patterns: {always_notify_patterns}")
 	previous_sigterm = signal.signal(signal.SIGTERM, _stop_on_sigterm)
+	# SIGHUP reloads the pattern files, but not in a terminal, where it means the terminal went away.
+	previous_sighup = None
+	if not _isatty(sys.stdin):
+		previous_sighup = signal.signal(signal.SIGHUP, _request_reload)
 	try:
 		capture_messages(
 			command_to_run, patterns,
@@ -2473,11 +2508,21 @@ def main(argv=None):
 			min_free_percent=resolved.min_free_percent,
 			purge_interval=resolved.purge_interval,
 			buffer_max_mb=resolved.buffer_max_mb,
+			reload_patterns=lambda: _load_pattern_sets(resolved.pattern_file, resolved.always_notify),
 		)
 	finally:
 		if previous_sigterm is not None:
 			signal.signal(signal.SIGTERM, previous_sigterm)
+		if previous_sighup is not None:
+			signal.signal(signal.SIGHUP, previous_sighup)
 	return 0
+
+
+def _isatty(stream):
+	try:
+		return stream.isatty()
+	except (AttributeError, ValueError, OSError):
+		return False
 
 
 if __name__ == '__main__':
