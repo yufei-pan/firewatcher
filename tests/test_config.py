@@ -362,6 +362,14 @@ def test_generated_config_round_trips_new_settings(tmp_path):
     ('[notify]\ntimeout = -1\n', 'notify.timeout'),
     ('[llm]\nenabled = true\nbase_url = 127.0.0.1:11434/v1\nmodel = m\n', 'llm.base_url'),
     ('[notify]\nenabled = true\nntfy_url = ntfy.sh/secret-topic-123\n', 'notify.ntfy_url'),
+    ('[notify]\nenabled = true\nntfy_url = https://ntfy.sh/secret topic-123\n', 'notify.ntfy_url'),
+    ('[notify]\nenabled = true\nntfy_url = https://ntfy.sh/secret-topic-123\x7f\n', 'notify.ntfy_url'),
+    ('https://ntfy.sh/secret-topic-123\n[notify]\n', 'line 1 is not inside a [section]'),
+    ('[notify]\nntfy.sh/secret-topic-123\n', 'cannot parse line 2'),
+    ('[watch]\ncapture_time = 1000000000000\n', 'watch.capture_time must be at most'),
+    ('[watch]\ncapture_time_max = 10000000000\n', 'watch.capture_time_max must be at most'),
+    ('[llm]\ntimeout = 100000\n', 'llm.timeout must be at most'),
+    ('[notify]\ntimeout = 100000\n', 'notify.timeout must be at most'),
 ])
 def test_startup_rejects_out_of_range_settings(tmp_path, text, message):
     conf = tmp_path / 'fw.conf'
@@ -390,3 +398,10 @@ def test_main_does_not_print_the_ntfy_topic(tmp_path, monkeypatch, capsys):
     assert 'LLM analysis enabled (http://127.0.0.1:9, model m)' in printed
     assert 'secret-topic-123' not in printed
     assert 'hunter2' not in printed
+
+
+def test_empty_always_notify_flag_clears_the_config_list(tmp_path):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[notify]\nalways_notify = /a\n')
+    settings = fw.resolve_settings(parse_cli(['--config', str(conf), '--always-notify', '', 'p.txt']), environ={})
+    assert settings.always_notify == []

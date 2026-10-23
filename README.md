@@ -25,7 +25,7 @@ firewatcher /etc/firewatcher/patterns.d
 firewatcher -t 300 -o /var/log/captured_messages/ /etc/firewatcher/patterns.d
 ```
 
-A directory argument loads every non-hidden pattern file inside it. Files ending in `.regex` are compiled as regular expressions. Any other pattern file is treated as fnmatch (bash-like) substrings, with `*` added on both ends. Lines starting with `#` are comments. Matching is case-sensitive; for a case-insensitive pattern, put it in a `.regex` file with `(?i)` in front.
+A directory argument loads every non-hidden pattern file inside it. Files ending in `.regex` are compiled as regular expressions. Any other pattern file is treated as fnmatch (bash-like) substrings, with `*` added on both ends. Lines starting with `#` are comments; to match text that starts with `#`, such as the kernel's `#PF:`, write `[#]PF:` in a plain file or `\#PF:` in a `.regex` file. Matching is case-sensitive; for a case-insensitive pattern, put it in a `.regex` file with `(?i)` in front.
 
 `firewatcher` exits with an error when no pattern loads, for example when a pattern path is mistyped or every regex is invalid, instead of running while matching nothing.
 
@@ -40,11 +40,15 @@ Live capture is written as lines arrive, so a copy can already be on another fil
 
 A capture ends `--capture-time` seconds after its last matching line, or `--capture-time-max` seconds (default 3600) after it opened, whichever comes first, so a pattern that keeps repeating still produces a finished capture, and its analysis and push, at least once an hour. A later match starts a new capture.
 
-If the output folder cannot be written (a dead NFS mount, a full disk), the capture continues under `--fallback-folder` (default `/var/lib/firewatcher/captured_messages/`), starting with every line written since the last successful fsync and a note naming the file it moved from. If no folder can be written, `firewatcher` keeps running, logs the error, and still hands the incident to the notifier.
+If the output folder cannot be written (a full disk, a read-only remount, an NFS server that returns errors), the capture continues under `--fallback-folder` (default `/var/lib/firewatcher/captured_messages/`), starting with every line written since the last successful fsync and a note naming the file it moved from. That capture is listed in the fallback folder's own `journal.log`, and the fallback folder is compressed and pruned like the output folder. If no folder can be written, `firewatcher` keeps running, logs the error, and still hands the incident to the notifier.
+
+Put the fallback folder on a different filesystem from the output folder. The default is under `/var/lib`, which shares a disk with `/var/log` on most systems, so it covers a failed NFS output folder but not a full local disk.
+
+The fallback needs the failure to come back as an error. On an NFS mount with the default `hard` option, writes to an unreachable server wait instead of failing, and `firewatcher` waits with them. To fall back instead, mount the output folder with `soft` (or `softerr`) and a short `timeo`.
 
 `firewatcher` finishes the open capture on SIGINT and on SIGTERM. A second SIGTERM ends it at once.
 
-Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`; the directory is removed only after `tar` succeeds, and an existing archive is never overwritten.
+Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`. The directory is removed only after `tar` succeeds and the archive is synced to disk. An existing archive is never overwritten: the new one becomes `YYYY-MM.1.tar.xz`, and so on.
 
 ## systemd service
 
@@ -83,7 +87,7 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `-o`, `--output-folder` | Where to write captures (default: `/var/log/captured_messages/`) |
 | `--fallback-folder` | Where a capture continues when the output folder cannot be written (default: `/var/lib/firewatcher/captured_messages/`; `''` disables) |
 | `--tail-lines` | Lines to start with (default: 20; `+N` from line N, not with journalctl) |
-| `--filter-only` | Filter existing logs only (`cat` instead of `tail -F`, or `journalctl` without `--follow`). Lines arrive faster than real time, so `-t` and `--capture-time-max` do not bound a capture: it runs to `--capture-line-count-max` lines or the end of the input |
+| `--filter-only` | Filter existing logs only (`cat` instead of `tail -F`, or `journalctl` without `--follow`). Windows are measured in read time, not log time, and existing logs are read far faster than they were written, so `-t` and `--capture-time-max` barely limit a capture: it usually runs to `--capture-line-count-max` lines or the end of the input |
 | `--compress-after-months` | Tar.xz monthly dirs after N months (default: 3) |
 | `--delete-after-months` | Delete `YYYY-MM` dirs after N months (default: 0 = never) |
 | `--capture-line-count-max` | Max lines before/after a match (default: 10000). Also caps how many recent lines are held in memory |
@@ -137,7 +141,7 @@ always_notify =
 
 `patterns` and `always_notify` are one path per line, or comma-separated. Positional pattern arguments replace the `patterns` list.
 
-Out-of-range values stop `firewatcher` at startup: a negative time or count, a timeout of 0 or less, an ntfy priority outside 1–5, or an LLM or ntfy URL that does not start with `http://` or `https://`.
+Out-of-range values stop `firewatcher` at startup: a negative time or count, `capture_time` over 7 days or `capture_time_max` over 30 days, a timeout of 0 or less or over a day, an ntfy priority outside 1–5, or an LLM or ntfy URL that does not start with `http://` or `https://` or that contains spaces.
 
 `api_key` under `[llm]` and `token` under `[notify]` are not command-line flags. `FIREWATCHER_LLM_API_KEY` and `FIREWATCHER_NTFY_TOKEN` override them when set. `--install-service` creates `/etc/firewatcher/firewatcher.conf` with mode `0600` only when it is missing, and the unit runs `firewatcher --config` that path. An existing file is left as it is. Flags passed to a later install are appended on `ExecStart` so they override the file.
 
@@ -154,11 +158,11 @@ Both features default off.
 
 The capture window closes even when no further log lines arrive. Analysis runs on a background worker so log following stays live. The queue holds four captures. When the queue is full, that incident skips the model and, if notifications are on, the capture thread sends the generated-title push itself.
 
-Any user or program on the host can write log lines, and those lines reach the model. The request marks the matched line and the excerpt as untrusted data between `BEGIN`/`END` lines that carry a random token, and the system prompt tells the model never to follow instructions inside them. That makes it harder for a log line to talk the model out of notifying, but cannot rule it out. For incidents that must always reach you, list patterns under `[notify] always_notify` (or `--always-notify`): when a line that matched a watch pattern also matches one of them, the capture is pushed even if the model says not to notify. Only lines that matched a watch pattern count, so other lines in the capture window cannot trigger it. The capture's color codes are removed before it is sent to the model.
+Any user or program on the host can write log lines, and those lines reach the model. The request marks the matched line and the excerpt as untrusted data between `BEGIN`/`END` lines that carry a random token, and the system prompt tells the model never to follow instructions inside them. That makes it harder for a log line to talk the model out of notifying, but cannot rule it out. For incidents that must always reach you, list patterns under `[notify] always_notify` (or `--always-notify`): when a line that matched a watch pattern also matches one of them, the capture is pushed even if the model says not to notify. That push uses the generated title and the line that matched, followed by the model's summary, since log text can steer the summary as well. If no always_notify pattern loads, firewatcher logs an error and keeps capturing without it; `--always-notify ''` clears a list set in the config. Only the line that opened the capture and later lines that matched a watch pattern while it was open count. Other lines in the window do not, and neither do matches from an earlier capture that appear as context. The capture's color codes are removed before it is sent to the model.
 
-The ntfy topic URL is not printed at startup or in error messages, since on a public ntfy server whoever knows the topic can subscribe to it. Only the server is shown.
+The ntfy topic URL is not printed at startup or in error messages, since on a public ntfy server whoever knows the topic can subscribe to it. Only the server is shown. Keep the topic in the config file (mode `0600`) rather than on the command line: `--ntfy-url` shows in the process list, and when the config already exists, `--install-service --ntfy-url` puts it on the unit's `ExecStart`, which any user can read. `--install-service` warns when that happens.
 
-Lines firewatcher writes back to the journal are a single physical line containing `firewatcher-self`, so a summary that quotes `panic` or `I/O error` does not start another capture. The capture files themselves stay in the log stream's original format.
+Lines firewatcher writes back to the journal are a single physical line containing `firewatcher-self`, so a summary that quotes `panic` or `I/O error` does not start another capture. In journalctl and syslog output, firewatcher recognizes its own lines by the identifier field after the timestamp and host (`firewatcher[PID]:`), not by text elsewhere in the line, so a process or user name chosen to look like firewatcher cannot hide a kernel or daemon message. Lines in other formats are checked for `firewatcher-self` or `firewatcher[PID]:` anywhere. The capture files themselves stay in the log stream's original format.
 
 
 ## Development

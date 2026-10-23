@@ -1,6 +1,8 @@
 import os
 import re
 
+import pytest
+
 import firewatcher as fw
 
 # --- matching ---
@@ -131,3 +133,24 @@ def test_own_line_check_runs_only_for_candidate_matches(monkeypatch):
     assert matcher.find('host firewatcher[12]: panic') is None
     assert matcher.find('kernel panic') == '*panic*'
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize('line', [
+    # a process named to look like firewatcher, a user-chosen sudo directory, a remote login name
+    'Oct 23 05:44:51 host kernel: /firewatcher.py[3853]: segfault at 0 ip 0 sp 0 error 4',
+    'Oct 23 05:44:51 host kernel: firewatcher[3853]: segfault at 0 ip 0 sp 0 error 4',
+    'Oct  3 05:44:51 host sudo[1234]: bob : 3 incorrect password attempts ; PWD=/tmp/firewatcher-self ; COMMAND=/bin/sh',
+    '2026-10-23T05:44:51.123456+00:00 host sshd[99]: Invalid user firewatcher-self from 203.0.113.9 port 22',
+])
+def test_text_in_a_message_cannot_pass_for_our_own_line(line):
+    assert not fw._is_own_log_line(line)
+
+
+@pytest.mark.parametrize('line', [
+    'Oct 23 05:44:51 host firewatcher[12]: firewatcher-self analysis title=panic summary=I/O error',
+    'Oct  3 05:44:51 host firewatcher: firewatcher-self LLM analysis failed: timed out',
+    'Oct 23 05:44:51 host firewatcher.py[7]: firewatcher-self ntfy failed',
+    '2026-10-23T05:44:51.123456+00:00 host firewatcher[12]:   Matched line:    kernel: panic',
+])
+def test_our_own_lines_are_recognized_by_identifier(line):
+    assert fw._is_own_log_line(line)

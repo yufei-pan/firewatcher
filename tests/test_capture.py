@@ -3,6 +3,8 @@ import datetime
 import threading
 import time
 
+import pytest
+
 import firewatcher as fw
 from conftest import Clock, capture, incident_logs, ScriptedPopen, patch_popen, REAL_OUTPUT_FOLDER
 
@@ -516,8 +518,63 @@ def test_capture_file_after_close_ignores_writes(tmp_path):
     cap.write('one\n')
     cap.close()
     cap.close()
+    cap.write('late\n')
+    cap.commit()
     fw._end_capture(cap, 0, 10)
     assert (tmp_path / 'c.log').read_text() == 'one\n'
+
+
+@pytest.mark.parametrize('where', ['trailer', 'close'])
+def test_interrupted_end_of_capture_still_hands_over_the_incident(tmp_path, monkeypatch, where):
+    dispatcher = RecordingDispatcher()
+    cap = fw.CaptureFile(str(tmp_path / 'c.log'), 1.0)
+    real_write, real_sync = cap.write, cap.sync
+
+    def interrupted_write(text):
+        if 'End of capture' in text:
+            raise KeyboardInterrupt
+        real_write(text)
+
+    def interrupted_sync(now=None):
+        real_sync(now)
+        raise KeyboardInterrupt
+
+    if where == 'trailer':
+        cap.write = interrupted_write
+    else:
+        cap.sync = interrupted_sync
+    with pytest.raises(KeyboardInterrupt):
+        fw._end_capture(cap, 0, 10, incident={'pattern': 'HIT'}, dispatcher=dispatcher)
+    assert cap.closed
+    assert [job['path'] for job in dispatcher.jobs] == [str(tmp_path / 'c.log')]
+
+
+def test_captures_opened_in_the_same_second_get_their_own_files(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    # the line cap ends the first capture, and the next match opens another in the same second
+    popen = ScriptedPopen([('HIT 1\n', 0), ('HIT 2\n', 0), ('HIT 3\n', 0)], clock=clock)
+    out = run_scripted(tmp_path, monkeypatch, popen, capture_line_count_max=0)
+    caps = incident_logs(out)
+    assert len(caps) == 2
+    assert sorted(p.name.endswith('-1.log') for p in caps) == [False, True]
+    assert sum('Matched pattern' in p.read_text() for p in caps) == 2
+    journal = (out / 'journal.log').read_text()
+    assert all(str(p) in journal for p in caps)
+
+
+def test_fallback_folder_is_compressed_too(tmp_path, monkeypatch):
+    roots = []
+    real_init = fw.Log_Compressor.__init__
+
+    def recording_init(self, logsDir, *args, **kwargs):
+        roots.append(logsDir)
+        real_init(self, logsDir, *args, **kwargs)
+
+    monkeypatch.setattr(fw.Log_Compressor, '__init__', recording_init)
+    fallback = tmp_path / 'fallback'
+    capture(tmp_path, 'noise\n', fallback_folder=str(fallback))
+    assert roots == [str(tmp_path / 'out'), str(fallback)]
 
 
 # --- always_notify ---
@@ -525,8 +582,9 @@ def test_capture_file_after_close_ignores_writes(tmp_path):
 def test_always_notify_marks_incidents_whose_matched_lines_match(tmp_path, monkeypatch):
     dispatcher = recording_dispatcher(monkeypatch)
     always = {'fnmatch': {'*I/O error*'}}
-    capture(tmp_path, 'HIT first\nHIT then I/O error\n', always_notify_patterns=always)
+    capture(tmp_path, 'HIT first\nHIT then I/O error\nHIT again I/O error\n', always_notify_patterns=always)
     assert dispatcher.jobs[0].get('always_notify') is True
+    assert dispatcher.jobs[0]['always_notify_line'] == 'HIT then I/O error'
 
 
 def test_always_notify_ignores_context_lines(tmp_path, monkeypatch):
@@ -540,15 +598,36 @@ def test_always_notify_ignores_context_lines(tmp_path, monkeypatch):
 # --- shutdown ---
 
 def test_interrupt_while_handling_a_line_still_finishes_the_capture(tmp_path, monkeypatch, capsys):
-    def interrupted():
+    dispatcher = recording_dispatcher(monkeypatch)
+
+    def interrupted(self):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(fw, '_hostname', interrupted)
+    monkeypatch.setattr(fw.CaptureFile, 'commit', interrupted)
     popen = ScriptedPopen(['HIT now\n', 'after\n'])
     out = run_scripted(tmp_path, monkeypatch, popen)
     assert popen.terminated
     assert 'Exiting.' in capsys.readouterr().out
     assert 'End of capture' in incident_logs(out)[0].read_text()
+    assert [job['matched_line'] for job in dispatcher.jobs] == ['HIT now']
+
+
+def test_interrupt_while_opening_a_capture_does_not_resend_the_previous_incident(tmp_path, monkeypatch):
+    dispatcher = recording_dispatcher(monkeypatch)
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    calls = []
+
+    def hostname():
+        calls.append(1)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return 'box'
+
+    monkeypatch.setattr(fw, '_hostname', hostname)
+    popen = ScriptedPopen([('HIT first\n', 0), ('HIT second\n', 70)], clock=clock)
+    run_scripted(tmp_path, monkeypatch, popen)
+    assert [job['matched_line'] for job in dispatcher.jobs] == ['HIT first']
 
 
 def test_eof_does_not_terminate_the_reader(tmp_path, monkeypatch):

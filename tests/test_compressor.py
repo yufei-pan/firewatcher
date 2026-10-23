@@ -1,8 +1,10 @@
 import datetime
 import tarfile
 import threading
+import time
 
 import firewatcher as fw
+from conftest import capture
 
 # --- compressor ---
 
@@ -132,6 +134,8 @@ def test_log_compressor_keeps_the_month_when_tar_fails(tmp_path, monkeypatch, ca
 
     monkeypatch.setattr(fw.subprocess, 'run', failing_tar)
     fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    # one partial file per process, so two firewatchers on one folder never write the same file
+    assert not list(logs.glob('*.partial'))
     assert sorted(p.name for p in logs.iterdir()) == ['2020-01']
     assert (logs / '2020-01' / 'x.log').read_text() == 'x'
     assert 'tar exited 2' in capsys.readouterr().out
@@ -176,3 +180,52 @@ def test_log_compressor_in_background(tmp_path):
     finally:
         running.set()
         blocker.join()
+
+
+def test_log_compressor_syncs_the_archive_before_removing_the_month(tmp_path, monkeypatch):
+    logs = month_dirs(tmp_path, '2020-01')
+    synced = []
+    real = fw._fsync_path
+
+    def recording(path):
+        synced.append((path, (logs / '2020-01').is_dir()))
+        real(path)
+
+    monkeypatch.setattr(fw, '_fsync_path', recording)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert synced == [(str(logs / '2020-01.tar.xz'), True), (str(logs), True)]
+    assert not (logs / '2020-01').exists()
+
+
+def test_fsync_path_tolerates_filesystems_without_fsync(tmp_path, monkeypatch):
+    def unsupported(fd):
+        raise OSError(fw.errno.EINVAL, 'Invalid argument')
+
+    monkeypatch.setattr(fw.os, 'fsync', unsupported)
+    fw._fsync_path(str(tmp_path))
+
+
+def test_partial_archive_name_is_per_process(tmp_path, monkeypatch):
+    logs = month_dirs(tmp_path, '2020-01')
+    commands = []
+    real_run = fw.subprocess.run
+    monkeypatch.setattr(fw.subprocess, 'run', lambda cmd, **kw: commands.append(cmd) or real_run(cmd, **kw))
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert commands[0][2] == str(logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid()))
+
+
+def test_run_that_reads_to_the_end_finishes_compressing(tmp_path, monkeypatch):
+    out = tmp_path / 'out'
+    out.mkdir()
+    (out / '2020-01').mkdir()
+    (out / '2020-01' / 'x.log').write_text('x')
+    real = fw.Log_Compressor.compressLogs
+
+    def slow(self):
+        time.sleep(0.3)
+        real(self)
+
+    monkeypatch.setattr(fw.Log_Compressor, 'compressLogs', slow)
+    capture(tmp_path, 'noise\n', compress_after_months=1)
+    assert (out / '2020-01.tar.xz').is_file()
+    assert not (out / '2020-01').exists()

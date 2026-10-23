@@ -173,14 +173,18 @@ def test_main_exits_when_no_pattern_loads(tmp_path, capsys, name, content):
     assert 'No usable patterns' in capsys.readouterr().err
 
 
-def test_main_exits_when_always_notify_loads_nothing(tmp_path, capsys):
+def test_main_keeps_capturing_when_always_notify_loads_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(fw.syslog, 'syslog', lambda *args: None)
     pat = tmp_path / 'p.txt'
     pat.write_text('HIT\n')
     src = tmp_path / 'log'
-    src.write_text('x\n')
-    rc = fw.main(['--filter_only', '--log-file', str(src), '--always-notify', str(tmp_path / 'missing.d'), str(pat)])
-    assert rc == 1
-    assert 'No usable always_notify patterns' in capsys.readouterr().err
+    src.write_text('HIT now\n')
+    out = tmp_path / 'out'
+    rc = fw.main(['--filter_only', '--log-file', str(src), '-o', str(out),
+                  '--always-notify', str(tmp_path / 'missing.d'), str(pat)])
+    assert rc == 0
+    assert 'no usable always_notify patterns' in capsys.readouterr().out
+    assert incident_logs(out)
 
 
 def test_main_passes_always_notify_and_restores_sigterm(tmp_path, monkeypatch, capsys):
