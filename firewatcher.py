@@ -920,14 +920,14 @@ def resolve_settings(args, environ=None):
 
 
 def _mount_paths(paths):
-	"""The --requires-mounts-for paths for the unit: absolute, with empty ones dropped.
+	"""The --requires-mounts-for paths for the unit, with empty ones dropped.
 
-	systemd ignores a relative or unnormalized path in RequiresMountsFor= with a warning, so the dependency
-	would silently vanish: a relative path is made absolute and '.' and a trailing '/' are dropped. A '..'
-	is refused instead of collapsed, since through a symlink it names a different directory than the text
-	suggests. A newline or carriage return can't be written in any form systemd reads back, and systemd
-	rejects a path that is not UTF-8, so those are refused too, before anything is installed. The path is
-	kept as its bytes decoded as UTF-8, which is what the unit file holds whatever the locale."""
+	systemd ignores a relative or unnormalized path in RequiresMountsFor= with a warning, and depends only on
+	the mounts along the path as written, so each path is resolved the way the kernel resolves it: made
+	absolute, with '.', '..', '//' and symlinks resolved (os.path.realpath, on the path's bytes, so a
+	non-UTF-8 locale or current directory changes nothing). A newline or carriage return can't be written in
+	any form systemd reads back, and systemd rejects a path that is not UTF-8, so those are refused, before
+	anything is installed."""
 	result = []
 	for path in paths or []:
 		if not path:
@@ -936,17 +936,14 @@ def _mount_paths(paths):
 			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
 							  'which systemd cannot read back from a unit file: %r' % path)
 		try:
-			path = os.fsencode(path).decode('utf-8')
+			real = os.path.realpath(os.fsencode(path))
+		except OSError as exc:  # a relative path, and the current directory is gone
+			raise ConfigError('--requires-mounts-for cannot resolve %r: %s' % (path, exc))
+		try:
+			result.append(real.decode('utf-8'))
 		except UnicodeError:
 			raise ConfigError('--requires-mounts-for cannot take a path that is not UTF-8, which systemd '
-							  'rejects: %r' % path)
-		if '..' in path.split('/'):
-			raise ConfigError("--requires-mounts-for needs the mount path without '..' (through a symlink it "
-							  'names another directory): %r' % path)
-		try:
-			result.append(os.path.abspath(path))
-		except OSError as exc:  # a relative path, and the current directory is gone
-			raise ConfigError('--requires-mounts-for cannot make %r absolute: %s' % (path, exc))
+							  'rejects: %r' % os.fsdecode(real))
 	return result
 
 
@@ -2545,7 +2542,7 @@ def build_parser():
 	svc.add_argument('--print-unit', action='store_true', help='Print the systemd unit that --install-service would write, then exit. Works without systemd.')
 	svc.add_argument('--uninstall-service', action='store_true', help='Disable and remove the systemd unit. Warns and exits if systemd is not available.')
 	parser.add_argument('--unit-name', type=str, default=DEFAULT_UNIT_NAME, help='systemd unit name (default: firewatcher).')
-	parser.add_argument('--requires-mounts-for', action='append', default=[], metavar='PATH', help='Add RequiresMountsFor= to the unit (repeatable). Use when -o is on NFS or another remote filesystem.')
+	parser.add_argument('--requires-mounts-for', action='append', default=[], metavar='PATH', help='Add RequiresMountsFor= to the unit (repeatable). Use when -o is on NFS or another remote filesystem. The path is resolved as the kernel would (absolute, symlinks followed); one with a newline or not in UTF-8 is refused.')
 	parser.add_argument('--no-enable', action='store_true', help='With --install-service, write the unit and daemon-reload but do not enable or start it.')
 
 	parser.add_argument('--config', default=None, help='INI config file. Default: /etc/firewatcher/firewatcher.conf when that file exists. An explicit path must exist. CLI flags override the file.')

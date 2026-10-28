@@ -588,14 +588,21 @@ def test_requires_mounts_for_line_is_quoted_so_systemd_reads_the_path_back(path,
     assert _systemd_reads(line.partition('=')[2]) == [path]
 
 
-def test_requires_mounts_for_paths_are_normalized_or_refused():
-    # A trailing slash or '.' names the same mount; '..' could cross a symlink, so it is refused.
+def test_requires_mounts_for_paths_are_resolved_like_the_kernel(tmp_path):
+    # systemd ignores '..', '//' and '.' ("not normalized") and follows no symlinks: resolve them all.
     assert _mounts_line('/mnt/logs/') == ['RequiresMountsFor=/mnt/logs']
-    assert _mounts_line('/mnt/./logs') == ['RequiresMountsFor=/mnt/logs']
-    with pytest.raises(fw.ConfigError) as err:
-        fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', '/mnt/nfs/../logs', 'p.d']), environ={})
-    assert "without '..'" in str(err.value)
+    assert _mounts_line('//mnt/./logs') == ['RequiresMountsFor=/mnt/logs']
+    assert _mounts_line('/mnt/nfs/../logs') == ['RequiresMountsFor=/mnt/logs']
     assert _mounts_line('/mnt/a..b') == ['RequiresMountsFor=/mnt/a..b']
+    (tmp_path / 'nfs').mkdir()
+    (tmp_path / 'data').symlink_to(tmp_path / 'nfs')
+    assert _mounts_line(str(tmp_path / 'data' / 'logs')) == ['RequiresMountsFor=%s' % (tmp_path / 'nfs' / 'logs')]
+
+
+def test_requires_mounts_for_keeps_a_utf8_path_whatever_python_decoded(tmp_path):
+    # Python 3.6 under a C locale hands over 'caf\u00e9' as surrogate-escaped bytes; the unit gets the text.
+    path = b'/mnt/caf\xc3\xa9'.decode('ascii', 'surrogateescape')
+    assert _mounts_line(path) == ['RequiresMountsFor=/mnt/caf\u00e9']
 
 
 def test_requires_mounts_for_refuses_a_path_that_is_not_utf8():
@@ -610,9 +617,20 @@ def test_requires_mounts_for_relative_path_with_the_current_directory_gone(monke
         raise FileNotFoundError(2, 'No such file or directory')
 
     monkeypatch.setattr(fw.os, 'getcwd', gone)
+    monkeypatch.setattr(fw.os, 'getcwdb', gone)
     with pytest.raises(fw.ConfigError) as err:
         fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', 'logs', 'p.d']), environ={})
-    assert 'cannot make' in str(err.value)
+    assert 'cannot resolve' in str(err.value)
+
+
+def test_requires_mounts_for_relative_path_in_a_non_utf8_directory_is_refused(tmp_path, monkeypatch):
+    # The current directory's bytes count too: the resolved path must be UTF-8 as a whole.
+    odd = os.path.join(os.fsencode(str(tmp_path)), b'caf\xe9')
+    os.mkdir(odd)
+    monkeypatch.chdir(odd)
+    with pytest.raises(fw.ConfigError) as err:
+        fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', 'logs', 'p.d']), environ={})
+    assert 'not UTF-8' in str(err.value)
 
 
 def test_requires_mounts_for_keeps_each_path_a_separate_line_and_adds_remote_fs():

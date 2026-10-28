@@ -104,7 +104,7 @@ Useful flags:
 | Flag | Description |
 |------|-------------|
 | `--unit-name NAME` | Unit name (default: `firewatcher`) |
-| `--requires-mounts-for PATH` | Add `RequiresMountsFor=` (repeat for NFS/remote output). A relative path is made absolute, a path with spaces, quotes or backslashes is quoted for you, and a path with a newline is refused (systemd cannot read one back there) |
+| `--requires-mounts-for PATH` | Add `RequiresMountsFor=` (repeat for NFS/remote output). Each path is resolved as the kernel would (made absolute; `.`, `..`, `//` and symlinks resolved), quoted for you when it has spaces, quotes or backslashes, and refused if it has a newline or is not UTF-8 (systemd cannot read either back there) |
 | `--no-enable` | Write the unit and reload, but do not enable or start it |
 
 ```bash
