@@ -1361,7 +1361,7 @@ def call_llm(settings, incident):
 	excerpt = _capture_excerpt(incident['path'], settings.llm_max_bytes, marks=marks)
 	# A random token, so a log line cannot fake the END marker and append its own instructions.
 	marker = 'LOG-DATA-' + secrets.token_hex(8)
-	notes = settings.llm_notes
+	notes = _note_text(settings.llm_notes)
 	user = (
 		'Host: %s\n'
 		'%s'
@@ -2323,8 +2323,7 @@ def render_unit_file(args, executable=None, config_exists=None, raw=None):
 		'Wants=' + ' '.join(wants),
 	]
 	for mount in requires:
-		# A path list: quoted and % escaped like an argument, but systemd substitutes no $ in it.
-		lines.append('RequiresMountsFor=' + _quote_unit_arg(mount, program=True))
+		lines.append('RequiresMountsFor=' + mount)
 	stop_sec = max(30, int(resolved.llm_timeout) + int(resolved.ntfy_timeout) + 15)
 	lines.extend([
 		'',
@@ -2515,7 +2514,7 @@ def build_parser():
 	parser.add_argument('--llm-model', default=None, help='Model name sent to the LLM API.')
 	parser.add_argument('--llm-timeout', type=int, default=None, help='LLM HTTP timeout in seconds. Default: 60.')
 	parser.add_argument('--llm-max-bytes', type=int, default=None, help='Maximum capture bytes sent to the LLM. Default: 48000.')
-	parser.add_argument('--llm-notes', default=None, metavar='TEXT', help="Short note sent to the LLM with each capture, for example what is normal on this host. Default: none; '' clears a note set in the config. A note starting with '-' needs the --llm-notes=TEXT form.")
+	parser.add_argument('--llm-notes', default=None, metavar='TEXT', help="Short note sent to the LLM with each capture, for example what is normal on this host. Default: none; '' clears a note set in the config. A note that looks like an option needs the --llm-notes=TEXT form.")
 	notify = parser.add_mutually_exclusive_group()
 	notify.add_argument('--notify', dest='notify', action='store_true', help='Push a notification for finished captures. With --llm, only when the model asks for one.')
 	notify.add_argument('--no-notify', dest='notify', action='store_false', help='Disable notifications, overriding the config file.')

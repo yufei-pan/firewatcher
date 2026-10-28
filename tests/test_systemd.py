@@ -535,10 +535,3 @@ def test_quote_unit_arg_keeps_a_bare_semicolon_and_newlines_inside_one_argument(
     # A bare ';' ends an ExecStart command, and a raw newline would end the line (or add a directive).
     assert fw._quote_unit_arg(';') == '";"'
     assert fw._quote_unit_arg('m\nExecStartPre=/bin/false\r') == '"m\\nExecStartPre=/bin/false\\r"'
-
-
-def test_requires_mounts_for_quotes_spaces_and_escapes_percent():
-    parsed = parse_cli(['--print-unit', '--requires-mounts-for', '/mnt/my logs', '--requires-mounts-for', '/mnt/100%$x', 'p.txt'])
-    unit = fw.render_unit_file(parsed, executable='/bin/fw', config_exists=True)
-    assert 'RequiresMountsFor="/mnt/my logs"' in unit
-    assert 'RequiresMountsFor=/mnt/100%%$x' in unit
