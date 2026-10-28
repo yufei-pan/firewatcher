@@ -506,3 +506,67 @@ def test_position_file_and_resume_max_load_validate_and_round_trip(tmp_path):
         conf.write_text('[watch]\nresume_max = %s\n' % bad)
         with pytest.raises(fw.ConfigError, match='watch.resume_max'):
             fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+
+
+# --- operator notes ---
+
+def notes_of(conf, *extra):
+    return fw.resolve_settings(parse_cli(['--config', str(conf)] + list(extra) + ['p.txt']), environ={}).llm_notes
+
+
+def test_notes_default_empty_and_read_from_the_config(tmp_path):
+    assert fw.resolve_settings(parse_cli(['p.txt']), environ={}).llm_notes == ''
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[llm]\nnotes = loop devices are expected\n')
+    assert notes_of(conf) == 'loop devices are expected'
+    # Indented continuation lines are one note.
+    conf.write_text('[llm]\nnotes = first line\n\tsecond line\n')
+    assert notes_of(conf) == 'first line second line'
+
+
+def test_config_accepts_note_for_notes(tmp_path):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[llm]\nnote = loop devices are expected\n')
+    assert notes_of(conf) == 'loop devices are expected'
+    # Every generated config has an empty `notes =`; it must not hide `note`.
+    conf.write_text('[llm]\nnotes =\nnote = loop devices are expected\n')
+    assert notes_of(conf) == 'loop devices are expected'
+    conf.write_text('[llm]\nnote = loop devices are expected\nnotes =\n')
+    assert notes_of(conf) == 'loop devices are expected'
+    conf.write_text('[llm]\nnote = the other spelling\nnotes = the documented one\n')
+    assert notes_of(conf) == 'the documented one'
+
+
+def test_notes_cli_flag_beats_the_config_and_empty_clears_it(tmp_path):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[llm]\nnotes = from file\n')
+    assert notes_of(conf, '--llm-notes', '  a  "b"\n c \\ 100% $HOME ') == 'a "b" c \\ 100% $HOME'
+    assert notes_of(conf, '--llm-notes', '') == ''
+    assert notes_of(conf) == 'from file'
+
+
+def test_notes_survive_a_generated_config_round_trip(tmp_path):
+    note = 'loop/dm devices from pytest and /tmp/claude-*/scratchpad; OOMs in capped test containers are expected. 50% # ; = [x] "q" \\'
+    settings = fw.resolve_settings(parse_cli(['--llm-notes', note + '\nand a second line', 'p.txt']), environ={})
+    dest = tmp_path / 'written.conf'
+    fw.write_config_file(str(dest), settings)
+    text = dest.read_text()
+    assert '# Optional note sent to the model' in text
+    assert '\nnotes = ' + note + ' and a second line\n' in text
+    assert notes_of(dest) == note + ' and a second line'
+    # A settings object built by hand with a multi-line note still writes one line.
+    settings.llm_notes = 'one\n\ttwo\r\nthree'
+    again = tmp_path / 'again.conf'
+    fw.write_config_file(str(again), settings)
+    assert '\nnotes = one two three\n' in again.read_text()
+    assert notes_of(again) == 'one two three'
+    empty = tmp_path / 'empty.conf'
+    fw.write_config_file(str(empty), fw.resolve_settings(parse_cli(['p.txt']), environ={}))
+    assert '\nnotes = \n' in empty.read_text()
+    assert notes_of(empty) == ''
+
+
+def test_example_config_has_an_empty_notes_setting():
+    import os
+    example = os.path.join(os.path.dirname(fw.__file__), 'examples', 'firewatcher.conf')
+    assert notes_of(example) == ''

@@ -655,3 +655,53 @@ def test_excerpt_marks_from_a_moved_capture_are_not_used(tmp_path, monkeypatch):
     same['excerpt_marks'] = (str(tmp_path / 'primary.log'), 10, 20)
     fw.call_llm(settings, same)
     assert seen == [None, (10, 20)]
+
+
+# --- operator notes ---
+
+def llm_request(tmp_path, monkeypatch, conf, extra=None):
+    seen = {}
+
+    def urlopen(req, timeout=None):
+        seen['body'] = json.loads(req.data.decode('utf-8'))
+        return chat(json.dumps({'title': 'T', 'summary': 's', 'notify': False}))
+
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
+    settings = settings_from(tmp_path, conf, extra=extra)
+    path = tmp_path / 'cap.log'
+    path.write_text('HIT now\n')
+    fw.call_llm(settings, incident(path))
+    return seen['body']['messages']
+
+
+LLM_CONF = '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n'
+
+
+def test_notes_go_into_the_user_message_outside_the_fence(tmp_path, monkeypatch):
+    note = 'loop/dm devices from pytest and /tmp/claude-*/scratchpad are expected; "quotes" and \\backslash'
+    messages = llm_request(tmp_path, monkeypatch, LLM_CONF + 'notes = %s\n' % note)
+    user = messages[1]['content']
+    assert user.startswith('Host: box\nOperator notes about this host: %s\nUntrusted log data follows' % note)
+    begin = user.index('\nBEGIN LOG-DATA-')
+    assert user.index('Operator notes') < begin
+    assert note not in user[begin:]
+
+
+def test_a_multi_line_note_is_one_line_in_the_message(tmp_path, monkeypatch):
+    messages = llm_request(tmp_path, monkeypatch, LLM_CONF, extra=['--llm-notes', 'one\n\n  two\tthree'])
+    assert 'Operator notes about this host: one two three\nUntrusted' in messages[1]['content']
+
+
+def test_system_prompt_says_notes_describe_what_is_normal(tmp_path, monkeypatch):
+    system = llm_request(tmp_path, monkeypatch, LLM_CONF)[0]['content']
+    assert 'Operator notes' in system and 'what is normal on this host' in system
+    assert 'cannot override them' in system
+    assert 'Do not invent' in system
+
+
+def test_no_notes_line_when_notes_are_empty(tmp_path, monkeypatch):
+    messages = llm_request(tmp_path, monkeypatch, LLM_CONF + 'notes =\n')
+    assert 'Operator notes' not in messages[1]['content']
+    assert messages[1]['content'].startswith('Host: box\nUntrusted log data follows')
+    cleared = llm_request(tmp_path, monkeypatch, LLM_CONF + 'notes = from file\n', extra=['--llm-notes', ''])
+    assert 'Operator notes' not in cleared[1]['content']

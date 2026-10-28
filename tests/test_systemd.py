@@ -448,3 +448,84 @@ def test_install_warns_when_the_topic_goes_on_execstart(tmp_path, capsys, monkey
     rc = fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'), systemctl=ok_systemctl, executable='/bin/fw')
     assert rc == 0
     assert 'any user can read it' in capsys.readouterr().err
+
+
+# --- operator notes in the unit ---
+
+def exec_start_line(unit):
+    return next(line for line in unit.splitlines() if line.startswith('ExecStart='))
+
+
+def systemd_words(exec_start):
+    """The words systemd would hand to the program: double quotes with \\ escapes, then %% and $$ undone."""
+    return [word.replace('%%', '%').replace('$$', '$') for word in shlex.split(exec_start[len('ExecStart='):])]
+
+
+def test_quote_unit_arg_escapes_for_systemd():
+    assert fw._quote_unit_arg('100%') == '100%%'
+    assert fw._quote_unit_arg('$HOME') == '$$HOME'
+    assert fw._quote_unit_arg("don't") == '"don\'t"'
+    assert fw._quote_unit_arg('a b%$') == '"a b%%$$"'
+    # The program path is not $-expanded by systemd, only %-expanded.
+    assert fw._quote_unit_arg('/opt/f$w/fw 1%', program=True) == '"/opt/f$w/fw 1%%"'
+    assert fw._quote_unit_arg('/opt/f$w/fw', program=True) == '/opt/f$w/fw'
+
+
+def test_notes_reach_the_unit_as_one_escaped_word(tmp_path):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[llm]\nnotes = from file\n')
+    note = '  a  "b"\n c \\ don\'t; 100% $HOME '
+    parsed = parse_cli(['--config', str(conf), '--llm-notes', note, 'p.txt'])
+    unit = fw.render_unit_file(parsed, executable='/opt/f$w/fw', config_exists=True)
+    line = exec_start_line(unit)
+    assert line.startswith('ExecStart=/opt/f$w/fw ')
+    assert '"--llm-notes=a \\"b\\" c \\\\ don\'t; 100%% $$HOME"' in line
+    words = systemd_words(line)
+    assert 'a "b" c \\ don\'t; 100% $HOME' == next(w for w in words if w.startswith('--llm-notes='))[len('--llm-notes='):]
+    assert fw.resolve_settings(parse_cli(words[1:]), environ={}).llm_notes == 'a "b" c \\ don\'t; 100% $HOME'
+    plain = fw.render_unit_file(parse_cli(['--config', str(conf), 'p.txt']), executable='/bin/fw', config_exists=True)
+    assert '--llm-notes' not in plain
+
+
+def test_a_cleared_note_reaches_the_unit_as_an_empty_override(tmp_path):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[llm]\nnotes = from file\n')
+    unit = fw.render_unit_file(parse_cli(['--config', str(conf), '--llm-notes', '', 'p.txt']), executable='/bin/fw', config_exists=True)
+    words = systemd_words(exec_start_line(unit))
+    assert '--llm-notes=' in words
+    assert fw.resolve_settings(parse_cli(words[1:]), environ={}).llm_notes == ''
+
+
+def test_notes_starting_with_a_dash_stay_one_unit_argument(tmp_path):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[llm]\nnotes = from file\n')
+    parsed = parse_cli(['--config', str(conf), '--llm-notes=-noisy', 'p.txt'])
+    line = exec_start_line(fw.render_unit_file(parsed, executable='/bin/fw', config_exists=True))
+    assert ' --llm-notes=-noisy ' in line
+    # What systemd hands back to firewatcher parses to the same note.
+    assert fw.resolve_settings(parse_cli(systemd_words(line)[1:]), environ={}).llm_notes == '-noisy'
+
+
+def test_install_with_notes_and_no_config_writes_them_to_the_new_config(tmp_path):
+    conf = tmp_path / 'firewatcher.conf'  # the default config path conftest points into tmp_path
+    assert not conf.exists()
+    args = parse_cli(['--install-service', '--no-enable', '-o', str(tmp_path / 'out'), '--llm-notes', "don't; 100% $HOME", 'p.txt'])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    assert "\nnotes = don't; 100% $HOME\n" in conf.read_text()
+    assert 'llm-notes' not in (tmp_path / 'units' / 'firewatcher.service').read_text()
+
+
+def test_a_rendered_unit_with_a_note_passes_systemd_analyze_verify(tmp_path):
+    import shutil
+    import subprocess
+    analyze = shutil.which('systemd-analyze')
+    if not analyze:
+        pytest.skip('systemd-analyze is not installed')
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[llm]\nenabled = false\n')
+    parsed = parse_cli(['--config', str(conf), '--llm-notes', "don't; 100% $HOME", 'p.txt'])
+    unit = tmp_path / 'fwtest.service'
+    unit.write_text(fw.render_unit_file(parsed, executable='/bin/true', config_exists=True))
+    done = subprocess.run([analyze, 'verify', str(unit)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
+    assert done.returncode == 0, done.stdout

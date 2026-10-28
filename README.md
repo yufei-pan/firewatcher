@@ -139,6 +139,7 @@ sudo firewatcher --install-service -o /mnt/logs/captured_messages \
 | `--llm-model NAME` | Model name |
 | `--llm-timeout SEC` | LLM HTTP timeout (default: 60) |
 | `--llm-max-bytes N` | Capture bytes sent to the model (default: 48000) |
+| `--llm-notes TEXT` | A short note about this host, sent to the model with each capture (default: none; `''` clears a note set in the config). See [LLM analysis and notifications](#llm-analysis-and-notifications) |
 | `--notify` / `--no-notify` | Enable or disable ntfy pushes |
 | `--ntfy-url URL` | ntfy topic URL, such as `https://ntfy.sh/mytopic` |
 | `--ntfy-priority N` | ntfy priority 1–5 (default: 4) |
@@ -172,6 +173,7 @@ base_url = http://127.0.0.1:11434/v1
 model = llama3.1
 timeout = 60
 max_bytes = 48000
+notes = loop/dm devices from pytest and OOMs in capped test containers are expected
 
 [notify]
 enabled = false
@@ -203,6 +205,8 @@ The capture window closes even when no further log lines arrive. Analysis runs o
 A capture that fits in `max_bytes` (default 48000) is sent whole. A bigger one is cut around the line that opened it: the header, then the lines just before the match (a quarter of the budget), the lines just after it (half), and the end of the capture (a quarter), each cut marked `[... N bytes skipped ...]`. Room one side does not need goes to the other. The pieces are read separately, so a large capture is never loaded into memory whole.
 
 Any user or program on the host can write log lines, and those lines reach the model. The request marks the matched line and the excerpt as untrusted data between `BEGIN`/`END` lines that carry a random token, and the system prompt tells the model never to follow instructions inside them. That makes it harder for a log line to talk the model out of notifying, but cannot rule it out. For incidents that must always reach you, list patterns under `[notify] always_notify` (or `--always-notify`): when a line that matched a watch pattern also matches one of them, the capture is pushed even if the model says not to notify. That push uses the generated title and the line that matched, followed by the model's summary, since log text can steer the summary as well. If no always_notify pattern loads, firewatcher logs an error and keeps capturing without it; `--always-notify ''` clears a list set in the config. Only the line that opened the capture and later lines that matched a watch pattern while it was open count. Other lines in the window do not, and neither do matches from an earlier capture that appear as context. The capture's color codes are removed before it is sent to the model.
+
+`[llm] notes` (or `--llm-notes TEXT`; `note` also works as the key; the flag wins over the file, and `--llm-notes ''` clears a note set in the config) is a short free-text note about this host, for example `loop/dm devices from pytest and /tmp/claude-*/scratchpad and OOMs in capped test containers are expected`. It is sent with every capture as a line `Operator notes about this host: ...` before the untrusted log data, outside the `BEGIN`/`END` block, and the system prompt tells the model that notes describe what is normal there. Any run of whitespace in a note, newlines included, becomes one space. Only you can set it, so unlike the log lines it is trusted text; keep it short, since it is sent with every capture. When the config exists, `--install-service --llm-notes ...` puts the note on the unit's `ExecStart` (as one `--llm-notes=...` word, with `%` and `$` doubled for systemd).
 
 The ntfy topic URL is not printed at startup or in error messages, since on a public ntfy server whoever knows the topic can subscribe to it. Only the server is shown. Keep the topic in the config file (mode `0600`) rather than on the command line: `--ntfy-url` shows in the process list, and when the config already exists, `--install-service --ntfy-url` puts it on the unit's `ExecStart`, which any user can read. `--install-service` warns when that happens.
 
