@@ -31,7 +31,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.63'
+version = '1.64'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -914,9 +914,26 @@ def resolve_settings(args, environ=None):
 	settings.ntfy_url = (settings.ntfy_url or '').strip()
 	settings.unit_name = getattr(args, 'unit_name', None) or DEFAULT_UNIT_NAME
 	settings.no_enable = bool(getattr(args, 'no_enable', False))
-	settings.requires_mounts_for = list(getattr(args, 'requires_mounts_for', None) or [])
+	settings.requires_mounts_for = _mount_paths(getattr(args, 'requires_mounts_for', None))
 	validate_settings(settings)
 	return settings
+
+
+def _mount_paths(paths):
+	"""The --requires-mounts-for paths for the unit: absolute, with empty ones dropped.
+
+	systemd ignores a relative path in RequiresMountsFor= with a warning, so the dependency would silently
+	vanish; it is made absolute here. A newline or carriage return ends the line in a unit file and cannot
+	be written in any form systemd reads back, so the path is refused, before anything is installed."""
+	result = []
+	for path in paths or []:
+		if not path:
+			continue
+		if '\n' in path or '\r' in path:
+			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
+							  'which systemd cannot read back from a unit file: %r' % path)
+		result.append(path if path.startswith('/') else os.path.abspath(path))
+	return result
 
 
 def validate_settings(settings):
@@ -2295,6 +2312,17 @@ def _quote_unit_arg(value, program=False):
 
 
 
+def _quote_unit_path(path):
+	"""A path for RequiresMountsFor=, a space-separated list in which systemd expands % specifiers. A path
+	with whitespace, a quote or a backslash goes in double quotes, with the backslash and the double quote
+	each prefixed by a backslash: that is all systemd reads back there. It has no \\n, so a newline does not
+	survive (such a path is refused in _mount_paths), unlike in an ExecStart argument."""
+	path = path.replace('%', '%%')
+	if any(ch.isspace() or ch in '"\'\\' for ch in path):
+		path = '"' + path.replace('\\', '\\\\').replace('"', '\\"') + '"'
+	return path
+
+
 def render_unit_file(args, executable=None, config_exists=None, raw=None):
 	"""Render a systemd unit. Does not require systemd to be present."""
 	resolved, raw = _prepare_unit_settings(args, raw=raw)
@@ -2323,7 +2351,7 @@ def render_unit_file(args, executable=None, config_exists=None, raw=None):
 		'Wants=' + ' '.join(wants),
 	]
 	for mount in requires:
-		lines.append('RequiresMountsFor=' + mount)
+		lines.append('RequiresMountsFor=' + _quote_unit_path(mount))
 	stop_sec = max(30, int(resolved.llm_timeout) + int(resolved.ntfy_timeout) + 15)
 	lines.extend([
 		'',

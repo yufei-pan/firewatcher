@@ -535,3 +535,121 @@ def test_quote_unit_arg_keeps_a_bare_semicolon_and_newlines_inside_one_argument(
     # A bare ';' ends an ExecStart command, and a raw newline would end the line (or add a directive).
     assert fw._quote_unit_arg(';') == '";"'
     assert fw._quote_unit_arg('m\nExecStartPre=/bin/false\r') == '"m\\nExecStartPre=/bin/false\\r"'
+
+
+# --- RequiresMountsFor= paths ---
+# Checked against systemd 257: a bind mount at each path, then which mount unit the unit's After= named.
+
+def _mounts_line(*paths):
+    argv = ['--print-unit']
+    for path in paths:
+        argv += ['--requires-mounts-for', path]
+    unit = fw.render_unit_file(parse_cli(argv + ['/etc/firewatcher/patterns.d']), executable='/bin/fw')
+    return [line for line in unit.splitlines() if line.startswith('RequiresMountsFor=')]
+
+
+def _systemd_reads(value):
+    """How systemd reads one RequiresMountsFor= value: words split on whitespace, quotes group, a backslash
+    inside double quotes takes the next character, %% is one %."""
+    words, word, quoted, started, chars = [], '', False, False, iter(value)
+    for ch in chars:
+        if quoted and ch == '\\':
+            word += next(chars)
+        elif ch == '"':
+            quoted, started = not quoted, True
+        elif ch.isspace() and not quoted:
+            if started or word:
+                words.append(word)
+            word, started = '', False
+        else:
+            word += ch
+    if started or word:
+        words.append(word)
+    return [w.replace('%%', '%') for w in words]
+
+
+@pytest.mark.parametrize('path, line', [
+    ('/mnt/logs/captured_messages', 'RequiresMountsFor=/mnt/logs/captured_messages'),
+    ('/mnt/logs/', 'RequiresMountsFor=/mnt/logs/'),
+    ('/mnt/a$b', 'RequiresMountsFor=/mnt/a$b'),
+    ('/mnt/a;b', 'RequiresMountsFor=/mnt/a;b'),
+    ('/mnt/a#b', 'RequiresMountsFor=/mnt/a#b'),
+    ('/mnt/my logs', 'RequiresMountsFor="/mnt/my logs"'),
+    ('/mnt/a\tb', 'RequiresMountsFor="/mnt/a\tb"'),
+    ('/mnt/100%', 'RequiresMountsFor=/mnt/100%%'),
+    ('/mnt/%h y', 'RequiresMountsFor="/mnt/%%h y"'),
+    ('/mnt/a"b', 'RequiresMountsFor="/mnt/a\\"b"'),
+    ('/mnt/a\\b', 'RequiresMountsFor="/mnt/a\\\\b"'),
+    ("/mnt/a'b", 'RequiresMountsFor="/mnt/a\'b"'),
+    ('/mnt/a b\\', 'RequiresMountsFor="/mnt/a b\\\\"'),
+    ('/mnt/a"b c\\d', 'RequiresMountsFor="/mnt/a\\"b c\\\\d"'),
+])
+def test_requires_mounts_for_line_is_quoted_so_systemd_reads_the_path_back(path, line):
+    assert _mounts_line(path) == [line]
+    assert _systemd_reads(line.partition('=')[2]) == [path]
+
+
+def test_requires_mounts_for_keeps_each_path_a_separate_line_and_adds_remote_fs():
+    lines = _mounts_line('/mnt/my logs', '/mnt/b')
+    assert lines == ['RequiresMountsFor="/mnt/my logs"', 'RequiresMountsFor=/mnt/b']
+    unit = fw.render_unit_file(parse_cli(['--print-unit', '--requires-mounts-for', '/mnt/my logs', 'p.d']),
+                               executable='/bin/fw')
+    assert 'remote-fs.target' in unit
+
+
+def test_requires_mounts_for_makes_a_relative_path_absolute(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert _mounts_line('nfs/logs') == ['RequiresMountsFor=' + str(tmp_path / 'nfs' / 'logs')]
+    assert _mounts_line('./a b') == ['RequiresMountsFor="%s"' % (tmp_path / 'a b')]
+    assert fw.resolve_settings(parse_cli(['--requires-mounts-for', 'x', 'p.d']),
+                               environ={}).requires_mounts_for == [str(tmp_path / 'x')]
+
+
+def test_requires_mounts_for_empty_path_is_dropped():
+    assert _mounts_line('') == []
+
+
+@pytest.mark.parametrize('path', ['/mnt/a\nb', '/mnt/a\rb', 'rel\nx'])
+def test_requires_mounts_for_refuses_a_newline_or_carriage_return(path, capsys):
+    with pytest.raises(fw.ConfigError) as exc:
+        fw.resolve_settings(parse_cli(['--requires-mounts-for', path, 'p.d']), environ={})
+    assert '--requires-mounts-for' in str(exc.value)
+    assert 'newline' in str(exc.value)
+    with pytest.raises(SystemExit) as exit_info:
+        fw.main(['--print-unit', '--requires-mounts-for', path])
+    assert exit_info.value.code == 2
+    assert '--requires-mounts-for' in capsys.readouterr().err
+
+
+def test_install_refuses_a_bad_mount_path_before_writing_anything(tmp_path, capsys):
+    unit_dir = tmp_path / 'system'
+    patterns = tmp_path / 'patterns.d'
+    out = tmp_path / 'captures'
+    calls = []
+    parsed = parse_cli(['--install-service', '-o', str(out), '--requires-mounts-for', '/mnt/a\nb', str(patterns)])
+    rc = fw.install_service(parsed, systemd_available=True, unit_dir=str(unit_dir),
+                            systemctl=systemctl_recorder(calls), executable='/bin/fw')
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert '--requires-mounts-for' in err and 'newline' in err
+    assert not unit_dir.exists() and not patterns.exists() and not out.exists()
+    assert not os.path.exists(fw.DEFAULT_CONFIG_PATH)
+    assert calls == []
+
+
+def test_main_install_refuses_a_bad_mount_path_with_exit_2_and_no_traceback(tmp_path, capsys):
+    out = tmp_path / 'captures'
+    with pytest.raises(SystemExit) as exit_info:
+        fw.main(['--install-service', '-o', str(out), '--requires-mounts-for', '/mnt/a\rb', str(tmp_path / 'p.d')])
+    assert exit_info.value.code == 2
+    assert 'Traceback' not in capsys.readouterr().err
+    assert not out.exists() and not os.path.exists(fw.DEFAULT_CONFIG_PATH)
+
+
+def test_install_writes_a_quoted_mount_path_to_the_unit(tmp_path):
+    unit_dir = tmp_path / 'system'
+    parsed = parse_cli(['--install-service', '--no-enable', '-o', str(tmp_path / 'out'),
+                        '--requires-mounts-for', '/mnt/my logs', str(tmp_path / 'p.d')])
+    assert fw.install_service(parsed, systemd_available=True, unit_dir=str(unit_dir),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    assert 'RequiresMountsFor="/mnt/my logs"\n' in (unit_dir / 'firewatcher.service').read_text()
