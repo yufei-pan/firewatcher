@@ -2514,7 +2514,7 @@ def build_parser():
 	parser.add_argument('--llm-model', default=None, help='Model name sent to the LLM API.')
 	parser.add_argument('--llm-timeout', type=int, default=None, help='LLM HTTP timeout in seconds. Default: 60.')
 	parser.add_argument('--llm-max-bytes', type=int, default=None, help='Maximum capture bytes sent to the LLM. Default: 48000.')
-	parser.add_argument('--llm-notes', default=None, metavar='TEXT', help="Short note sent to the LLM with each capture, for example what is normal on this host. Default: none; '' clears a note set in the config. A note that looks like an option needs the --llm-notes=TEXT form.")
+	parser.add_argument('--llm-notes', default=None, metavar='TEXT', help="Short note sent to the LLM with each capture, for example what is normal on this host. Default: none; '' clears a note set in the config. A one-word note starting with '-' needs the --llm-notes=TEXT form.")
 	notify = parser.add_mutually_exclusive_group()
 	notify.add_argument('--notify', dest='notify', action='store_true', help='Push a notification for finished captures. With --llm, only when the model asks for one.')
 	notify.add_argument('--no-notify', dest='notify', action='store_false', help='Disable notifications, overriding the config file.')
