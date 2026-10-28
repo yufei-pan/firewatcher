@@ -588,15 +588,34 @@ def test_requires_mounts_for_line_is_quoted_so_systemd_reads_the_path_back(path,
     assert _systemd_reads(line.partition('=')[2]) == [path]
 
 
-def test_requires_mounts_for_paths_are_resolved_like_the_kernel(tmp_path):
-    # systemd ignores '..', '//' and '.' ("not normalized") and follows no symlinks: resolve them all.
+def test_requires_mounts_for_paths_are_normalized_as_text(tmp_path):
+    # systemd ignores '..', '//' and '.' ("not normalized"); normalize as text, follow no symlinks.
     assert _mounts_line('/mnt/logs/') == ['RequiresMountsFor=/mnt/logs']
     assert _mounts_line('//mnt/./logs') == ['RequiresMountsFor=/mnt/logs']
     assert _mounts_line('/mnt/nfs/../logs') == ['RequiresMountsFor=/mnt/logs']
     assert _mounts_line('/mnt/a..b') == ['RequiresMountsFor=/mnt/a..b']
     (tmp_path / 'nfs').mkdir()
     (tmp_path / 'data').symlink_to(tmp_path / 'nfs')
-    assert _mounts_line(str(tmp_path / 'data' / 'logs')) == ['RequiresMountsFor=%s' % (tmp_path / 'nfs' / 'logs')]
+    assert _mounts_line(str(tmp_path / 'data' / 'logs')) == ['RequiresMountsFor=%s' % (tmp_path / 'data' / 'logs')]
+
+
+def test_requires_mounts_for_touches_no_file(monkeypatch):
+    # A hung hard NFS mount or an automount point must not stall or trigger anything.
+    def no_fs(*args, **kwargs):
+        raise AssertionError('the file system was touched')
+
+    for name in ('lstat', 'stat', 'readlink'):
+        monkeypatch.setattr(fw.os, name, no_fs)
+    assert fw._mount_paths(['/mnt/nfs/../logs', '/mnt/x']) == ['/mnt/logs', '/mnt/x']
+
+
+def test_requires_mounts_for_refuses_a_newline_the_current_directory_brings_in(tmp_path, monkeypatch):
+    odd = tmp_path / 'a\nb'
+    odd.mkdir()
+    monkeypatch.chdir(str(odd))
+    with pytest.raises(fw.ConfigError) as err:
+        fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', 'logs', 'p.d']), environ={})
+    assert 'newline' in str(err.value)
 
 
 def test_requires_mounts_for_keeps_a_utf8_path_whatever_python_decoded(tmp_path):
@@ -620,7 +639,7 @@ def test_requires_mounts_for_relative_path_with_the_current_directory_gone(monke
     monkeypatch.setattr(fw.os, 'getcwdb', gone)
     with pytest.raises(fw.ConfigError) as err:
         fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', 'logs', 'p.d']), environ={})
-    assert 'cannot resolve' in str(err.value)
+    assert 'cannot make' in str(err.value)
 
 
 def test_requires_mounts_for_relative_path_in_a_non_utf8_directory_is_refused(tmp_path, monkeypatch):

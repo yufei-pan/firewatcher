@@ -922,28 +922,30 @@ def resolve_settings(args, environ=None):
 def _mount_paths(paths):
 	"""The --requires-mounts-for paths for the unit, with empty ones dropped.
 
-	systemd ignores a relative or unnormalized path in RequiresMountsFor= with a warning, and depends only on
-	the mounts along the path as written, so each path is resolved the way the kernel resolves it: made
-	absolute, with '.', '..', '//' and symlinks resolved (os.path.realpath, on the path's bytes, so a
-	non-UTF-8 locale or current directory changes nothing). A newline or carriage return can't be written in
-	any form systemd reads back, and systemd rejects a path that is not UTF-8, so those are refused, before
-	anything is installed."""
+	systemd ignores a relative or unnormalized path in RequiresMountsFor= with a warning, so each path is
+	made absolute and normalized as text ('.', '..', '//' and a trailing '/'). The file system is not
+	touched: symlinks are not followed (systemd follows none either, and one inside a remote share would
+	lead off it), and a hung NFS mount or an automount point can't stall or trigger anything. The work is
+	done on the path's bytes, so the locale doesn't matter. A newline or carriage return can't be written
+	in any form systemd reads back, and systemd rejects a path that is not UTF-8, so those are refused,
+	before anything is installed."""
 	result = []
 	for path in paths or []:
 		if not path:
 			continue
-		if '\n' in path or '\r' in path:
-			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
-							  'which systemd cannot read back from a unit file: %r' % path)
 		try:
-			real = os.path.realpath(os.fsencode(path))
+			raw = os.path.abspath(os.fsencode(path))
 		except OSError as exc:  # a relative path, and the current directory is gone
-			raise ConfigError('--requires-mounts-for cannot resolve %r: %s' % (path, exc))
+			raise ConfigError('--requires-mounts-for cannot make %r absolute: %s' % (path, exc))
+		raw = b'/' + raw.lstrip(b'/')  # POSIX normpath keeps a leading '//'; systemd does not accept it
+		if b'\n' in raw or b'\r' in raw:
+			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
+							  'which systemd cannot read back from a unit file: %r' % os.fsdecode(raw))
 		try:
-			result.append(real.decode('utf-8'))
+			result.append(raw.decode('utf-8'))
 		except UnicodeError:
 			raise ConfigError('--requires-mounts-for cannot take a path that is not UTF-8, which systemd '
-							  'rejects: %r' % os.fsdecode(real))
+							  'rejects: %r' % os.fsdecode(raw))
 	return result
 
 
@@ -2542,7 +2544,7 @@ def build_parser():
 	svc.add_argument('--print-unit', action='store_true', help='Print the systemd unit that --install-service would write, then exit. Works without systemd.')
 	svc.add_argument('--uninstall-service', action='store_true', help='Disable and remove the systemd unit. Warns and exits if systemd is not available.')
 	parser.add_argument('--unit-name', type=str, default=DEFAULT_UNIT_NAME, help='systemd unit name (default: firewatcher).')
-	parser.add_argument('--requires-mounts-for', action='append', default=[], metavar='PATH', help='Add RequiresMountsFor= to the unit (repeatable). Use when -o is on NFS or another remote filesystem. The path is resolved as the kernel would (absolute, symlinks followed); one with a newline or not in UTF-8 is refused.')
+	parser.add_argument('--requires-mounts-for', action='append', default=[], metavar='PATH', help='Add RequiresMountsFor= to the unit (repeatable). Use when -o is on NFS or another remote filesystem. The path is made absolute and normalized (symlinks are not followed); one with a newline or not in UTF-8 is refused.')
 	parser.add_argument('--no-enable', action='store_true', help='With --install-service, write the unit and daemon-reload but do not enable or start it.')
 
 	parser.add_argument('--config', default=None, help='INI config file. Default: /etc/firewatcher/firewatcher.conf when that file exists. An explicit path must exist. CLI flags override the file.')
