@@ -570,7 +570,6 @@ def _systemd_reads(value):
 
 @pytest.mark.parametrize('path, line', [
     ('/mnt/logs/captured_messages', 'RequiresMountsFor=/mnt/logs/captured_messages'),
-    ('/mnt/logs/', 'RequiresMountsFor=/mnt/logs/'),
     ('/mnt/a$b', 'RequiresMountsFor=/mnt/a$b'),
     ('/mnt/a;b', 'RequiresMountsFor=/mnt/a;b'),
     ('/mnt/a#b', 'RequiresMountsFor=/mnt/a#b'),
@@ -587,6 +586,29 @@ def _systemd_reads(value):
 def test_requires_mounts_for_line_is_quoted_so_systemd_reads_the_path_back(path, line):
     assert _mounts_line(path) == [line]
     assert _systemd_reads(line.partition('=')[2]) == [path]
+
+
+def test_requires_mounts_for_paths_are_normalized():
+    # systemd ignores a path with '..' ("not normalized"); a trailing slash names the same mount.
+    assert _mounts_line('/mnt/nfs/../logs') == ['RequiresMountsFor=/mnt/logs']
+    assert _mounts_line('/mnt/logs/') == ['RequiresMountsFor=/mnt/logs']
+
+
+def test_requires_mounts_for_refuses_a_path_that_is_not_utf8():
+    path = b'/mnt/caf\xe9'.decode('utf-8', 'surrogateescape')
+    with pytest.raises(fw.ConfigError) as err:
+        fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', path, 'p.d']), environ={})
+    assert 'not UTF-8' in str(err.value)
+
+
+def test_requires_mounts_for_relative_path_with_the_current_directory_gone(monkeypatch):
+    def gone():
+        raise FileNotFoundError(2, 'No such file or directory')
+
+    monkeypatch.setattr(fw.os, 'getcwd', gone)
+    with pytest.raises(fw.ConfigError) as err:
+        fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', 'logs', 'p.d']), environ={})
+    assert 'cannot make' in str(err.value)
 
 
 def test_requires_mounts_for_keeps_each_path_a_separate_line_and_adds_remote_fs():

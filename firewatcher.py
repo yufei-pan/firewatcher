@@ -920,11 +920,12 @@ def resolve_settings(args, environ=None):
 
 
 def _mount_paths(paths):
-	"""The --requires-mounts-for paths for the unit: absolute, with empty ones dropped.
+	"""The --requires-mounts-for paths for the unit: absolute and normalized, with empty ones dropped.
 
-	systemd ignores a relative path in RequiresMountsFor= with a warning, so the dependency would silently
-	vanish; it is made absolute here. A newline or carriage return ends the line in a unit file and cannot
-	be written in any form systemd reads back, so the path is refused, before anything is installed."""
+	systemd ignores a relative or unnormalized path (one with '..') in RequiresMountsFor= with a warning,
+	so the dependency would silently vanish; abspath fixes both. A newline or carriage return ends the line
+	in a unit file and cannot be written in any form systemd reads back, and systemd rejects a path that is
+	not UTF-8, so those are refused, before anything is installed."""
 	result = []
 	for path in paths or []:
 		if not path:
@@ -932,7 +933,15 @@ def _mount_paths(paths):
 		if '\n' in path or '\r' in path:
 			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
 							  'which systemd cannot read back from a unit file: %r' % path)
-		result.append(path if path.startswith('/') else os.path.abspath(path))
+		try:
+			path.encode('utf-8')
+		except UnicodeError:
+			raise ConfigError('--requires-mounts-for cannot take a path that is not UTF-8, which systemd '
+							  'rejects: %r' % path)
+		try:
+			result.append(os.path.abspath(path))
+		except OSError as exc:  # a relative path, and the current directory is gone
+			raise ConfigError('--requires-mounts-for cannot make %r absolute: %s' % (path, exc))
 	return result
 
 
