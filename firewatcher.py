@@ -920,12 +920,14 @@ def resolve_settings(args, environ=None):
 
 
 def _mount_paths(paths):
-	"""The --requires-mounts-for paths for the unit: absolute and normalized, with empty ones dropped.
+	"""The --requires-mounts-for paths for the unit: absolute, with empty ones dropped.
 
-	systemd ignores a relative or unnormalized path (one with '..') in RequiresMountsFor= with a warning,
-	so the dependency would silently vanish; abspath fixes both. A newline or carriage return ends the line
-	in a unit file and cannot be written in any form systemd reads back, and systemd rejects a path that is
-	not UTF-8, so those are refused, before anything is installed."""
+	systemd ignores a relative or unnormalized path in RequiresMountsFor= with a warning, so the dependency
+	would silently vanish: a relative path is made absolute and '.' and a trailing '/' are dropped. A '..'
+	is refused instead of collapsed, since through a symlink it names a different directory than the text
+	suggests. A newline or carriage return can't be written in any form systemd reads back, and systemd
+	rejects a path that is not UTF-8, so those are refused too, before anything is installed. The path is
+	kept as its bytes decoded as UTF-8, which is what the unit file holds whatever the locale."""
 	result = []
 	for path in paths or []:
 		if not path:
@@ -934,10 +936,13 @@ def _mount_paths(paths):
 			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
 							  'which systemd cannot read back from a unit file: %r' % path)
 		try:
-			path.encode('utf-8')
+			path = os.fsencode(path).decode('utf-8')
 		except UnicodeError:
 			raise ConfigError('--requires-mounts-for cannot take a path that is not UTF-8, which systemd '
 							  'rejects: %r' % path)
+		if '..' in path.split('/'):
+			raise ConfigError("--requires-mounts-for needs the mount path without '..' (through a symlink it "
+							  'names another directory): %r' % path)
 		try:
 			result.append(os.path.abspath(path))
 		except OSError as exc:  # a relative path, and the current directory is gone

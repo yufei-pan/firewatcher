@@ -588,10 +588,14 @@ def test_requires_mounts_for_line_is_quoted_so_systemd_reads_the_path_back(path,
     assert _systemd_reads(line.partition('=')[2]) == [path]
 
 
-def test_requires_mounts_for_paths_are_normalized():
-    # systemd ignores a path with '..' ("not normalized"); a trailing slash names the same mount.
-    assert _mounts_line('/mnt/nfs/../logs') == ['RequiresMountsFor=/mnt/logs']
+def test_requires_mounts_for_paths_are_normalized_or_refused():
+    # A trailing slash or '.' names the same mount; '..' could cross a symlink, so it is refused.
     assert _mounts_line('/mnt/logs/') == ['RequiresMountsFor=/mnt/logs']
+    assert _mounts_line('/mnt/./logs') == ['RequiresMountsFor=/mnt/logs']
+    with pytest.raises(fw.ConfigError) as err:
+        fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', '/mnt/nfs/../logs', 'p.d']), environ={})
+    assert "without '..'" in str(err.value)
+    assert _mounts_line('/mnt/a..b') == ['RequiresMountsFor=/mnt/a..b']
 
 
 def test_requires_mounts_for_refuses_a_path_that_is_not_utf8():
