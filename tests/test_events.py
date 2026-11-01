@@ -319,3 +319,54 @@ def test_init_config_lists_events_keys(tmp_path):
     again = settings_from(tmp_path, path.read_text())
     assert again.events_url == 'https://hk.example/api/events'
     assert again.events_token == 'tok'
+
+
+def test_strip_userinfo():
+    assert fw._strip_userinfo('https://user:PASSSECRET@hk.example/api/events?x=1') == 'https://hk.example/api/events?x=1'
+    assert fw._strip_userinfo('http://user@127.0.0.1:8080/p') == 'http://127.0.0.1:8080/p'
+    assert fw._strip_userinfo('http://[::1]:8080/p@q') == 'http://[::1]:8080/p@q'
+    assert fw._strip_userinfo('http://u:p@w@host/x') == 'http://host/x'
+    assert fw._strip_userinfo('https://hk.example/api/events') == 'https://hk.example/api/events'
+
+
+def test_userinfo_without_port_leaks_nowhere(tmp_path, server, capsys, records):
+    # no port in the URL: http.client used to quote the whole netloc, password included, in its error
+    ntfy = server()
+    settings = settings_from(tmp_path, conf('https://user:PASSSECRET@127.0.0.1/api/events', ntfy.url('/topic'), timeout=1))
+    dispatcher(settings)._process(incident())
+    assert len(ntfy.requests) == 1
+    # ntfy alone, and the shared request helper that the LLM URL uses
+    settings = settings_from(tmp_path, conf(ntfy_url='http://user:PASSSECRET@127.0.0.1/topic', timeout=1))
+    dispatcher(settings)._process(incident())
+    with pytest.raises(Exception) as caught:
+        fw._urlopen_bytes('http://user:PASSSECRET@127.0.0.1/v1/chat', b'{}', {}, 1)
+    shown = capsys.readouterr().out + '\n'.join(str(item) for item in records) + str(caught.value) + repr(caught.value)
+    assert 'event post failed' in shown and 'ntfy failed' in shown
+    assert 'PASSSECRET' not in shown
+
+
+def test_2xx_with_stalled_body_is_accepted(tmp_path, server, records):
+    stalled = socket.socket()
+    stalled.bind(('127.0.0.1', 0))
+    stalled.listen(5)
+    held = []
+
+    def serve():
+        conn, _ = stalled.accept()
+        held.append(conn)
+        conn.recv(65536)
+        conn.sendall(b'HTTP/1.1 202 Accepted\r\nContent-Length: 100\r\n\r\n')
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        ntfy = server()
+        settings = settings_from(tmp_path, conf('http://127.0.0.1:%d/api/events' % stalled.getsockname()[1], ntfy.url('/topic'), timeout=1))
+        dispatcher(settings)._process(incident())
+        assert ntfy.requests == []
+        assert any('event sent' in item[1] for item in records)
+        assert not any('event post failed' in item[1] for item in records)
+    finally:
+        for conn in held:
+            conn.close()
+        stalled.close()

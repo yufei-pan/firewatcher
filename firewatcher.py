@@ -1016,6 +1016,19 @@ def _url_origin(url):
 	return '%s://%s%s' % (parts.scheme, host, ':%d' % port if port else '')
 
 
+def _strip_userinfo(url):
+	"""url without any user name and password: http.client quotes the whole netloc in some errors, password included."""
+	from urllib.parse import urlsplit, urlunsplit
+	url = str(url)
+	try:
+		parts = urlsplit(url)
+	except ValueError:
+		return url
+	if '@' not in parts.netloc:
+		return url
+	return urlunsplit(parts._replace(netloc=parts.netloc.rsplit('@', 1)[1]))
+
+
 def _ini_patterns(paths):
 	paths = list(paths or [])
 	if not paths:
@@ -1115,8 +1128,8 @@ def render_config_text(settings):
 		'priority = %s' % int(settings.ntfy_priority),
 		'# HTTP timeout in seconds.',
 		'timeout = %s' % int(settings.ntfy_timeout),
-		'# Optional: POST each capture and its verdict as JSON to this http(s) URL (for example a housekeepd',
-		'# /api/events endpoint). While the POST succeeds nothing goes to ntfy; when it fails, the push is sent.',
+		'# Optional: an http(s) URL that receives each capture and its verdict as JSON. When the POST fails,',
+		'# firewatcher pushes to ntfy itself if the verdict says push. A user:password in the URL is not sent.',
 		'events_url = %s' % _ini_text(settings.events_url),
 		'# Optional secret sent as "Authorization: Bearer"; FIREWATCHER_EVENTS_TOKEN overrides this value.',
 		'events_token = %s' % _ini_text(settings.events_token),
@@ -1263,6 +1276,7 @@ def _urlopen_bytes(url, data, headers, timeout):
 	# and only LLM analysis and ntfy pushes need them.
 	import urllib.error
 	import urllib.request
+	url = _strip_userinfo(url)
 	request = urllib.request.Request(url, data=data, headers=headers, method='POST')
 	try:
 		with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1462,10 +1476,11 @@ def post_event(url, token, payload, timeout):
 	headers = {'Content-Type': 'application/json'}
 	if token:
 		headers['Authorization'] = 'Bearer ' + _http_header(token, 2000)
-	request = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+	request = urllib.request.Request(_strip_userinfo(url), data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
 	try:
-		with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
-			response.read(1)
+		# A 2xx status is the answer; the body is not read, so a stalled one cannot turn it into a failure.
+		with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout):
+			pass
 	except urllib.error.HTTPError as exc:
 		raise RuntimeError('HTTP %s from %s' % (getattr(exc, 'code', '?'), _url_origin(url)))
 	except Exception as exc:
