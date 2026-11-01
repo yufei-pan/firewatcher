@@ -329,11 +329,14 @@ def test_strip_userinfo():
     assert fw._strip_userinfo('https://hk.example/api/events') == 'https://hk.example/api/events'
 
 
-def test_strip_userinfo_never_raises_and_covers_fullwidth():
+def test_strip_userinfo_never_raises():
     pw = 'ab\uff1aPASSSECRET'  # fullwidth colon
     assert fw._strip_userinfo('http://user:%s@127.0.0.1/x?' % pw) == 'http://127.0.0.1/x?'
     assert fw._strip_userinfo('http://user:ab\uff20PASSSECRET@127.0.0.1:81/x') == 'http://127.0.0.1:81/x'
-    assert fw._strip_userinfo('http://user:PASSSECRET\uff20127.0.0.1/x') == 'http://127.0.0.1/x'
+    # a fullwidth '@' alone is not a separator; the URL is refused at config time and has no origin
+    url = 'http://user:PASSSECRET\uff20127.0.0.1/x'
+    assert fw._strip_userinfo(url) == url
+    assert not fw._is_http_url(url) and fw._url_origin(url) == '(invalid URL)'
     assert fw._strip_userinfo('HTTP://u:p@Host#frag@x') == 'HTTP://Host#frag@x'
     assert fw._strip_userinfo('not a url') == 'not a url'
     assert fw._strip_userinfo('') == ''
@@ -454,6 +457,64 @@ def test_userinfo_with_a_later_at_refused(tmp_path, capsys, records):
     for good in ('http://user:pw@127.0.0.1:81/e', 'http://h/p@x', 'http://h/p?q=a@b#c@d', 'https://user:pw@ntfy.example/topic'):
         assert settings_from(tmp_path, '[notify]\nevents_url = %s\n' % good).events_url == good
     assert fw._strip_userinfo('http://user:pw@127.0.0.1:81/e') == 'http://127.0.0.1:81/e'
+    out = capsys.readouterr()
+    logged = out.out + out.err + '\n'.join(str(item) for item in records)
+    for part in ('HIDDENPART', 'hiddenpart', 'REST'):
+        assert part not in logged
+
+
+def test_authority_checked_by_our_own_pattern(tmp_path, capsys, records):
+    # A '[' ... ']' inside a password, before its first '/', '?' or '#': Python 3.8 and older took the host from inside
+    # the brackets. Our own check refuses the same on every Python.
+    for rest in ('[HIDDENPART]/REST', 'x[HIDDENPART]x?REST', '][HIDDENPART#REST', '[v1.HIDDENPART]/REST'):
+        url = 'http://usr:%s@127.0.0.1/e' % rest
+        cases = [
+            ('[notify]\nevents_url = %s\n' % url, 'events_url', 'events_token'),
+            ('[notify]\nenabled = true\nntfy_url = %s\n' % url, 'ntfy_url', 'token'),
+            ('[llm]\nenabled = true\nmodel = m\nbase_url = %s\n' % url, 'base_url', 'api_key'),
+        ]
+        for text, key, hint in cases:
+            with pytest.raises(fw.ConfigError) as caught:
+                settings_from(tmp_path, text)
+            assert key in str(caught.value) and hint in str(caught.value)
+            for part in ('HIDDENPART', 'hiddenpart', 'REST'):
+                assert part not in str(caught.value) + repr(caught.value)
+        assert fw._url_origin(url) == '(invalid URL)'
+    # Accepted, with the origin built from the checked server part only
+    for url, origin in (
+        ('http://127.0.0.1:81/e', 'http://127.0.0.1:81'),
+        ('https://[::1]:8443/e', 'https://[::1]:8443'),
+        ('http://[::1]/e', 'http://[::1]'),
+        ('http://[fe80::1%25eth0]:81/e', 'http://[fe80::1%25eth0]:81'),
+        ('http://[fe80::1%eth0]:81/e', 'http://[fe80::1%eth0]:81'),
+        ('http://[::ffff:127.0.0.1]/e', 'http://[::ffff:127.0.0.1]'),
+        ('http://u:p%40ss@h.example/e', 'http://h.example'),
+        ('http://u:p%40ss@h.example:81/e', 'http://h.example:81'),
+        ('HTTP://H.EXAMPLE/x', 'http://h.example'),
+        ('HTTPS://H.EXAMPLE:8443/x', 'https://h.example:8443'),
+        ('http://h.example:/x', 'http://h.example'),
+        ('http://h.example:080/x', 'http://h.example:80'),
+        ('http://h.example', 'http://h.example'),
+        ('http://h.example?x=1', 'http://h.example'),
+        ('http://bücher.example/', 'http://bücher.example'),
+        ('http://user:pw@127.0.0.1:81/e', 'http://127.0.0.1:81'),
+        ('https://user:pass@ntfy.example/topic', 'https://ntfy.example'),
+        ('https://h.example/@cf/x', 'https://h.example'),
+        ('http://h/p?q=a@b#c@d', 'http://h'),
+    ):
+        assert fw._is_http_url(url), url
+        assert fw._url_origin(url) == origin
+        assert settings_from(tmp_path, '[notify]\nevents_url = %s\n' % url).events_url == url
+    # Refused: a server part that is not a name or a bracketed IPv6 address, then up to 5 ASCII digits of port
+    for url in ('http://u%3Aab/REST@127.0.0.1/e', 'http://:8080/x', 'http:///x', 'http://h.example:+80/',
+                'http://[127.0.0.1]:80/', 'http://[v1.abc]/', 'http://h.example:٨٠/', 'http://h.example:８０/',
+                'http://h.example:99999/', 'http://h.example:123456/', 'http://h.example:1:2/', 'http://h：80/',
+                'http://h[x]/', 'http://[::1]x/', 'http://[::1%]/'):
+        assert not fw._is_http_url(url), url
+        assert fw._url_origin(url) == '(invalid URL)'
+        with pytest.raises(fw.ConfigError) as caught:
+            settings_from(tmp_path, '[notify]\nevents_url = %s\n' % url)
+        assert 'events_url' in str(caught.value) and 'REST' not in str(caught.value)
     out = capsys.readouterr()
     logged = out.out + out.err + '\n'.join(str(item) for item in records)
     for part in ('HIDDENPART', 'hiddenpart', 'REST'):

@@ -996,62 +996,68 @@ def validate_settings(settings):
 		raise ConfigError('watch.resume_max must be 0 to %d seconds: %s' % (30 * 86400, settings.resume_max))
 
 
+# The server part of an http(s) URL, after any user:password, as firewatcher accepts it: a bracketed IPv6 address
+# (with an optional %zone or %25zone) or a name with no '/', '?', '#', '@', '[', ']', ':' or '%' (so IDN names pass),
+# then an optional ':' with up to 5 ASCII digits. Our own pattern, because urlsplit's leniency differs between Python
+# versions, and whatever it reads as the host is logged: a password could end up there.
+_URL_AUTHORITY = re.compile(r'(\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(?:%(?:25)?[A-Za-z0-9._~-]+)?\]|[^/?#@\[\]:%]+)(?::([0-9]{0,5}))?\Z')
+
+
 def _is_http_url(url):
+	"""The match of url's server part (group 1 the host, group 2 the port) when url is an http(s) URL firewatcher can use, else None."""
 	# urllib quotes a URL with whitespace or control characters in its error, topic and all.
 	url = str(url)
 	if not url.lower().startswith(('http://', 'https://')) or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
-		return False
-	# What a request would use: user:password is not sent. A '/', '?' or '#' inside a password ends the host early and leaves
-	# a "port" that is part of the password, which http.client would then quote in its error.
-	# With user:password, a later '@' means the password itself held an '@' before a '/', '?' or '#': the text between
-	# them would become the host, and the host is logged. Without user:password, an '@' in the path is fine.
+		return None
+	# What a request would use: user:password is not sent. With user:password, a later '@' (or one in another script)
+	# means the password itself held an '@' before a '/', '?' or '#': the text between them would become the host,
+	# and the host is logged. Without user:password, an '@' in the path is fine.
 	stripped = _strip_userinfo(url)
-	if stripped != url and any(ch == '@' or (ord(ch) > 127 and '@' in unicodedata.normalize('NFKC', ch)) for ch in stripped):
-		return False
-	from urllib.parse import urlsplit
-	try:
-		parts = urlsplit(stripped)
-		parts.port
-	except ValueError:
-		return False
-	return bool(parts.hostname)
+	if stripped != url and '@' in unicodedata.normalize('NFKC', stripped):
+		return None
+	start, end = _authority_span(stripped)
+	authority = stripped[start:end]
+	# It must split the same way after Unicode normalization, which urllib applies too: a fullwidth '@' or ':' in the
+	# host is refused like the real one.
+	match = _URL_AUTHORITY.match(authority)
+	normal = _URL_AUTHORITY.match(unicodedata.normalize('NFKC', authority))
+	if not match or not normal or normal.group(2) != match.group(2) or int(match.group(2) or 0) > 65535:
+		return None
+	return match
 
 
 def _url_origin(url):
-	"""scheme://host[:port] of url, without credentials, path, or query: an ntfy topic in the path works like a password."""
-	from urllib.parse import urlsplit
-	try:
-		parts = urlsplit(_strip_userinfo(url))
-		host = parts.hostname or ''
-		port = parts.port
-	except ValueError:
+	"""scheme://host[:port] of url, without credentials, path, or query: an ntfy topic in the path works like a password.
+
+	Built only from the server part that _is_http_url accepted, never from what urlsplit would make of the URL."""
+	match = _is_http_url(url)
+	if not match:
 		return '(invalid URL)'
-	if ':' in host:
-		host = '[%s]' % host
-	return '%s://%s%s' % (parts.scheme, host, ':%d' % port if port else '')
+	port = int(match.group(2) or 0)
+	return '%s://%s%s' % (str(url).split(':', 1)[0].lower(), match.group(1).lower(), ':%d' % port if port else '')
 
 
-def _strip_userinfo(url):
-	"""url without any user name and password: urllib and http.client quote the whole netloc in some errors, password included.
-
-	Plain string splitting, so it never raises and leaves the rest of the URL byte for byte as it was. A
-	character that Unicode normalization turns into '@' (fullwidth, for one) counts as '@' too, since
-	urllib refuses such a netloc and quotes it."""
-	url = str(url)
+def _authority_span(url):
+	"""(start, end) of url's authority: the text after '//' up to the first '/', '?' or '#'. Empty, (0, 0), without '//'."""
 	start = url.find('//')
 	if start < 0:
-		return url
+		return 0, 0
 	start += 2
 	end = len(url)
 	for mark in '/?#':
 		found = url.find(mark, start)
 		if 0 <= found < end:
 			end = found
-	at = -1
-	for index in range(start, end):
-		char = url[index]
-		if char == '@' or (ord(char) > 127 and '@' in unicodedata.normalize('NFKC', char)):
-			at = index
+	return start, end
+
+
+def _strip_userinfo(url):
+	"""url without any user name and password: urllib and http.client quote the whole netloc in some errors, password included.
+
+	Plain string splitting, so it never raises and leaves the rest of the URL byte for byte as it was."""
+	url = str(url)
+	start, end = _authority_span(url)
+	at = url.rfind('@', start, end)
 	if at < 0:
 		return url
 	return url[:start] + url[at + 1:]
