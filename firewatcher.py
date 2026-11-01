@@ -964,11 +964,11 @@ def validate_settings(settings):
 		raise ConfigError('notifications require an ntfy topic URL (--ntfy-url, or notify.ntfy_url in the config)')
 	# The URLs stay out of these messages: an ntfy topic works like a password.
 	if settings.llm_enabled and not _is_http_url(settings.llm_base_url):
-		raise ConfigError('llm.base_url must be an http:// or https:// URL without spaces')
+		raise ConfigError('llm.base_url must be an http:// or https:// URL without spaces, with a valid host and port (user:password in a URL is not supported; use api_key)')
 	if settings.notify_enabled and not _is_http_url(settings.ntfy_url):
-		raise ConfigError('notify.ntfy_url must be an http:// or https:// URL without spaces')
+		raise ConfigError('notify.ntfy_url must be an http:// or https:// URL without spaces, with a valid host and port (user:password in a URL is not supported; use token)')
 	if settings.events_url and not _is_http_url(settings.events_url):
-		raise ConfigError('notify.events_url must be an http:// or https:// URL without spaces')
+		raise ConfigError('notify.events_url must be an http:// or https:// URL without spaces, with a valid host and port (user:password in a URL is not supported; use events_token)')
 	for key, label in (('capture_time', 'watch.capture_time'), ('capture_time_max', 'watch.capture_time_max'),
 					   ('capture_line_count_max', 'watch.capture_line_count_max'),
 					   ('compress_after_months', 'watch.compress_after_months'),
@@ -999,14 +999,24 @@ def validate_settings(settings):
 def _is_http_url(url):
 	# urllib quotes a URL with whitespace or control characters in its error, topic and all.
 	url = str(url)
-	return url.lower().startswith(('http://', 'https://')) and not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url)
+	if not url.lower().startswith(('http://', 'https://')) or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
+		return False
+	# What a request would use: user:password is not sent. A '/', '?' or '#' inside a password ends the host early and leaves
+	# a "port" that is part of the password, which http.client would then quote in its error.
+	from urllib.parse import urlsplit
+	try:
+		parts = urlsplit(_strip_userinfo(url))
+		parts.port
+	except ValueError:
+		return False
+	return bool(parts.hostname)
 
 
 def _url_origin(url):
 	"""scheme://host[:port] of url, without credentials, path, or query: an ntfy topic in the path works like a password."""
 	from urllib.parse import urlsplit
 	try:
-		parts = urlsplit(str(url))
+		parts = urlsplit(_strip_userinfo(url))
 		host = parts.hostname or ''
 		port = parts.port
 	except ValueError:

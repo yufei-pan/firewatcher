@@ -77,7 +77,7 @@ def records(monkeypatch):
 
 def settings_from(tmp_path, text, environ=None):
     conf = tmp_path / 'events.conf'
-    conf.write_text(text)
+    conf.write_text(text, encoding='utf-8')
     return fw.resolve_settings(fw.build_parser().parse_args(['--config', str(conf), 'p.txt']), environ=environ or {})
 
 
@@ -401,3 +401,34 @@ def test_2xx_with_stalled_body_is_accepted(tmp_path, server, records):
         for conn in held:
             conn.close()
         stalled.close()
+
+
+def test_unparseable_urls_refused_at_config_time(tmp_path, capsys, records):
+    for mark in ('/', '?', '#'):
+        url = 'http://user:pa%sPASSSECRET@127.0.0.1/e' % mark
+        cases = [
+            ('[notify]\nevents_url = %s\n' % url, 'events_url', 'events_token'),
+            ('[notify]\nenabled = true\nntfy_url = %s\n' % url, 'ntfy_url', 'token'),
+            ('[llm]\nenabled = true\nmodel = m\nbase_url = %s\n' % url, 'base_url', 'api_key'),
+        ]
+        for text, key, hint in cases:
+            with pytest.raises(fw.ConfigError) as caught:
+                settings_from(tmp_path, text)
+            assert key in str(caught.value) and hint in str(caught.value)
+            assert 'PASSSECRET' not in str(caught.value) + repr(caught.value)
+    # an empty host, a bad port
+    for bad in ('http:///x', 'http://host:99999/x', 'http://host:abc/x', 'http://user:pw@/x'):
+        with pytest.raises(fw.ConfigError) as caught:
+            settings_from(tmp_path, '[notify]\nevents_url = %s\n' % bad)
+        assert 'events_url' in str(caught.value)
+    # URLs that work still pass
+    for good in ('http://user:pw@127.0.0.1:81/e', 'https://[::1]:8443/e', 'http://u:12/e@h/x'):
+        assert settings_from(tmp_path, '[notify]\nevents_url = %s\n' % good).events_url == good
+    out = capsys.readouterr()
+    assert 'PASSSECRET' not in out.out + out.err + '\n'.join(str(item) for item in records)
+
+
+def test_url_origin_strips_userinfo_first():
+    assert fw._url_origin('https://user:ab\uff1aPW@host.example:8443/p?q') == 'https://host.example:8443'
+    assert fw._url_origin('https://user:ab\uff20PW@host.example/p') == 'https://host.example'
+    assert fw._url_origin('https://user:pw@[::1]:81/p') == 'https://[::1]:81'
