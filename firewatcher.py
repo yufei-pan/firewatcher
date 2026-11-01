@@ -1003,9 +1003,14 @@ def _is_http_url(url):
 		return False
 	# What a request would use: user:password is not sent. A '/', '?' or '#' inside a password ends the host early and leaves
 	# a "port" that is part of the password, which http.client would then quote in its error.
+	# With user:password, a later '@' means the password itself held an '@' before a '/', '?' or '#': the text between
+	# them would become the host, and the host is logged. Without user:password, an '@' in the path is fine.
+	stripped = _strip_userinfo(url)
+	if stripped != url and any(ch == '@' or (ord(ch) > 127 and '@' in unicodedata.normalize('NFKC', ch)) for ch in stripped):
+		return False
 	from urllib.parse import urlsplit
 	try:
-		parts = urlsplit(_strip_userinfo(url))
+		parts = urlsplit(stripped)
 		parts.port
 	except ValueError:
 		return False

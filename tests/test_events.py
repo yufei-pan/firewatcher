@@ -432,3 +432,29 @@ def test_url_origin_strips_userinfo_first():
     assert fw._url_origin('https://user:ab\uff1aPW@host.example:8443/p?q') == 'https://host.example:8443'
     assert fw._url_origin('https://user:ab\uff20PW@host.example/p') == 'https://host.example'
     assert fw._url_origin('https://user:pw@[::1]:81/p') == 'https://[::1]:81'
+
+
+def test_userinfo_with_a_later_at_refused(tmp_path, capsys, records):
+    # The password held an '@' before a '/', '?' or '#': the text between them would be logged as the host.
+    for mark in ('/', '?', '#'):
+        for at in ('@', '＠'):
+            url = 'http://u:ab@HIDDENPART%sREST%s127.0.0.1/e' % (mark, at)
+            cases = [
+                ('[notify]\nevents_url = %s\n' % url, 'events_url', 'events_token'),
+                ('[notify]\nenabled = true\nntfy_url = %s\n' % url, 'ntfy_url', 'token'),
+                ('[llm]\nenabled = true\nmodel = m\nbase_url = %s\n' % url, 'base_url', 'api_key'),
+            ]
+            for text, key, hint in cases:
+                with pytest.raises(fw.ConfigError) as caught:
+                    settings_from(tmp_path, text)
+                assert key in str(caught.value) and hint in str(caught.value)
+                for part in ('HIDDENPART', 'hiddenpart', 'REST', 'ab@'):
+                    assert part not in str(caught.value) + repr(caught.value)
+    # user:password and no later '@' is stripped and accepted; an '@' in the path without user:password is fine
+    for good in ('http://user:pw@127.0.0.1:81/e', 'http://h/p@x', 'http://h/p?q=a@b#c@d', 'https://user:pw@ntfy.example/topic'):
+        assert settings_from(tmp_path, '[notify]\nevents_url = %s\n' % good).events_url == good
+    assert fw._strip_userinfo('http://user:pw@127.0.0.1:81/e') == 'http://127.0.0.1:81/e'
+    out = capsys.readouterr()
+    logged = out.out + out.err + '\n'.join(str(item) for item in records)
+    for part in ('HIDDENPART', 'hiddenpart', 'REST'):
+        assert part not in logged
