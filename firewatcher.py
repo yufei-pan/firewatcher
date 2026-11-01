@@ -1017,16 +1017,29 @@ def _url_origin(url):
 
 
 def _strip_userinfo(url):
-	"""url without any user name and password: http.client quotes the whole netloc in some errors, password included."""
-	from urllib.parse import urlsplit, urlunsplit
+	"""url without any user name and password: urllib and http.client quote the whole netloc in some errors, password included.
+
+	Plain string splitting, so it never raises and leaves the rest of the URL byte for byte as it was. A
+	character that Unicode normalization turns into '@' (fullwidth, for one) counts as '@' too, since
+	urllib refuses such a netloc and quotes it."""
 	url = str(url)
-	try:
-		parts = urlsplit(url)
-	except ValueError:
+	start = url.find('//')
+	if start < 0:
 		return url
-	if '@' not in parts.netloc:
+	start += 2
+	end = len(url)
+	for mark in '/?#':
+		found = url.find(mark, start)
+		if 0 <= found < end:
+			end = found
+	at = -1
+	for index in range(start, end):
+		char = url[index]
+		if char == '@' or (ord(char) > 127 and '@' in unicodedata.normalize('NFKC', char)):
+			at = index
+	if at < 0:
 		return url
-	return urlunsplit(parts._replace(netloc=parts.netloc.rsplit('@', 1)[1]))
+	return url[:start] + url[at + 1:]
 
 
 def _ini_patterns(paths):

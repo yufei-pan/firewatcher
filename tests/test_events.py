@@ -329,20 +329,51 @@ def test_strip_userinfo():
     assert fw._strip_userinfo('https://hk.example/api/events') == 'https://hk.example/api/events'
 
 
-def test_userinfo_without_port_leaks_nowhere(tmp_path, server, capsys, records):
-    # no port in the URL: http.client used to quote the whole netloc, password included, in its error
-    ntfy = server()
-    settings = settings_from(tmp_path, conf('https://user:PASSSECRET@127.0.0.1/api/events', ntfy.url('/topic'), timeout=1))
-    dispatcher(settings)._process(incident())
-    assert len(ntfy.requests) == 1
-    # ntfy alone, and the shared request helper that the LLM URL uses
-    settings = settings_from(tmp_path, conf(ntfy_url='http://user:PASSSECRET@127.0.0.1/topic', timeout=1))
-    dispatcher(settings)._process(incident())
-    with pytest.raises(Exception) as caught:
-        fw._urlopen_bytes('http://user:PASSSECRET@127.0.0.1/v1/chat', b'{}', {}, 1)
-    shown = capsys.readouterr().out + '\n'.join(str(item) for item in records) + str(caught.value) + repr(caught.value)
-    assert 'event post failed' in shown and 'ntfy failed' in shown
+def test_strip_userinfo_never_raises_and_covers_fullwidth():
+    pw = 'ab\uff1aPASSSECRET'  # fullwidth colon
+    assert fw._strip_userinfo('http://user:%s@127.0.0.1/x?' % pw) == 'http://127.0.0.1/x?'
+    assert fw._strip_userinfo('http://user:ab\uff20PASSSECRET@127.0.0.1:81/x') == 'http://127.0.0.1:81/x'
+    assert fw._strip_userinfo('http://user:PASSSECRET\uff20127.0.0.1/x') == 'http://127.0.0.1/x'
+    assert fw._strip_userinfo('HTTP://u:p@Host#frag@x') == 'HTTP://Host#frag@x'
+    assert fw._strip_userinfo('not a url') == 'not a url'
+    assert fw._strip_userinfo('') == ''
+
+
+def test_userinfo_without_port_leaks_nowhere(tmp_path, server, capsys, records, monkeypatch):
+    import http.client
+    # No port in the URLs: the default ports are pointed at fake servers, so nothing else is contacted.
+    events, ntfy, llm = server(), server(), server()
+    monkeypatch.setattr(http.client.HTTPConnection, 'default_port', events.port)
+    monkeypatch.setattr(http.client.HTTPSConnection, 'default_port', events.port)
+    shown = ''
+    for password in ('PASSSECRET', 'ab\uff1aPASSSECRET', 'ab\uff20PASSSECRET'):
+        monkeypatch.setattr(http.client.HTTPConnection, 'default_port', events.port)
+        settings = settings_from(tmp_path, conf('http://user:%s@127.0.0.1/api/events' % password, 'http://127.0.0.1:%d/topic' % ntfy.port, timeout=1))
+        dispatcher(settings)._process(incident())
+        # ntfy alone
+        monkeypatch.setattr(http.client.HTTPConnection, 'default_port', ntfy.port)
+        settings = settings_from(tmp_path, conf(ntfy_url='http://user:%s@127.0.0.1/topic' % password, timeout=1))
+        dispatcher(settings)._process(incident())
+        # the shared request helper, which the LLM URL goes through
+        monkeypatch.setattr(http.client.HTTPConnection, 'default_port', llm.port)
+        fw._urlopen_bytes('http://user:%s@127.0.0.1/v1/chat' % password, b'{}', {}, 1)
+        shown += capsys.readouterr().out + '\n'.join(str(item) for item in records)
+        del records[:]
+    # the stripped requests arrived, each on the right fake server
+    assert [r['path'] for r in events.requests] == ['/api/events'] * 3
+    assert [r['path'] for r in ntfy.requests] == ['/topic'] * 3
+    assert [r['path'] for r in llm.requests] == ['/v1/chat'] * 3
+    assert 'event sent' in shown and 'notification sent' in shown
     assert 'PASSSECRET' not in shown
+    # a refused connection quotes no password either
+    probe = socket.socket()
+    probe.bind(('127.0.0.1', 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+    for password in ('PASSSECRET', 'ab\uff1aPASSSECRET', 'ab\uff20PASSSECRET'):
+        with pytest.raises(Exception) as caught:
+            fw._urlopen_bytes('http://user:%s@127.0.0.1:%d/v1/chat' % (password, dead_port), b'{}', {}, 1)
+        assert 'PASSSECRET' not in str(caught.value) + repr(caught.value)
 
 
 def test_2xx_with_stalled_body_is_accepted(tmp_path, server, records):
