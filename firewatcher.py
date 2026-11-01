@@ -113,6 +113,7 @@ EXCERPT_MARKER_BYTES = len(b'[... %d bytes skipped ...]\n' % (2 ** 64))
 JOURNAL_LINE_MAX = 8000
 LLM_API_KEY_ENV = 'FIREWATCHER_LLM_API_KEY'
 NTFY_TOKEN_ENV = 'FIREWATCHER_NTFY_TOKEN'
+EVENTS_TOKEN_ENV = 'FIREWATCHER_EVENTS_TOKEN'
 LLM_SYSTEM_PROMPT = (
 	'You analyze one firewatcher incident capture from a Linux host. '
 	'You receive a matched pattern and an excerpt of surrounding logs. '
@@ -679,6 +680,8 @@ class Settings(object):
 		self.ntfy_token = ''
 		self.ntfy_priority = 4
 		self.ntfy_timeout = 10
+		self.events_url = ''
+		self.events_token = ''
 		self.always_notify = []
 		self.unit_name = DEFAULT_UNIT_NAME
 		self.no_enable = False
@@ -789,6 +792,8 @@ def _read_config_file(path):
 	take('notify', 'token', 'ntfy_token', 'str')
 	take('notify', 'priority', 'ntfy_priority', 'int')
 	take('notify', 'timeout', 'ntfy_timeout', 'int')
+	take('notify', 'events_url', 'events_url', 'str')
+	take('notify', 'events_token', 'events_token', 'str')
 	take('notify', 'always_notify', 'always_notify', 'patterns')
 	return values
 
@@ -845,7 +850,7 @@ def resolve_settings(args, environ=None):
 		settings.always_notify = list(file_values['always_notify'])
 	if file_values.get('tail_lines'):
 		settings.tail_lines = file_values['tail_lines']
-	for key in ('llm_base_url', 'llm_model', 'llm_api_key', 'llm_notes', 'ntfy_url', 'ntfy_token'):
+	for key in ('llm_base_url', 'llm_model', 'llm_api_key', 'llm_notes', 'ntfy_url', 'ntfy_token', 'events_url', 'events_token'):
 		if key in file_values:
 			setattr(settings, key, file_values[key])
 	if getattr(args, 'pattern_file', None):
@@ -908,10 +913,13 @@ def resolve_settings(args, environ=None):
 		settings.llm_api_key = environ[LLM_API_KEY_ENV]
 	if NTFY_TOKEN_ENV in environ:
 		settings.ntfy_token = environ[NTFY_TOKEN_ENV]
+	if EVENTS_TOKEN_ENV in environ:
+		settings.events_token = environ[EVENTS_TOKEN_ENV]
 	settings.llm_base_url = (settings.llm_base_url or '').strip()
 	settings.llm_model = (settings.llm_model or '').strip()
 	settings.llm_notes = _note_text(settings.llm_notes)
 	settings.ntfy_url = (settings.ntfy_url or '').strip()
+	settings.events_url = (settings.events_url or '').strip()
 	settings.unit_name = getattr(args, 'unit_name', None) or DEFAULT_UNIT_NAME
 	settings.no_enable = bool(getattr(args, 'no_enable', False))
 	settings.requires_mounts_for = _mount_paths(getattr(args, 'requires_mounts_for', None))
@@ -959,6 +967,8 @@ def validate_settings(settings):
 		raise ConfigError('llm.base_url must be an http:// or https:// URL without spaces')
 	if settings.notify_enabled and not _is_http_url(settings.ntfy_url):
 		raise ConfigError('notify.ntfy_url must be an http:// or https:// URL without spaces')
+	if settings.events_url and not _is_http_url(settings.events_url):
+		raise ConfigError('notify.events_url must be an http:// or https:// URL without spaces')
 	for key, label in (('capture_time', 'watch.capture_time'), ('capture_time_max', 'watch.capture_time_max'),
 					   ('capture_line_count_max', 'watch.capture_line_count_max'),
 					   ('compress_after_months', 'watch.compress_after_months'),
@@ -1105,6 +1115,11 @@ def render_config_text(settings):
 		'priority = %s' % int(settings.ntfy_priority),
 		'# HTTP timeout in seconds.',
 		'timeout = %s' % int(settings.ntfy_timeout),
+		'# Optional: POST each capture and its verdict as JSON to this http(s) URL (for example a housekeepd',
+		'# /api/events endpoint). While the POST succeeds nothing goes to ntfy; when it fails, the push is sent.',
+		'events_url = %s' % _ini_text(settings.events_url),
+		'# Optional secret sent as "Authorization: Bearer"; FIREWATCHER_EVENTS_TOKEN overrides this value.',
+		'events_token = %s' % _ini_text(settings.events_token),
 		'# Pattern files or directories. A capture whose matched lines match one of these is pushed',
 		'# even when the LLM says not to notify. Blank: the LLM decides for every capture.',
 		'always_notify = %s' % _ini_patterns(settings.always_notify),
@@ -1432,6 +1447,34 @@ def send_ntfy(url, title, body, priority, token, timeout):
 	_urlopen_bytes(url, body.encode('utf-8'), headers, timeout)
 
 
+def post_event(url, token, payload, timeout):
+	"""POST payload as JSON; raises RuntimeError unless the answer is 2xx. A redirect is a failure, not followed.
+
+	The reason never holds the URL (beyond its origin) or the token."""
+	import json
+	import urllib.error
+	import urllib.request
+
+	class NoRedirect(urllib.request.HTTPRedirectHandler):
+		def redirect_request(self, *args, **kwargs):
+			return None
+
+	headers = {'Content-Type': 'application/json'}
+	if token:
+		headers['Authorization'] = 'Bearer ' + _http_header(token, 2000)
+	request = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+	try:
+		with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
+			response.read(1)
+	except urllib.error.HTTPError as exc:
+		raise RuntimeError('HTTP %s from %s' % (getattr(exc, 'code', '?'), _url_origin(url)))
+	except Exception as exc:
+		reason = str(getattr(exc, 'reason', None) or exc) or type(exc).__name__
+		if token:
+			reason = reason.replace(token, '***')
+		raise RuntimeError('%s (%s)' % (reason, _url_origin(url)))
+
+
 def _append_note(path, text):
 	rows = str(text).splitlines() or ['']
 	with open(path, 'a', encoding='utf-8') as handle:
@@ -1490,6 +1533,8 @@ class IncidentDispatcher(object):
 		except queue.Full:
 			pass
 		timeout = float(self.settings.llm_timeout) + float(self.settings.ntfy_timeout)
+		if self.settings.events_url:
+			timeout += float(self.settings.ntfy_timeout)  # a failed POST, then the ntfy push
 		self.thread.join(timeout)
 
 	def _run(self):
@@ -1510,12 +1555,11 @@ class IncidentDispatcher(object):
 
 	def _overflow(self, incident):
 		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full', status='analysis skipped, queue full')
-		if not self.settings.notify_enabled:
-			return
-		self._push(incident, _programmatic_title(incident.get('hostname', ''), incident.get('pattern', '')), incident.get('matched_line') or '', OVERFLOW_NOTIFY_TIMEOUT)
+		self._deliver(incident, True, _programmatic_title(incident.get('hostname', ''), incident.get('pattern', '')), incident.get('matched_line') or '', None, OVERFLOW_NOTIFY_TIMEOUT)
 
 	def _process(self, incident):
 		should_push = True
+		model_notify = None  # the model's own verdict; None when it gave none
 		title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
 		body_source = incident.get('matched_line') or ''
 		# No path: the capture could not be written anywhere, so there is nothing for the model to read.
@@ -1532,6 +1576,7 @@ class IncidentDispatcher(object):
 					status='analysis title=%s model_notify=%s%s' % (result['title'][:80], decision, ' always_notify=yes' if forced else ''),
 				)
 				should_push = result['notify'] or forced
+				model_notify = result['notify']
 				if incident.get('always_notify'):
 					# Log text can steer the model's title and summary too, so the push leads with the line that matched.
 					body_source = incident.get('always_notify_line') or body_source
@@ -1548,11 +1593,43 @@ class IncidentDispatcher(object):
 					pass
 				_journal(syslog.LOG_ERR, 'LLM analysis failed: %s' % exc, status='LLM analysis failed')
 				should_push = True
+				model_notify = None
 				title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
 				body_source = incident.get('matched_line') or ''
-		if not self.settings.notify_enabled or not should_push:
-			return
-		self._push(incident, title, body_source, self.settings.ntfy_timeout)
+		self._deliver(incident, should_push, title, body_source, model_notify, self.settings.ntfy_timeout)
+
+	def _deliver(self, incident, should_push, title, body_source, model_notify, timeout):
+		"""The verdict is known: tell the events service, and push to ntfy unless that took it."""
+		will_push = should_push and self.settings.notify_enabled
+		if self.settings.events_url:
+			failure = self._post_event(incident, should_push, title, body_source, model_notify, timeout)
+			if failure is None:
+				return
+			_journal(syslog.LOG_ERR, 'event post failed: %s%s' % (failure, '; pushing to ntfy' if will_push else ''), status='event post failed')
+		if will_push:
+			self._push(incident, title, body_source, timeout)
+
+	def _post_event(self, incident, should_push, title, body_source, model_notify, timeout):
+		"""POST the capture and its verdict; None when accepted, else the reason it was not."""
+		payload = {
+			'source': 'firewatcher',
+			'version': version,
+			'host': incident.get('hostname', ''),
+			'pattern': incident.get('pattern', ''),
+			'title': title,
+			'body': _notify_body(body_source, incident.get('path') or 'capture not saved; see the firewatcher journal'),
+			'push': bool(should_push),
+			'always_notify': bool(incident.get('always_notify')),
+			'model_notify': model_notify,
+			'path': incident.get('path') or None,
+			'time': datetime.datetime.now().astimezone().isoformat(),
+		}
+		try:
+			post_event(self.settings.events_url, self.settings.events_token, payload, timeout)
+		except Exception as exc:
+			return _flatten(exc)
+		_journal(syslog.LOG_INFO, 'event sent title=%s' % title, status='event sent')
+		return None
 
 	def _push(self, incident, title, body_source, timeout):
 		body = _notify_body(body_source, incident.get('path') or 'capture not saved; see the firewatcher journal')
@@ -1567,7 +1644,7 @@ class IncidentDispatcher(object):
 def _start_dispatcher(settings):
 	if settings is None:
 		return None
-	if not settings.llm_enabled and not settings.notify_enabled:
+	if not settings.llm_enabled and not settings.notify_enabled and not settings.events_url:
 		return None
 	return IncidentDispatcher(settings)
 
@@ -2365,7 +2442,7 @@ def render_unit_file(args, executable=None, config_exists=None, raw=None):
 	]
 	for mount in requires:
 		lines.append('RequiresMountsFor=' + _quote_unit_path(mount))
-	stop_sec = max(30, int(resolved.llm_timeout) + int(resolved.ntfy_timeout) + 15)
+	stop_sec = max(30, int(resolved.llm_timeout) + int(resolved.ntfy_timeout) * (2 if resolved.events_url else 1) + 15)
 	lines.extend([
 		'',
 		'[Service]',
@@ -2905,6 +2982,8 @@ def _watch(resolved):
 	if resolved.notify_enabled:
 		# Not the topic: on a public ntfy server, whoever knows the topic URL can subscribe to it.
 		print(f"Notifications enabled ({_url_origin(resolved.ntfy_url)}, topic not shown).")
+	if resolved.events_url:
+		print(f"Sending captures to {_url_origin(resolved.events_url)}.")
 	if always_notify_patterns:
 		print(f"Always notify for patterns: {always_notify_patterns}")
 	previous_sigterm = signal.signal(signal.SIGTERM, _stop_on_sigterm)

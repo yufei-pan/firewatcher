@@ -180,14 +180,16 @@ enabled = false
 ntfy_url = https://ntfy.sh/firewatcher-myhost-REPLACE_ME
 priority = 4
 timeout = 10
+events_url =
+events_token =
 always_notify =
 ```
 
 `patterns` and `always_notify` are one path per line, or comma-separated. Positional pattern arguments replace the `patterns` list.
 
-Out-of-range values stop `firewatcher` at startup: a negative time or count, `capture_time` over 7 days or `capture_time_max` over 30 days, `min_free_percent` outside 0–50, `purge_interval` or `resume_max` over 30 days, `buffer_max_mb` below 1, a timeout of 0 or less or over a day, an ntfy priority outside 1–5, or an LLM or ntfy URL that does not start with `http://` or `https://` or that contains spaces.
+Out-of-range values stop `firewatcher` at startup: a negative time or count, `capture_time` over 7 days or `capture_time_max` over 30 days, `min_free_percent` outside 0–50, `purge_interval` or `resume_max` over 30 days, `buffer_max_mb` below 1, a timeout of 0 or less or over a day, an ntfy priority outside 1–5, or an LLM, ntfy or events URL that does not start with `http://` or `https://` or that contains spaces.
 
-`api_key` under `[llm]` and `token` under `[notify]` are not command-line flags. `FIREWATCHER_LLM_API_KEY` and `FIREWATCHER_NTFY_TOKEN` override them when set. `--install-service` creates `/etc/firewatcher/firewatcher.conf` with mode `0600` only when it is missing, and the unit runs `firewatcher --config` that path. An existing file is left as it is. Flags passed to a later install are appended on `ExecStart` so they override the file.
+`api_key` under `[llm]` and `token` under `[notify]` are not command-line flags. `FIREWATCHER_LLM_API_KEY` and `FIREWATCHER_NTFY_TOKEN` override them when set. `events_token` under `[notify]` is likewise config-only, overridden by `FIREWATCHER_EVENTS_TOKEN`. `--install-service` creates `/etc/firewatcher/firewatcher.conf` with mode `0600` only when it is missing, and the unit runs `firewatcher --config` that path. An existing file is left as it is. Flags passed to a later install are appended on `ExecStart` so they override the file.
 
 Generated configs include explanatory comments above each setting. When no ntfy URL is supplied, a new config gets `https://ntfy.sh/firewatcher-<hostname>-<random>`, with a 12-character URL-safe base64 suffix (72 random bits, no padding). The hostname is sanitized and shortened as needed to keep the topic within 64 characters. Explicit URLs are preserved, and reinstalling leaves an existing config and topic unchanged. Notifications still default to off; subscribe to the generated topic in ntfy, then set `[notify] enabled = true`. When copying the example above, replace its topic with your own.
 
@@ -209,6 +211,25 @@ Any user or program on the host can write log lines, and those lines reach the m
 `[llm] notes` (or `--llm-notes TEXT`; `note` also works as the key; the flag wins over the file, and `--llm-notes ''` clears a note set in the config) is a short free-text note about this host, for example `loop/dm devices from pytest and /tmp/claude-*/scratchpad and OOMs in capped test containers are expected`. It is sent with every capture as a line `Operator notes about this host: ...` before the untrusted log data, outside the `BEGIN`/`END` block, and the system prompt tells the model that notes describe what is normal there. Any run of whitespace in a note, newlines included, becomes one space. Only you can set it, so unlike the log lines it is trusted text; keep it short, since it is sent with every capture. When the config exists, `--install-service --llm-notes ...` puts the note on the unit's `ExecStart` (as one `--llm-notes=...` word, with `%` and `$` doubled for systemd), like any flag given there: local users can read it with `systemctl cat`, and it overrides `notes` in the config until the unit is reinstalled. To keep it private and editable, set it in the config instead.
 
 The ntfy topic URL is not printed at startup or in error messages, since on a public ntfy server whoever knows the topic can subscribe to it. Only the server is shown. Keep the topic in the config file (mode `0600`) rather than on the command line: `--ntfy-url` shows in the process list, and when the config already exists, `--install-service --ntfy-url` puts it on the unit's `ExecStart`, which any user can read. `--install-service` warns when that happens.
+
+### Sending captures to another service
+
+Set `[notify] events_url` to an `http://` or `https://` URL (empty means off) and firewatcher POSTs every finished capture, with the verdict, to it as JSON, with `Content-Type: application/json`. If `events_token` is set (or `FIREWATCHER_EVENTS_TOKEN`), it is sent as `Authorization: Bearer <token>`. The service can be a log dashboard, a webhook relay, or anything that accepts the POST; the timeout is `[notify] timeout`. The fields:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | always `firewatcher` |
+| `version` | the firewatcher version |
+| `host` | the host name |
+| `pattern` | the pattern that opened the capture |
+| `title`, `body` | what the ntfy push would carry: the generated or model title, and the summary or matched line followed by the capture path |
+| `push` | whether the capture is worth an alert (the model said so, an `always_notify` pattern matched, the model failed, or there is no model) |
+| `always_notify` | an `always_notify` pattern matched |
+| `model_notify` | the model's own verdict: `true`, `false`, or `null` when there was no model answer |
+| `path` | the capture file, or `null` when it could not be saved |
+| `time` | ISO 8601 time with the UTC offset |
+
+Captures are posted whatever `push` says, so the service sees them all. Any 2xx answer means the service has the capture, and then nothing goes to ntfy. Anything else (a refused connection, a timeout, a TLS error, a redirect, a 4xx or 5xx) is logged as `event post failed`, and when `push` is true and notifications are on, firewatcher sends the ntfy push as it would without `events_url`, so an alert is not lost because the service is down. `events_url` also works without `[notify] enabled`; a failed POST then only logs. Like the ntfy topic, the URL is shown only as its server, and the token is never logged.
 
 Lines firewatcher writes back to the journal are a single physical line containing `firewatcher-self`, so a summary that quotes `panic` or `I/O error` does not start another capture. In journalctl and syslog output, firewatcher recognizes its own lines by the identifier field after the timestamp and host (`firewatcher[PID]:`), not by text elsewhere in the line, so a process or user name chosen to look like firewatcher cannot hide a kernel or daemon message. Lines in other formats are checked for `firewatcher-self` or `firewatcher[PID]:` anywhere. The capture files themselves stay in the log stream's original format.
 

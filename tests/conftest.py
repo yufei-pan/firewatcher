@@ -27,6 +27,7 @@ def isolated_firewatcher_config(tmp_path, monkeypatch):
     monkeypatch.setattr(fw, 'JOURNAL_DIRS', (str(tmp_path / 'journal'),))
     monkeypatch.delenv(fw.LLM_API_KEY_ENV, raising=False)
     monkeypatch.delenv(fw.NTFY_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(fw.EVENTS_TOKEN_ENV, raising=False)
     # a SIGHUP flag left set by one test must not reload patterns in the next
     monkeypatch.setattr(fw, '_reload_requested', False)
 
