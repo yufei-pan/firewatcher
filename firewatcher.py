@@ -1067,6 +1067,23 @@ def _strip_userinfo(url):
 	return url[:start] + url[at + 1:]
 
 
+def userinfo_warnings(settings):
+	"""A line for each URL setting that holds a user:password, naming the setting and never its value.
+
+	The user:password is not sent (see _strip_userinfo), so without this the mistake shows only as 401s when an
+	incident fires."""
+	rows = []
+	for attr, label, instead in (
+		('llm_base_url', 'llm.base_url', 'api_key under [llm]'),
+		('ntfy_url', 'notify.ntfy_url', 'token under [notify]'),
+		('events_url', 'notify.events_url', 'events_token under [notify]'),
+	):
+		url = getattr(settings, attr, '') or ''
+		if url and _strip_userinfo(url) != str(url):
+			rows.append('Warning: %s holds a user:password, which firewatcher does not send; use %s instead.' % (label, instead))
+	return rows
+
+
 def _ini_patterns(paths):
 	paths = list(paths or [])
 	if not paths:
@@ -1310,23 +1327,48 @@ def _notify_body(text, path):
 	return body.decode('utf-8', 'ignore') + suffix
 
 
-def _urlopen_bytes(url, data, headers, timeout):
+def _open_url(request, timeout):
+	"""Open request without following redirects: a 3xx raises HTTPError, like a 4xx.
+
+	Every outgoing request goes through here. A followed 301 or 302 turns the POST into a GET, and urllib sends the
+	Authorization header on to whatever host the Location names, while the answer still reads as success."""
 	# Imported on first use: urllib.request pulls in ssl and http.client (about 9 MB RSS),
-	# and only LLM analysis and ntfy pushes need them.
+	# and only the LLM, ntfy and the events service need them.
+	import urllib.request
+
+	class NoRedirect(urllib.request.HTTPRedirectHandler):
+		def redirect_request(self, *args, **kwargs):
+			return None
+
+	return urllib.request.build_opener(NoRedirect).open(request, timeout=timeout)
+
+
+def _http_error_reason(exc, url):
+	"""'HTTP <code> from <origin>', and for a 3xx that it was refused. Never the Location: it is the server's, not ours to log."""
+	code = getattr(exc, 'code', '?')
+	reason = 'HTTP %s from %s' % (code, _url_origin(url))
+	if isinstance(code, int) and 300 <= code < 400:
+		reason += ' (redirect, not followed)'
+	return reason
+
+
+def _urlopen_bytes(url, data, headers, timeout):
 	import urllib.error
 	import urllib.request
 	url = _strip_userinfo(url)
 	request = urllib.request.Request(url, data=data, headers=headers, method='POST')
 	try:
-		with urllib.request.urlopen(request, timeout=timeout) as response:
+		with _open_url(request, timeout) as response:
 			return response.read()
 	except urllib.error.HTTPError as exc:
+		if isinstance(exc.code, int) and 300 <= exc.code < 400:
+			raise RuntimeError(_http_error_reason(exc, url))
 		detail = ''
 		try:
 			detail = exc.read().decode('utf-8', 'replace')
 		except Exception:
 			detail = ''
-		raise RuntimeError('HTTP %s from %s: %s' % (getattr(exc, 'code', '?'), _url_origin(url), detail[:300]))
+		raise RuntimeError('%s: %s' % (_http_error_reason(exc, url), detail[:300]))
 
 
 def _parse_llm_object(content):
@@ -1533,20 +1575,16 @@ def post_event(url, token, payload, timeout):
 	import urllib.error
 	import urllib.request
 
-	class NoRedirect(urllib.request.HTTPRedirectHandler):
-		def redirect_request(self, *args, **kwargs):
-			return None
-
 	headers = {'Content-Type': 'application/json'}
 	if token:
 		headers['Authorization'] = 'Bearer ' + _http_header(token, 2000)
 	request = urllib.request.Request(_strip_userinfo(url), data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
 	try:
 		# A 2xx status is the answer; the body is not read, so a stalled one cannot turn it into a failure.
-		with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout):
+		with _open_url(request, timeout):
 			pass
 	except urllib.error.HTTPError as exc:
-		raise RuntimeError('HTTP %s from %s' % (getattr(exc, 'code', '?'), _url_origin(url)))
+		raise RuntimeError(_http_error_reason(exc, url))
 	except Exception as exc:
 		reason = str(getattr(exc, 'reason', None) or exc) or type(exc).__name__
 		if token:
@@ -3019,6 +3057,8 @@ def main(argv=None):
 			resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
 		else:
 			parser.error('pattern file or directory required (for example /etc/firewatcher/patterns.d)')
+	for row in userinfo_warnings(resolved):
+		print(row, file=sys.stderr)
 	if args.print_unit:
 		print(render_unit_file(resolved, raw=args), end='')
 		return 0
