@@ -360,15 +360,21 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
         assert proc.returncode == 0, output
         return output
 
-    def captured(count, text):
+    def captured(count, text, saved):
+        # The capture shows a line before the loop marks it handled, so the saved position is waited for too.
         logs = incident_logs(out)
-        return len(logs) == count and text in logs[-1].read_text()
+        if not (len(logs) == count and text in logs[-1].read_text()):
+            return False
+        try:
+            return json.loads(position_file.read_text())['time'] == saved
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
 
-    first = run_until(lambda: captured(1, 'after the first'))
+    first = run_until(lambda: captured(1, 'after the first', now - 20))
     assert 'No journal position saved' in first
     assert json.loads(position_file.read_text())['time'] == now - 20
     journal.write_text(journal.read_text() + line(-10, 'logged while stopped') + line(-5, 'HIT second'))
-    second = run_until(lambda: captured(2, 'HIT second'))
+    second = run_until(lambda: captured(2, 'HIT second', now - 5))
     assert 'Resuming the journal after' in second
     logs = incident_logs(out)
     assert len(logs) == 2
