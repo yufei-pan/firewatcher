@@ -1631,24 +1631,24 @@ class IncidentDispatcher(object):
 				self.queue.task_done()
 
 	def _overflow(self, incident):
-		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full', status='analysis skipped, queue full')
 		if self.settings.events_url:
+			_journal(syslog.LOG_WARNING, 'queue full: posting the capture without waiting', status='queue full: posting the capture without waiting')
 			self._deliver_unjudged(incident, OVERFLOW_NOTIFY_TIMEOUT)
 			return
-		self._deliver(incident, True, _programmatic_title(incident.get('hostname', ''), incident.get('pattern', '')), incident.get('matched_line') or '', None, OVERFLOW_NOTIFY_TIMEOUT)
+		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full', status='analysis skipped, queue full')
+		self._deliver(incident, True, _programmatic_title(incident.get('hostname', ''), incident.get('pattern', '')), incident.get('matched_line') or '', OVERFLOW_NOTIFY_TIMEOUT)
 
 	def _deliver_unjudged(self, incident, timeout):
 		"""events_url is set: the receiver judges. Only an always_notify capture counts as worth a push here."""
 		body_source = incident.get('always_notify_line') or incident.get('matched_line') or ''
 		title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
-		self._deliver(incident, bool(incident.get('always_notify')), title, body_source, None, timeout)
+		self._deliver(incident, bool(incident.get('always_notify')), title, body_source, timeout)
 
 	def _process(self, incident):
 		if self.settings.events_url:
 			self._deliver_unjudged(incident, self.settings.ntfy_timeout)
 			return
 		should_push = True
-		model_notify = None  # the model's own verdict; None when it gave none
 		title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
 		body_source = incident.get('matched_line') or ''
 		# No path: the capture could not be written anywhere, so there is nothing for the model to read.
@@ -1665,7 +1665,6 @@ class IncidentDispatcher(object):
 					status='analysis title=%s model_notify=%s%s' % (result['title'][:80], decision, ' always_notify=yes' if forced else ''),
 				)
 				should_push = result['notify'] or forced
-				model_notify = result['notify']
 				if incident.get('always_notify'):
 					# Log text can steer the model's title and summary too, so the push leads with the line that matched.
 					body_source = incident.get('always_notify_line') or body_source
@@ -1682,16 +1681,15 @@ class IncidentDispatcher(object):
 					pass
 				_journal(syslog.LOG_ERR, 'LLM analysis failed: %s' % exc, status='LLM analysis failed')
 				should_push = True
-				model_notify = None
 				title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
 				body_source = incident.get('matched_line') or ''
-		self._deliver(incident, should_push, title, body_source, model_notify, self.settings.ntfy_timeout)
+		self._deliver(incident, should_push, title, body_source, self.settings.ntfy_timeout)
 
-	def _deliver(self, incident, should_push, title, body_source, model_notify, timeout):
+	def _deliver(self, incident, should_push, title, body_source, timeout):
 		"""The verdict is known: tell the events service, and push to ntfy unless that took it."""
 		will_push = should_push and self.settings.notify_enabled
 		if self.settings.events_url:
-			failure = self._post_event(incident, should_push, title, body_source, model_notify, timeout)
+			failure = self._post_event(incident, should_push, title, body_source, timeout)
 			if failure is None:
 				return
 			if will_push:
@@ -1704,7 +1702,7 @@ class IncidentDispatcher(object):
 		if will_push:
 			self._push(incident, title, body_source, timeout)
 
-	def _post_event(self, incident, should_push, title, body_source, model_notify, timeout):
+	def _post_event(self, incident, should_push, title, body_source, timeout):
 		"""POST the capture and its verdict; None when accepted, else the reason it was not."""
 		payload = {
 			'source': 'firewatcher',
@@ -1715,7 +1713,6 @@ class IncidentDispatcher(object):
 			'body': _notify_body(body_source, incident.get('path') or 'capture not saved; see the firewatcher journal'),
 			'push': bool(should_push),
 			'always_notify': bool(incident.get('always_notify')),
-			'model_notify': model_notify,
 			'excerpt': _event_excerpt(incident),
 			'path': incident.get('path') or None,
 			'time': datetime.datetime.now().astimezone().isoformat(),

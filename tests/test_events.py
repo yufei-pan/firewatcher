@@ -119,7 +119,7 @@ def test_event_posted_and_no_ntfy_when_accepted(tmp_path, server, records):
     assert payload['body'] == fw._notify_body('HIT now', '/tmp/cap.log')
     assert payload['push'] is False
     assert payload['always_notify'] is False
-    assert payload['model_notify'] is None
+    assert 'model_notify' not in payload
     assert 'excerpt' in payload
     assert payload['path'] == '/tmp/cap.log'
     assert 'T' in payload['time'] and payload['time'][:4].isdigit()
@@ -169,7 +169,7 @@ def test_push_false_is_posted_and_never_pushed(tmp_path, server, monkeypatch, re
     dispatcher(settings)._process(incident())
     payload = json.loads(events.requests[0]['body'].decode('utf-8'))
     assert payload['push'] is False
-    assert payload['model_notify'] is None
+    assert 'model_notify' not in payload
     assert payload['title'] == 'box: HIT'
     assert payload['body'].startswith('HIT now')
     assert ntfy.requests == []
@@ -191,7 +191,7 @@ def test_overflow_posts_push_as_always_notify(tmp_path, server, records):
     payload = json.loads(events.requests[0]['body'].decode('utf-8'))
     assert payload['push'] is False
     assert payload['path'] is None
-    assert payload['model_notify'] is None
+    assert 'model_notify' not in payload
     assert payload['excerpt'] == ''
     assert payload['body'].endswith('capture not saved; see the firewatcher journal')
     assert ntfy.requests == []
@@ -202,6 +202,20 @@ def test_overflow_posts_push_as_always_notify(tmp_path, server, records):
     assert ntfy2.requests == []
     dispatcher(settings)._overflow(incident(always_notify=True))
     assert len(ntfy2.requests) == 1
+
+
+def test_overflow_wording_follows_events_url(tmp_path, server, records):
+    events = server()
+    settings = settings_from(tmp_path, conf(events.url(), notify=False))
+    dispatcher(settings)._overflow(incident())
+    assert any('queue full: posting the capture without waiting' in item[1] for item in records)
+    assert not any('analysis skipped' in item[1] for item in records)
+    del records[:]
+    ntfy = server()
+    settings = settings_from(tmp_path, conf(ntfy_url=ntfy.url('/topic')))
+    dispatcher(settings)._overflow(incident())
+    assert any('analysis skipped, queue full' in item[1] for item in records)
+    assert len(ntfy.requests) == 1
 
 
 def test_events_only_without_ntfy(tmp_path, server, records):
@@ -225,13 +239,13 @@ def test_always_notify_and_model_fields(tmp_path, server, monkeypatch, records):
     dispatcher(settings)._process(incident(always_notify=True, always_notify_line='the line'))
     payload = json.loads(events.requests[0]['body'].decode('utf-8'))
     assert payload['always_notify'] is True
-    assert payload['model_notify'] is None
+    assert 'model_notify' not in payload
     assert payload['push'] is True
     assert payload['title'] == 'box: HIT'
     assert payload['body'].startswith('the line')
     dispatcher(settings)._process(incident())
     payload = json.loads(events.requests[1]['body'].decode('utf-8'))
-    assert payload['model_notify'] is None and payload['push'] is False
+    assert 'model_notify' not in payload and payload['push'] is False
     assert payload['title'] == 'box: HIT'
     assert payload['always_notify'] is False
 

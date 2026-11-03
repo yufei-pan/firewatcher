@@ -228,10 +228,9 @@ The receiver judges. With `events_url` set, firewatcher's own LLM analysis is of
 | `title`, `body` | what a fallback ntfy push would carry: the generated title `{hostname}: {pattern}`, and the `always_notify` line or the matched line followed by the capture path |
 | `push` | whether firewatcher itself counts the capture as worth an alert: the same as `always_notify` |
 | `always_notify` | an `always_notify` pattern matched |
-| `model_notify` | always `null` (kept for receivers that read it; there is no model verdict) |
 | `excerpt` | the capture, cut the same way as for the model when it is too big, and at most 16384 characters once JSON-encoded, so the whole event stays well under 64 KiB; `""` when the capture could not be saved or is gone |
 | `path` | the capture file, or `null` when it could not be saved |
-| `time` | when the event was sent (ISO 8601 with the UTC offset): after the capture window and the model call, not when the line matched |
+| `time` | when the event was sent (ISO 8601 with the UTC offset): after the capture window, not when the line matched |
 
 Captures are posted whatever `push` says, so the service sees them all. Any 2xx answer means the service has the capture, and then nothing goes to ntfy. Anything else (a refused connection, a timeout, a TLS error, a redirect, a 4xx or 5xx) is logged as `event post failed`, and then only `always_notify` captures are pushed to ntfy (when notifications are on), with the generated title and the line that matched. Other captures stay in the capture folder and the journal (`event post failed: ...; not pushed (not always_notify)`). While the service does not answer, each push goes out one timeout late ([limitations](docs/limitations.md#while-the-events-receiver-is-down-each-alert-waits-one-timeout-before-ntfy)). `events_url` also works without `[notify] enabled`; a failed POST then only logs. Like the ntfy topic, the URL is shown only as its server, and the token is never logged. A `user:password` in a URL (events, ntfy or LLM) is not sent: use `events_token` (`token` under `[notify]` for ntfy, `api_key` under `[llm]` for the model).
 
