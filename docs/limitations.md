@@ -19,7 +19,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### While the events receiver is down, each alert waits one timeout before ntfy
 - Kind: known limitation
 - What the operator sees: with `events_url` set and its receiver not answering (the host down, its packets
-  dropped), each alert is pushed to ntfy one `ntfy_timeout` late (10 s by default; twice that for a capture that
+  dropped), each alert (only `always_notify` captures fall back to ntfy) is pushed one `ntfy_timeout` late (10 s by default; twice that for a capture that
   overflows), because firewatcher tries the POST first and pushes to ntfy only when it fails. No alert is lost.
 - Why: the POST and the push run one after the other. A separate short timeout, or skipping the POST for a while
   after a failure, would shorten the wait at the cost of a second setting or of state; a few seconds' delay while

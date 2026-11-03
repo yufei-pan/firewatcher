@@ -117,9 +117,10 @@ def test_event_posted_and_no_ntfy_when_accepted(tmp_path, server, records):
     assert payload['pattern'] == 'HIT'
     assert payload['title'] == 'box: HIT'
     assert payload['body'] == fw._notify_body('HIT now', '/tmp/cap.log')
-    assert payload['push'] is True
+    assert payload['push'] is False
     assert payload['always_notify'] is False
     assert payload['model_notify'] is None
+    assert 'excerpt' in payload
     assert payload['path'] == '/tmp/cap.log'
     assert 'T' in payload['time'] and payload['time'][:4].isdigit()
     assert any('event sent title=box: HIT' in item[1] for item in records)
@@ -145,7 +146,7 @@ def test_fallback_to_ntfy_on_refused_connection_500_and_timeout(tmp_path, server
             ntfy = server()
             settings = settings_from(tmp_path, conf(url, ntfy.url('/topic'), timeout=1))
             del records[:]
-            dispatcher(settings)._process(incident())
+            dispatcher(settings)._process(incident(always_notify=True, always_notify_line='HIT now'))
             assert len(ntfy.requests) == 1, url
             assert any('event post failed: ' in item[1] and '; pushing to ntfy' in item[1] for item in records)
             assert any('notification sent' in item[1] for item in records)
@@ -157,52 +158,49 @@ def test_redirect_and_client_errors_are_failures(tmp_path, server, records):
     for status, location in ((302, 'http://127.0.0.1:1/x'), (301, None), (400, None), (401, None), (403, None)):
         events, ntfy = server(status=status, location=location), server()
         settings = settings_from(tmp_path, conf(events.url(), ntfy.url('/topic')))
-        dispatcher(settings)._process(incident())
+        dispatcher(settings)._process(incident(always_notify=True))
         assert len(events.requests) == 1
         assert len(ntfy.requests) == 1, status
 
 
 def test_push_false_is_posted_and_never_pushed(tmp_path, server, monkeypatch, records):
-    events, ntfy, llm = server(), server(), server()
+    events, ntfy = server(), server()
     settings = settings_from(tmp_path, conf(events.url(), ntfy.url('/topic')))
-    monkeypatch.setattr(fw, 'call_llm', lambda s, i: {'title': 'Benign', 'summary': 'fine', 'notify': False})
-    monkeypatch.setattr(fw, '_append_note', lambda path, text: None)
-    settings.llm_enabled = True
     dispatcher(settings)._process(incident())
     payload = json.loads(events.requests[0]['body'].decode('utf-8'))
     assert payload['push'] is False
-    assert payload['model_notify'] is False
-    assert payload['title'] == 'Benign'
-    assert payload['body'].startswith('fine')
+    assert payload['model_notify'] is None
+    assert payload['title'] == 'box: HIT'
+    assert payload['body'].startswith('HIT now')
     assert ntfy.requests == []
 
 
 def test_push_false_and_post_failed_sends_nothing(tmp_path, server, monkeypatch, records):
     events, ntfy = server(status=500), server()
     settings = settings_from(tmp_path, conf(events.url(), ntfy.url('/topic')))
-    monkeypatch.setattr(fw, 'call_llm', lambda s, i: {'title': 'Benign', 'summary': 'fine', 'notify': False})
-    monkeypatch.setattr(fw, '_append_note', lambda path, text: None)
-    settings.llm_enabled = True
     dispatcher(settings)._process(incident())
     assert len(events.requests) == 1
     assert ntfy.requests == []
     assert any('event post failed: ' in item[1] and 'pushing to ntfy' not in item[1] for item in records)
 
 
-def test_overflow_posts_with_push_true(tmp_path, server, records):
+def test_overflow_posts_push_as_always_notify(tmp_path, server, records):
     events, ntfy = server(), server()
     settings = settings_from(tmp_path, conf(events.url(), ntfy.url('/topic')))
     dispatcher(settings)._overflow(incident(path=None))
     payload = json.loads(events.requests[0]['body'].decode('utf-8'))
-    assert payload['push'] is True
+    assert payload['push'] is False
     assert payload['path'] is None
     assert payload['model_notify'] is None
+    assert payload['excerpt'] == ''
     assert payload['body'].endswith('capture not saved; see the firewatcher journal')
     assert ntfy.requests == []
-    # a failed POST falls back to ntfy here too
+    # a failed POST falls back to ntfy here too, for an always_notify capture only
     events2, ntfy2 = server(status=503), server()
     settings = settings_from(tmp_path, conf(events2.url(), ntfy2.url('/topic')))
     dispatcher(settings)._overflow(incident())
+    assert ntfy2.requests == []
+    dispatcher(settings)._overflow(incident(always_notify=True))
     assert len(ntfy2.requests) == 1
 
 
@@ -223,28 +221,105 @@ def test_always_notify_and_model_fields(tmp_path, server, monkeypatch, records):
     events = server()
     settings = settings_from(tmp_path, conf(events.url(), notify=False))
     settings.llm_enabled = True
-    monkeypatch.setattr(fw, '_append_note', lambda path, text: None)
-    monkeypatch.setattr(fw, 'call_llm', lambda s, i: {'title': 'Model title', 'summary': 'sum', 'notify': False})
+    monkeypatch.setattr(fw, 'call_llm', lambda s, i: pytest.fail('the receiver judges'))
     dispatcher(settings)._process(incident(always_notify=True, always_notify_line='the line'))
     payload = json.loads(events.requests[0]['body'].decode('utf-8'))
     assert payload['always_notify'] is True
-    assert payload['model_notify'] is False
+    assert payload['model_notify'] is None
     assert payload['push'] is True
     assert payload['title'] == 'box: HIT'
     assert payload['body'].startswith('the line')
-    monkeypatch.setattr(fw, 'call_llm', lambda s, i: {'title': 'Model title', 'summary': 'sum', 'notify': True})
     dispatcher(settings)._process(incident())
     payload = json.loads(events.requests[1]['body'].decode('utf-8'))
-    assert payload['model_notify'] is True and payload['push'] is True
-    assert payload['title'] == 'Model title'
+    assert payload['model_notify'] is None and payload['push'] is False
+    assert payload['title'] == 'box: HIT'
     assert payload['always_notify'] is False
-    # a failed LLM call: no model verdict
-    def boom(s, i):
-        raise RuntimeError('down')
-    monkeypatch.setattr(fw, 'call_llm', boom)
-    dispatcher(settings)._process(incident())
+
+
+def _capture(tmp_path, text, name='cap.log'):
+    path = tmp_path / name
+    path.write_bytes(text.encode('utf-8') if isinstance(text, str) else text)
+    return str(path)
+
+
+def test_events_url_turns_the_llm_off(tmp_path, server, monkeypatch, records):
+    events, ntfy = server(), server()
+    settings = settings_from(tmp_path, conf(events.url(), ntfy.url('/topic')))
+    settings.llm_enabled = True
+    calls = []
+    monkeypatch.setattr(fw, 'call_llm', lambda s, i: calls.append(i) or {'title': 't', 'summary': 's', 'notify': True})
+    disp = dispatcher(settings)
+    disp.submit(incident(path=_capture(tmp_path, 'HIT now\n')))
+    priority, _seq, item = disp.queue.get_nowait()
+    assert priority == 0
+    disp._process(item)
+    assert calls == []
+    assert len(events.requests) == 1 and ntfy.requests == []
+    assert not any('analysis' in entry[1] for entry in records)
+
+
+def test_event_carries_excerpt_under_16k_json(tmp_path, server, records):
+    events = server()
+    settings = settings_from(tmp_path, conf(events.url(), notify=False))
+    small = _capture(tmp_path, 'header\nHIT now\nafter\n', 'small.log')
+    dispatcher(settings)._process(incident(path=small))
+    payload = json.loads(events.requests[0]['body'].decode('utf-8'))
+    assert payload['excerpt'] == 'header\nHIT now\nafter\n'
+    big_text = ''.join('line %06d \u00e9\u4e2d some text\n' % n for n in range(20000))
+    big = _capture(tmp_path, big_text, 'big.log')
+    dispatcher(settings)._process(incident(path=big))
+    payload = json.loads(events.requests[1]['body'].decode('utf-8'))
+    assert payload['excerpt']
+    assert len(json.dumps(payload['excerpt'])) <= 16384
+    assert len(events.requests[1]['body']) < 64 * 1024
+    # P27: the capture is gone; the event is still posted with an empty excerpt
+    dispatcher(settings)._process(incident(path=str(tmp_path / 'gone.log')))
     payload = json.loads(events.requests[2]['body'].decode('utf-8'))
-    assert payload['model_notify'] is None and payload['push'] is True
+    assert payload['excerpt'] == ''
+    assert payload['path'] == str(tmp_path / 'gone.log')
+
+
+def test_excerpt_with_control_chars_stays_under_budget(tmp_path, server, records):
+    events = server()
+    settings = settings_from(tmp_path, conf(events.url(), notify=False))
+    # Every byte a control character: json.dumps writes each as six characters.
+    path = _capture(tmp_path, b'\x01\x02\x03\x04' * 20000, 'ctl.log')
+    dispatcher(settings)._process(incident(path=path))
+    payload = json.loads(events.requests[0]['body'].decode('utf-8'))
+    assert payload['excerpt']
+    assert len(json.dumps(payload['excerpt'])) <= 16384
+    assert len(events.requests[0]['body']) < 64 * 1024
+
+
+def test_post_failure_pushes_only_always_notify(tmp_path, server, records):
+    events, ntfy = server(status=500), server()
+    settings = settings_from(tmp_path, conf(events.url(), ntfy.url('/topic')))
+    dispatcher(settings)._process(incident())
+    assert ntfy.requests == []
+    assert any('event post failed: ' in item[1] and '; not pushed (not always_notify)' in item[1] for item in records)
+    del records[:]
+    dispatcher(settings)._process(incident(always_notify=True, always_notify_line='HIT now'))
+    assert len(ntfy.requests) == 1
+    assert any('event post failed: ' in item[1] and '; pushing to ntfy' in item[1] for item in records)
+    assert len(events.requests) == 2
+
+
+def test_no_events_url_keeps_llm_judging(tmp_path, server, monkeypatch, records):
+    ntfy = server()
+    settings = settings_from(tmp_path, conf(ntfy_url=ntfy.url('/topic')))
+    settings.llm_enabled = True
+    calls = []
+    monkeypatch.setattr(fw, 'call_llm', lambda s, i: calls.append(i) or {'title': 'Model title', 'summary': 'sum', 'notify': True})
+    monkeypatch.setattr(fw, '_append_note', lambda path, text: None)
+    disp = dispatcher(settings)
+    disp.submit(incident())
+    priority, _seq, item = disp.queue.get_nowait()
+    assert priority == 1
+    disp._process(item)
+    assert len(calls) == 1
+    assert len(ntfy.requests) == 1
+    assert any('notification sent title=Model title' in entry[1] for entry in records)
+    assert any('analysis title=Model title' in entry[1] for entry in records)
 
 
 def test_token_never_in_journal_or_errors(tmp_path, server, capsys, records):

@@ -107,6 +107,8 @@ PROGRAMMATIC_TITLE_MAX = 120
 NTFY_TITLE_MAX = 200
 NTFY_BODY_MAX = 4096
 EXCERPT_HEAD_BYTES = 2048
+# The excerpt sent with an event, measured JSON-encoded, so the whole event stays under housekeepd's 64 KiB body limit.
+EVENT_EXCERPT_JSON_MAX = 16384
 # Below this budget the excerpt is just the head and tail of the capture.
 EXCERPT_AROUND_MATCH_MIN = 1024
 EXCERPT_MARKER_BYTES = len(b'[... %d bytes skipped ...]\n' % (2 ** 64))
@@ -1445,13 +1447,38 @@ def _excerpt_around_match(handle, size, max_bytes, header_end, match_end):
 	return b''.join(out)
 
 
+def _excerpt_marks(incident):
+	marks = incident.get('excerpt_marks')
+	# Marks taken in a file the capture later moved away from do not apply to the file it ended in.
+	return marks[1:] if marks and marks[0] == incident.get('path') else None
+
+
+def _event_excerpt(incident, limit=EVENT_EXCERPT_JSON_MAX):
+	"""The capture excerpt for the events service: at most limit characters once JSON-encoded, '' without a capture."""
+	import json
+	path = incident.get('path')
+	if not path:
+		return ''
+	marks = _excerpt_marks(incident)
+	budget = limit
+	try:
+		excerpt = _capture_excerpt(path, budget, marks=marks)
+		# Control and non-ASCII characters grow when JSON-encoded; shrink the byte budget in proportion until it fits.
+		while budget > 0:
+			size = len(json.dumps(excerpt))
+			if size <= limit:
+				return excerpt
+			budget = min(budget - 1, budget * limit // size)
+			excerpt = _capture_excerpt(path, budget, marks=marks)
+	except OSError:
+		pass  # the capture is gone; the event still goes out
+	return ''
+
+
 def call_llm(settings, incident):
 	import json
 	import secrets
-	marks = incident.get('excerpt_marks')
-	# Marks taken in a file the capture later moved away from do not apply to the file it ended in.
-	marks = marks[1:] if marks and marks[0] == incident['path'] else None
-	excerpt = _capture_excerpt(incident['path'], settings.llm_max_bytes, marks=marks)
+	excerpt = _capture_excerpt(incident['path'], settings.llm_max_bytes, marks=_excerpt_marks(incident))
 	# A random token, so a log line cannot fake the END marker and append its own instructions.
 	marker = 'LOG-DATA-' + secrets.token_hex(8)
 	notes = _note_text(settings.llm_notes)
@@ -1565,7 +1592,8 @@ class IncidentDispatcher(object):
 		with self._seq_lock:
 			self.seq += 1
 			seq = self.seq
-		priority = 1 if self.settings.llm_enabled else 0
+		# With events_url the receiver judges, so nothing waits on the model.
+		priority = 1 if self.settings.llm_enabled and not self.settings.events_url else 0
 		try:
 			self.queue.put_nowait((priority, seq, incident))
 		except queue.Full:
@@ -1604,9 +1632,21 @@ class IncidentDispatcher(object):
 
 	def _overflow(self, incident):
 		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full', status='analysis skipped, queue full')
+		if self.settings.events_url:
+			self._deliver_unjudged(incident, OVERFLOW_NOTIFY_TIMEOUT)
+			return
 		self._deliver(incident, True, _programmatic_title(incident.get('hostname', ''), incident.get('pattern', '')), incident.get('matched_line') or '', None, OVERFLOW_NOTIFY_TIMEOUT)
 
+	def _deliver_unjudged(self, incident, timeout):
+		"""events_url is set: the receiver judges. Only an always_notify capture counts as worth a push here."""
+		body_source = incident.get('always_notify_line') or incident.get('matched_line') or ''
+		title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
+		self._deliver(incident, bool(incident.get('always_notify')), title, body_source, None, timeout)
+
 	def _process(self, incident):
+		if self.settings.events_url:
+			self._deliver_unjudged(incident, self.settings.ntfy_timeout)
+			return
 		should_push = True
 		model_notify = None  # the model's own verdict; None when it gave none
 		title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
@@ -1654,7 +1694,13 @@ class IncidentDispatcher(object):
 			failure = self._post_event(incident, should_push, title, body_source, model_notify, timeout)
 			if failure is None:
 				return
-			_journal(syslog.LOG_ERR, 'event post failed: %s%s' % (failure, '; pushing to ntfy' if will_push else ''), status='event post failed')
+			if will_push:
+				outcome = '; pushing to ntfy'
+			elif self.settings.notify_enabled:
+				outcome = '; not pushed (not always_notify)'
+			else:
+				outcome = ''
+			_journal(syslog.LOG_ERR, 'event post failed: %s%s' % (failure, outcome), status='event post failed')
 		if will_push:
 			self._push(incident, title, body_source, timeout)
 
@@ -1670,6 +1716,7 @@ class IncidentDispatcher(object):
 			'push': bool(should_push),
 			'always_notify': bool(incident.get('always_notify')),
 			'model_notify': model_notify,
+			'excerpt': _event_excerpt(incident),
 			'path': incident.get('path') or None,
 			'time': datetime.datetime.now().astimezone().isoformat(),
 		}
@@ -3026,7 +3073,9 @@ def _watch(resolved):
 		print(f"Keeping at least {resolved.min_free_percent:g}% free where captures are written.")
 	print(f"Compress logs after {resolved.compress_after_months} months.")
 	print(f"Delete logs after {resolved.delete_after_months} months.")
-	if resolved.llm_enabled:
+	if resolved.llm_enabled and resolved.events_url:
+		print("LLM analysis off: events_url is set, so the events service judges captures.")
+	elif resolved.llm_enabled:
 		print(f"LLM analysis enabled ({_url_origin(resolved.llm_base_url)}, model {resolved.llm_model}).")
 	if resolved.notify_enabled:
 		# Not the topic: on a public ntfy server, whoever knows the topic URL can subscribe to it.

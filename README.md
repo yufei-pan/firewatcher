@@ -200,6 +200,7 @@ Both features default off.
 - Notifications on, LLM off: every finished capture is pushed. The title is `{hostname}: {pattern}`.
 - LLM on, notifications off: the model writes a title, summary, and notify decision. The report is appended to the capture file and logged. Nothing is pushed.
 - Both on: a push is sent only when the model sets `notify` to true.
+- With `[notify] events_url` set, the events service judges instead and firewatcher's LLM is off; see [Sending captures to an events service](#sending-captures-to-an-events-service).
 - If the LLM request times out, returns an HTTP error, or is not the expected JSON, and notifications are on, firewatcher still pushes, using the generated title.
 
 The capture window closes even when no further log lines arrive. Analysis runs on a background worker so log following stays live. The queue holds four captures. When the queue is full, that incident skips the model and, if notifications are on, the capture thread sends the generated-title push itself.
@@ -212,9 +213,11 @@ Any user or program on the host can write log lines, and those lines reach the m
 
 The ntfy topic URL is not printed at startup or in error messages, since on a public ntfy server whoever knows the topic can subscribe to it. Only the server is shown. Keep the topic in the config file (mode `0600`) rather than on the command line: `--ntfy-url` shows in the process list, and when the config already exists, `--install-service --ntfy-url` puts it on the unit's `ExecStart`, which any user can read. `--install-service` warns when that happens.
 
-### Sending captures to another service
+### Sending captures to an events service
 
-Set `[notify] events_url` to an `http://` or `https://` URL (empty means off) and firewatcher POSTs every finished capture, with the verdict, to it as JSON, with `Content-Type: application/json`. If `events_token` is set (or `FIREWATCHER_EVENTS_TOKEN`), it is sent as `Authorization: Bearer <token>`. The service can be a log dashboard, a webhook relay, or anything that accepts the POST; the timeout is `[notify] timeout`. The fields:
+Set `[notify] events_url` to an `http://` or `https://` URL (empty means off) and firewatcher POSTs every finished capture, with an excerpt of it, to that service as JSON, with `Content-Type: application/json`. If `events_token` is set (or `FIREWATCHER_EVENTS_TOKEN`), it is sent as `Authorization: Bearer <token>`. The service can be a log dashboard, a webhook relay, or anything that accepts the POST; the timeout is `[notify] timeout`.
+
+The receiver judges. With `events_url` set, firewatcher's own LLM analysis is off whatever `[llm] enabled` says: no capture goes to the model, and nothing is appended to the capture file. The only judgment left at the source is the rule-based floor, `always_notify`. The fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -222,14 +225,15 @@ Set `[notify] events_url` to an `http://` or `https://` URL (empty means off) an
 | `version` | the firewatcher version |
 | `host` | the host name |
 | `pattern` | the pattern that opened the capture |
-| `title`, `body` | what the ntfy push would carry: the generated or model title, and the summary or matched line followed by the capture path |
-| `push` | whether the capture is worth an alert (the model said so, an `always_notify` pattern matched, the model failed, or there is no model) |
+| `title`, `body` | what a fallback ntfy push would carry: the generated title `{hostname}: {pattern}`, and the `always_notify` line or the matched line followed by the capture path |
+| `push` | whether firewatcher itself counts the capture as worth an alert: the same as `always_notify` |
 | `always_notify` | an `always_notify` pattern matched |
-| `model_notify` | the model's own verdict: `true`, `false`, or `null` when there was no model answer |
+| `model_notify` | always `null` (kept for receivers that read it; there is no model verdict) |
+| `excerpt` | the capture, cut the same way as for the model when it is too big, and at most 16384 characters once JSON-encoded, so the whole event stays well under 64 KiB; `""` when the capture could not be saved or is gone |
 | `path` | the capture file, or `null` when it could not be saved |
 | `time` | when the event was sent (ISO 8601 with the UTC offset): after the capture window and the model call, not when the line matched |
 
-Captures are posted whatever `push` says, so the service sees them all. Any 2xx answer means the service has the capture, and then nothing goes to ntfy. Anything else (a refused connection, a timeout, a TLS error, a redirect, a 4xx or 5xx) is logged as `event post failed`, and when `push` is true and notifications are on, firewatcher sends the ntfy push as it would without `events_url`, so an alert is not lost because the service is down. While the service does not answer, each push goes out one timeout late ([limitations](docs/limitations.md#while-the-events-receiver-is-down-each-alert-waits-one-timeout-before-ntfy)). `events_url` also works without `[notify] enabled`; a failed POST then only logs. Like the ntfy topic, the URL is shown only as its server, and the token is never logged. A `user:password` in a URL (events, ntfy or LLM) is not sent: use `events_token` (`token` under `[notify]` for ntfy, `api_key` under `[llm]` for the model).
+Captures are posted whatever `push` says, so the service sees them all. Any 2xx answer means the service has the capture, and then nothing goes to ntfy. Anything else (a refused connection, a timeout, a TLS error, a redirect, a 4xx or 5xx) is logged as `event post failed`, and then only `always_notify` captures are pushed to ntfy (when notifications are on), with the generated title and the line that matched. Other captures stay in the capture folder and the journal (`event post failed: ...; not pushed (not always_notify)`). While the service does not answer, each push goes out one timeout late ([limitations](docs/limitations.md#while-the-events-receiver-is-down-each-alert-waits-one-timeout-before-ntfy)). `events_url` also works without `[notify] enabled`; a failed POST then only logs. Like the ntfy topic, the URL is shown only as its server, and the token is never logged. A `user:password` in a URL (events, ntfy or LLM) is not sent: use `events_token` (`token` under `[notify]` for ntfy, `api_key` under `[llm]` for the model).
 
 Lines firewatcher writes back to the journal are a single physical line containing `firewatcher-self`, so a summary that quotes `panic` or `I/O error` does not start another capture. In journalctl and syslog output, firewatcher recognizes its own lines by the identifier field after the timestamp and host (`firewatcher[PID]:`), not by text elsewhere in the line, so a process or user name chosen to look like firewatcher cannot hide a kernel or daemon message. Lines in other formats are checked for `firewatcher-self` or `firewatcher[PID]:` anywhere. The capture files themselves stay in the log stream's original format.
 
