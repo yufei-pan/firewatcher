@@ -960,12 +960,14 @@ def _mount_paths(paths):
 
 
 def validate_settings(settings):
-	if settings.llm_enabled and (not settings.llm_base_url or not settings.llm_model):
+	# With events_url the LLM never runs (the events service judges), so its settings cannot stop firewatcher.
+	llm_runs = settings.llm_enabled and not settings.events_url
+	if llm_runs and (not settings.llm_base_url or not settings.llm_model):
 		raise ConfigError('LLM analysis requires base_url and model (--llm-base-url and --llm-model, or llm.base_url and llm.model in the config)')
 	if settings.notify_enabled and not settings.ntfy_url:
 		raise ConfigError('notifications require an ntfy topic URL (--ntfy-url, or notify.ntfy_url in the config)')
 	# The URLs stay out of these messages: an ntfy topic works like a password.
-	if settings.llm_enabled and not _is_http_url(settings.llm_base_url):
+	if llm_runs and not _is_http_url(settings.llm_base_url):
 		raise ConfigError('llm.base_url must be an http:// or https:// URL without spaces, with a valid host and port (user:password in a URL is not supported; use api_key)')
 	if settings.notify_enabled and not _is_http_url(settings.ntfy_url):
 		raise ConfigError('notify.ntfy_url must be an http:// or https:// URL without spaces, with a valid host and port (user:password in a URL is not supported; use token)')
@@ -1096,8 +1098,8 @@ def render_config_text(settings):
 	"""INI text for a new config file. Secrets are included; the file is mode 0600."""
 	lines = [
 		'# firewatcher configuration. Explicit command-line flags override this file.',
-		'# FIREWATCHER_LLM_API_KEY and FIREWATCHER_NTFY_TOKEN override api_key and token.',
-		'# Those two secrets are not command-line flags.',
+		'# FIREWATCHER_LLM_API_KEY, FIREWATCHER_NTFY_TOKEN and FIREWATCHER_EVENTS_TOKEN override api_key, token',
+		'# and events_token. Those three secrets are not command-line flags.',
 		'',
 		'[watch]',
 		'# Pattern files or directories, comma-separated or one per indented line.',
@@ -1164,13 +1166,14 @@ def render_config_text(settings):
 		'priority = %s' % int(settings.ntfy_priority),
 		'# HTTP timeout in seconds.',
 		'timeout = %s' % int(settings.ntfy_timeout),
-		'# Optional: an http(s) URL that receives each capture and its verdict as JSON. When the POST fails,',
-		'# firewatcher pushes to ntfy itself if the verdict says push. A user:password in the URL is not sent.',
+		'# Optional: an http(s) URL that receives each capture, with an excerpt, as JSON, and judges it: while this',
+		'# is set, the LLM above is off. When the POST fails, only always_notify captures are pushed to ntfy.',
+		'# A user:password in the URL is not sent.',
 		'events_url = %s' % _ini_text(settings.events_url),
 		'# Optional secret sent as "Authorization: Bearer"; FIREWATCHER_EVENTS_TOKEN overrides this value.',
 		'events_token = %s' % _ini_text(settings.events_token),
-		'# Pattern files or directories. A capture whose matched lines match one of these is pushed',
-		'# even when the LLM says not to notify. Blank: the LLM decides for every capture.',
+		'# Pattern files or directories. A capture whose matched lines match one of these is pushed even when',
+		'# the LLM says not to notify, and with events_url, pushed when the POST fails. Blank: no such floor.',
 		'always_notify = %s' % _ini_patterns(settings.always_notify),
 		'',
 	]
@@ -2990,7 +2993,7 @@ def _load_pattern_sets(pattern_sources, always_notify_sources):
 		always_notify_patterns = load_patterns(always_notify_sources)
 		if not any(always_notify_patterns.values()):
 			# Capturing matters more than this override, so keep watching, and say so where it will be seen.
-			_journal(syslog.LOG_ERR, 'no usable always_notify patterns in %s; the LLM decides for every capture' % always_notify_sources)
+			_journal(syslog.LOG_ERR, 'no usable always_notify patterns in %s; going on as if always_notify were blank' % always_notify_sources)
 			always_notify_patterns = None
 	return patterns, always_notify_patterns
 

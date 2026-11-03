@@ -169,6 +169,23 @@ def test_llm_and_notify_require_their_endpoints():
         fw.resolve_settings(parse_cli(['--llm', '--llm-base-url', 'http://127.0.0.1:9/v1', 'p.txt']), environ={})
 
 
+@pytest.mark.parametrize('llm', [
+    '[llm]\nenabled = true\nbase_url = http://127.0.0.1:9/v1\n',  # no model
+    '[llm]\nenabled = true\nbase_url =\nmodel = m\n',  # no base_url
+    '[llm]\nenabled = true\nbase_url = https://u:k@gw.example/v1/@cf\nmodel = m\n',  # a URL 1.65 refuses
+])
+def test_events_url_skips_the_llm_checks(tmp_path, llm):
+    # The LLM never runs with events_url set, so a broken [llm] section must not stop firewatcher.
+    conf = tmp_path / 'fw.conf'
+    conf.write_text(llm + '[notify]\nevents_url = http://127.0.0.1:9/api/events\n')
+    settings = fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+    assert settings.llm_enabled and settings.events_url
+    # Without events_url the same [llm] section is still refused.
+    conf.write_text(llm)
+    with pytest.raises(fw.ConfigError, match='llm'):
+        fw.resolve_settings(parse_cli(['--config', str(conf), 'p.txt']), environ={})
+
+
 def test_tri_state_flags_reject_both_directions():
     with pytest.raises(SystemExit):
         parse_cli(['--llm', '--no-llm', 'p.txt'])

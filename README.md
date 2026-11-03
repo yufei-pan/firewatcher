@@ -217,7 +217,7 @@ The ntfy topic URL is not printed at startup or in error messages, since on a pu
 
 Set `[notify] events_url` to an `http://` or `https://` URL (empty means off) and firewatcher POSTs every finished capture, with an excerpt of it, to that service as JSON, with `Content-Type: application/json`. If `events_token` is set (or `FIREWATCHER_EVENTS_TOKEN`), it is sent as `Authorization: Bearer <token>`. The service can be a log dashboard, a webhook relay, or anything that accepts the POST; the timeout is `[notify] timeout`.
 
-The receiver judges. With `events_url` set, firewatcher's own LLM analysis is off whatever `[llm] enabled` says: no capture goes to the model, and nothing is appended to the capture file. The only judgment left at the source is the rule-based floor, `always_notify`. The fields:
+The receiver judges. With `events_url` set, firewatcher's own LLM analysis is off whatever `[llm] enabled` says: no capture goes to the model, nothing is appended to the capture file, and `[llm] base_url` and `model` are not checked at startup. The only judgment left at the source is the rule-based floor, `always_notify`. The fields:
 
 | Field | Meaning |
 | --- | --- |
