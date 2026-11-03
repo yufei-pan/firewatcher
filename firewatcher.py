@@ -1343,12 +1343,15 @@ def _open_url(request, timeout):
 	return urllib.request.build_opener(NoRedirect).open(request, timeout=timeout)
 
 
-def _http_error_reason(exc, url):
-	"""'HTTP <code> from <origin>', and for a 3xx that it was refused. Never the Location: it is the server's, not ours to log."""
-	code = getattr(exc, 'code', '?')
-	reason = 'HTTP %s from %s' % (code, _url_origin(url))
-	if isinstance(code, int) and 300 <= code < 400:
-		reason += ' (redirect, not followed)'
+def _http_error_reason(exc, url, detail=None):
+	"""'HTTP <code> from <origin>', then ': detail' when given; a 3xx says it was refused instead, without its body.
+
+	Never the Location: it is the server's, not ours to log."""
+	reason = 'HTTP %s from %s' % (exc.code, _url_origin(url))
+	if 300 <= exc.code < 400:
+		return reason + ' (redirect, not followed)'
+	if detail is not None:
+		reason += ': ' + detail[:300]
 	return reason
 
 
@@ -1361,14 +1364,12 @@ def _urlopen_bytes(url, data, headers, timeout):
 		with _open_url(request, timeout) as response:
 			return response.read()
 	except urllib.error.HTTPError as exc:
-		if isinstance(exc.code, int) and 300 <= exc.code < 400:
-			raise RuntimeError(_http_error_reason(exc, url))
 		detail = ''
 		try:
 			detail = exc.read().decode('utf-8', 'replace')
 		except Exception:
 			detail = ''
-		raise RuntimeError('%s: %s' % (_http_error_reason(exc, url), detail[:300]))
+		raise RuntimeError(_http_error_reason(exc, url, detail))
 
 
 def _parse_llm_object(content):
