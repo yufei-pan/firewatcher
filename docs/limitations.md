@@ -33,8 +33,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   with digits followed by `/`), the text up to the `/` is a valid host and port (`u`, port 2024), so firewatcher
   accepts it and its log lines show `http://u:2024`: the leading digits of the password appear as the port, and the
   request goes to host `u`. The same holds for a password that starts with `/`, `?` or `#` (`http://usr:/…@h/e`
-  goes to host `usr`).
+  goes to host `usr`). Because such a URL reads as a host and port, firewatcher gives it no user:password warning.
 - Why: such a URL is valid as written; refusing it would mean refusing an `@` in a URL's path, which valid LLM URLs
   use. Credentials in a URL are never sent anyway (README: use `events_token`, `token` or `api_key`).
 - Revisit when: a way to tell such a URL from a real host and path appears, or someone hits it.
-- Approved: 2026-11-01, the user ticked "fw: digits shown as port".
+- Approved: 2026-11-01, the user ticked "fw: digits shown as port". The no-warning sentence added 2026-11-04, the user: "Add it to the wording".
