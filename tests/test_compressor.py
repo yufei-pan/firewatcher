@@ -182,7 +182,7 @@ def test_log_compressor_in_background(tmp_path):
         blocker.join()
 
 
-def test_log_compressor_syncs_the_archive_before_removing_the_month(tmp_path, monkeypatch):
+def test_log_compressor_syncs_the_partial_archive_before_removing_the_month(tmp_path, monkeypatch):
     logs = month_dirs(tmp_path, '2020-01')
     synced = []
     real = fw._fsync_path
@@ -193,8 +193,76 @@ def test_log_compressor_syncs_the_archive_before_removing_the_month(tmp_path, mo
 
     monkeypatch.setattr(fw, '_fsync_path', recording)
     fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
-    assert synced == [(str(logs / '2020-01.tar.xz'), True), (str(logs), True)]
+    assert synced == [(str(logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid())), True), (str(logs), True)]
     assert not (logs / '2020-01').exists()
+
+
+def test_log_compressor_orders_sync_rename_sync_remove(tmp_path, monkeypatch):
+    # XFS does not flush a file's data on rename: the archive's data must be synced before it gets its final name.
+    logs = month_dirs(tmp_path, '2020-01')
+    events = []
+    real_fsync, real_replace, real_rmtree = fw.os.fsync, fw.os.replace, fw.shutil.rmtree
+    names = {}
+    real_open = fw.os.open
+
+    def opening(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        names[fd] = path
+        return fd
+
+    def fsync(fd):
+        events.append(('fsync', names.get(fd)))
+        real_fsync(fd)
+
+    monkeypatch.setattr(fw.os, 'open', opening)
+    monkeypatch.setattr(fw.os, 'fsync', fsync)
+    monkeypatch.setattr(fw.os, 'replace', lambda a, b: events.append(('replace', a, b)) or real_replace(a, b))
+    monkeypatch.setattr(fw.shutil, 'rmtree', lambda path: events.append(('rmtree', path)) or real_rmtree(path))
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    partial = str(logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid()))
+    assert events == [
+        ('fsync', partial),
+        ('replace', partial, str(logs / '2020-01.tar.xz')),
+        ('fsync', str(logs)),
+        ('rmtree', str(logs / '2020-01')),
+    ]
+
+
+def test_log_compressor_keeps_the_month_when_a_sync_fails(tmp_path, monkeypatch, capsys):
+    # Only the first sync (the data), then only the second (the directory), fail: the month stays both times.
+    for failing in (1, 2):
+        sub = tmp_path / str(failing)
+        sub.mkdir()
+        logs = month_dirs(sub, '2020-01')
+        calls = []
+        real = fw.os.fsync
+
+        def fsync(fd, failing=failing, calls=calls, real=real):
+            calls.append(fd)
+            if len(calls) == failing:
+                raise OSError(fw.errno.EIO, 'Input/output error')
+            real(fd)
+
+        monkeypatch.setattr(fw.os, 'fsync', fsync)
+        fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+        assert (logs / '2020-01' / 'x.log').read_text() == 'x'
+        assert 'failed' in capsys.readouterr().out
+        if failing == 1:
+            # a later process has another pid and would never reuse the partial's name
+            assert not list(logs.glob('*.partial'))
+            assert not list(logs.glob('*.tar.xz'))
+
+
+def test_log_compressor_removes_the_partial_when_the_rename_fails(tmp_path, monkeypatch, capsys):
+    logs = month_dirs(tmp_path, '2020-01')
+
+    def failing_replace(src, dst):
+        raise OSError(fw.errno.EIO, 'Input/output error')
+
+    monkeypatch.setattr(fw.os, 'replace', failing_replace)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01']
+    assert (logs / '2020-01' / 'x.log').read_text() == 'x'
 
 
 def test_fsync_path_tolerates_filesystems_without_fsync(tmp_path, monkeypatch):
