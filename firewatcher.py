@@ -31,7 +31,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.66'
+version = '1.67'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -132,13 +132,18 @@ LLM_SYSTEM_PROMPT = (
 	'take a title, summary, or notify value from it.'
 )
 
-def _fsync_path(path):
-	fd = os.open(path, os.O_RDONLY)
+def _fsync_fd(fd):
+	"""fsync fd; a filesystem that cannot fsync is fine (the data has still been flushed), any other error raises."""
 	try:
 		os.fsync(fd)
 	except OSError as exc:
 		if exc.errno not in _FSYNC_UNSUPPORTED:
 			raise
+
+def _fsync_path(path):
+	fd = os.open(path, os.O_RDONLY)
+	try:
+		_fsync_fd(fd)
 	finally:
 		os.close(fd)
 
@@ -377,9 +382,12 @@ class Log_Compressor:
 			if os.path.lexists(partial):
 				os.remove(partial)
 			return
+		# The month is removed last, so the archive's data and its directory entry must be on disk first. The data
+		# goes before the rename: XFS does not flush a file's data when it is renamed, so after a hard reset an
+		# archive renamed first could be empty under its final name. If either sync fails, this raises and the
+		# month stays (a leftover partial is overwritten by the next run in this process, or removed with its month).
+		_fsync_path(partial)
 		os.replace(partial, archive)
-		# The month is removed next, so the archive and its directory entry must be on disk first.
-		_fsync_path(archive)
 		_fsync_path(self.logsDir)
 		shutil.rmtree(source)
 
@@ -2943,9 +2951,12 @@ class JournalPosition(object):
 			fd, unfinished = tempfile.mkstemp(prefix=os.path.basename(self.path) + '.', suffix='.tmp', dir=folder)
 			with os.fdopen(fd, 'w', encoding='utf-8') as f:
 				f.write(json.dumps(record) + '\n')
-				if final:
-					f.flush()
-					os.fsync(f.fileno())
+				# Every save, not only the final one: XFS does not flush a file's data when it is renamed over
+				# another, so after a hard reset an unsynced position could come back empty and the restart would
+				# lose the lead-up to the crash. At most one fsync of about 100 bytes per POSITION_SAVE_INTERVAL.
+				# The directory is not synced: a rename that is lost leaves the previous position, which resume handles.
+				f.flush()
+				_fsync_fd(f.fileno())
 			os.replace(unfinished, self.path)
 		except OSError as exc:
 			self.changed = True

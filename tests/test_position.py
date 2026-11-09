@@ -178,6 +178,48 @@ def test_saw_saves_once_per_interval_and_round_trips(tmp_path):
     assert replay(again, [jline(0, 'a'), jline(0, 'b'), jline(0, 'c'), jline(1, 'd'), jline(1, 'e')]) == ['old'] * 4 + ['new']
 
 
+def test_every_save_syncs_the_file_before_the_rename(tmp_path, monkeypatch):
+    # XFS does not flush a file's data when it is renamed over another; after a hard reset an unsynced
+    # position could come back empty. Even a periodic save (final=False) must sync first.
+    path = tmp_path / 'journal.position'
+    position = fw.JournalPosition(str(path), now=T)
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        events.append('fsync')
+        real_fsync(fd)
+
+    def replace(a, b):
+        events.append('replace')
+        real_replace(a, b)
+
+    monkeypatch.setattr(fw.os, 'fsync', fsync)
+    monkeypatch.setattr(fw.os, 'replace', replace)
+    position.saw(jline(0, 'a'), 100.0)
+    position.saw(jline(0, 'b'), 100.5)
+    assert events == ['fsync', 'replace']
+    position.saw(jline(1, 'c'), 101.5)
+    assert events == ['fsync', 'replace'] * 2
+    position.changed = True
+    position.save(final=True)
+    assert events == ['fsync', 'replace'] * 3
+    assert json.loads(path.read_text())['line'] == 1
+
+
+def test_save_survives_a_filesystem_without_fsync(tmp_path, monkeypatch):
+    def unsupported(fd):
+        raise OSError(fw.errno.EINVAL, 'Invalid argument')
+
+    monkeypatch.setattr(fw.os, 'fsync', unsupported)
+    path = tmp_path / 'journal.position'
+    position = fw.JournalPosition(str(path), now=T)
+    position.saw(jline(0, 'a'), 100.0)
+    position.save(100.0)
+    assert json.loads(path.read_text())['line'] == 1
+    assert not position.save_failed
+
+
 def test_save_without_a_new_line_writes_nothing(tmp_path):
     path = tmp_path / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
