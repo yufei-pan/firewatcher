@@ -247,6 +247,22 @@ def test_log_compressor_keeps_the_month_when_a_sync_fails(tmp_path, monkeypatch,
         fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
         assert (logs / '2020-01' / 'x.log').read_text() == 'x'
         assert 'failed' in capsys.readouterr().out
+        if failing == 1:
+            # a later process has another pid and would never reuse the partial's name
+            assert not list(logs.glob('*.partial'))
+            assert not list(logs.glob('*.tar.xz'))
+
+
+def test_log_compressor_removes_the_partial_when_the_rename_fails(tmp_path, monkeypatch, capsys):
+    logs = month_dirs(tmp_path, '2020-01')
+
+    def failing_replace(src, dst):
+        raise OSError(fw.errno.EIO, 'Input/output error')
+
+    monkeypatch.setattr(fw.os, 'replace', failing_replace)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01']
+    assert (logs / '2020-01' / 'x.log').read_text() == 'x'
 
 
 def test_fsync_path_tolerates_filesystems_without_fsync(tmp_path, monkeypatch):

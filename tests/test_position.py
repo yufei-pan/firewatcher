@@ -10,7 +10,7 @@ import time
 import pytest
 
 import firewatcher as fw
-from conftest import ROOT, ScriptedPopen, fake_exists, incident_logs, parse_cli, patch_popen, use_journal
+from conftest import ROOT, Clock, ScriptedPopen, fake_exists, incident_logs, parse_cli, patch_popen, use_journal
 
 # --- resuming the journal after a restart ---
 
@@ -489,32 +489,105 @@ def test_a_line_that_crashes_the_loop_is_not_read_again(tmp_path, monkeypatch):
     assert json.loads((tmp_path / 'journal.position').read_text())['time'] == T + 1
 
 
-def test_a_quiet_journal_during_a_capture_still_saves_the_position(tmp_path, monkeypatch):
-    monkeypatch.setattr(fw, 'CAPTURE_SYNC_INTERVAL', 0.05)
-    path = tmp_path / 'journal.position'
-    seen_while_quiet = []
-
+def _quiet_after(lines, path, expected):
+    """A stdout that serves lines (a str, or a float to wait that many seconds first), then stays quiet, polling
+    for up to 5 s until the position file holds `expected` (its line count) before it ends; the polls are returned."""
     class QuietStdout:
         def __init__(self):
-            self.lines = [jline(0, 'HIT one'), jline(0, 'HIT two')]
+            self.lines = list(lines)
+            self.seen = []
 
         def readline(self, size=-1):
-            if self.lines:
-                return self.lines.pop(0)
-            time.sleep(0.5)
-            seen_while_quiet.append(json.loads(path.read_text())['line'])
+            while self.lines:
+                item = self.lines.pop(0)
+                if isinstance(item, float):
+                    time.sleep(item)
+                else:
+                    return item
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    seen = json.loads(path.read_text())['line']
+                except (OSError, ValueError):
+                    seen = None
+                self.seen.append(seen)
+                if seen == expected:
+                    break
+                time.sleep(0.01)
             return ''
+    return QuietStdout()
 
+
+def _run_quiet(tmp_path, monkeypatch, stdout):
+    monkeypatch.setattr(fw.os, 'fsync', lambda fd: None)  # a slow disk must not decide this test
+    monkeypatch.setattr(fw, 'CAPTURE_SYNC_INTERVAL', 0.05)
+    monkeypatch.setattr(fw, 'POSITION_SAVE_INTERVAL', 0.05)
     popen = ScriptedPopen([])
-    popen.stdout = QuietStdout()
+    popen.stdout = stdout
     patch_popen(monkeypatch, popen)
     pat = tmp_path / 'p.txt'
     pat.write_text('HIT\n')
     fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
                         compress_after_months=0, delete_after_months=0,
-                        journal_position=fw.JournalPosition(str(path), now=T))
+                        journal_position=fw.JournalPosition(str(tmp_path / 'journal.position'), now=T))
+
+
+def test_a_quiet_journal_during_a_capture_still_saves_the_position(tmp_path, monkeypatch):
+    path = tmp_path / 'journal.position'
+    stdout = _quiet_after([jline(0, 'HIT one'), jline(0, 'HIT two')], path, 2)
+    _run_quiet(tmp_path, monkeypatch, stdout)
     # 'HIT two' only extended the open capture, so no save came with it: the quiet wait saved it
-    assert seen_while_quiet == [2]
+    assert stdout.seen[-1] == 2
+
+
+def test_a_line_synced_on_commit_has_its_position_saved_while_the_journal_is_quiet(tmp_path, monkeypatch):
+    # The line is read after the capture's sync interval, so the commit syncs it and nothing is left pending:
+    # only the position's own deadline wakes the read.
+    path = tmp_path / 'journal.position'
+    stdout = _quiet_after([jline(0, 'HIT one'), 0.2, jline(0, 'HIT two')], path, 2)
+    _run_quiet(tmp_path, monkeypatch, stdout)
+    assert stdout.seen[-1] == 2
+
+
+def test_a_position_save_never_covers_capture_lines_that_are_not_synced(tmp_path, monkeypatch):
+    clock = Clock(1_000_000.0)
+    monkeypatch.setattr(fw.time, 'time', clock.time)
+    monkeypatch.setattr(fw.os, 'fsync', lambda fd: None)
+    events = []
+    real_write, real_sync = fw.CaptureFile.write, fw.CaptureFile.sync
+
+    def write(self, text):
+        events.append('write')
+        return real_write(self, text)
+
+    def sync(self, now=None):
+        events.append('sync')
+        return real_sync(self, now)
+
+    monkeypatch.setattr(fw.CaptureFile, 'write', write)
+    monkeypatch.setattr(fw.CaptureFile, 'sync', sync)
+    unsynced_at_save = []
+
+    class Recording(fw.JournalPosition):
+        def save(self, now=None, final=False):
+            covers = self.changed and not final
+            super().save(now, final)
+            if covers:
+                # a write after the last sync would be on disk only by luck when the position reaches it
+                tail = events[len(events) - events[::-1].index('sync'):] if 'sync' in events else events
+                unsynced_at_save.append('write' in tail)
+
+    # The capture opens at t, 'a' and 'b' are written within the sync interval, and 'c' comes after the
+    # position's interval: its saw() saves a and b, which the capture has not synced yet.
+    popen = ScriptedPopen([(jline(0, 'HIT'), 0), (jline(0, 'a'), 0.25), (jline(0, 'b'), 0.25), (jline(1, 'c'), 0.75), (jline(1, 'd'), 0)], clock=clock)
+    patch_popen(monkeypatch, popen)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=600, output_folder=str(tmp_path / 'out'),
+                        compress_after_months=0, delete_after_months=0,
+                        journal_position=Recording(str(tmp_path / 'journal.position'), now=T))
+    assert len(unsynced_at_save) >= 2
+    assert not any(unsynced_at_save)
 
 
 def test_a_carriage_return_fragment_that_looks_like_a_stamp_is_harmless(tmp_path, monkeypatch):

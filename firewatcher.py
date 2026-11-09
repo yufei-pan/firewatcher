@@ -385,9 +385,19 @@ class Log_Compressor:
 		# The month is removed last, so the archive's data and its directory entry must be on disk first. The data
 		# goes before the rename: XFS does not flush a file's data when it is renamed, so after a hard reset an
 		# archive renamed first could be empty under its final name. If either sync fails, this raises and the
-		# month stays (a leftover partial is overwritten by the next run in this process, or removed with its month).
-		_fsync_path(partial)
-		os.replace(partial, archive)
+		# month stays.
+		try:
+			_fsync_path(partial)
+			os.replace(partial, archive)
+		except BaseException:
+			# A later process has another pid, so it would never reuse this name: a partial left here is a leak,
+			# one archive-sized file per attempt on a failing disk. The rename may have happened before the error.
+			try:
+				if os.path.lexists(partial):
+					os.remove(partial)
+			except OSError:
+				pass
+			raise
 		_fsync_path(self.logsDir)
 		shutil.rmtree(source)
 
@@ -2210,6 +2220,15 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	earlier = deque()
 	written = None  # the open capture's record
 
+	def sync_open_capture():
+		# A saved position must never cover capture lines that are not on disk: after a hard reset the restart
+		# would read them again only as context, so an incident would lose its lead-up.
+		if capture is not None and capture.dirty:
+			capture.sync()
+
+	if journal_position is not None:
+		journal_position.before_save = sync_open_capture
+
 	def end_capture(now):
 		nonlocal capture, capture_until, capture_ends_by, captured_line_counter, written
 		reached_max = capture_ends_by is not None and now >= capture_ends_by
@@ -2250,16 +2269,22 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							sync_due = capture.sync_due() if capture else None
 							if sync_due is not None and (deadline is None or sync_due < deadline):
 								deadline = sync_due
+							if journal_position is not None and journal_position.changed:
+								# A line the capture synced on commit leaves nothing pending, so without this its
+								# position would wait for the next line, or the end of the capture.
+								if deadline is None or journal_position.next_save < deadline:
+									deadline = journal_position.next_save
 							remaining = None if deadline is None else max(0, deadline - time.time())
 							line = pending_read.result(timeout=remaining)
 							pending_read = None
 					except ReadTimeout:
 						if journal_position is not None:
-							# Saved along with the capture's fsync below, so a quiet journal leaves no line unsaved for long.
+							# The save syncs the capture first (before_save), so a quiet journal leaves no line unsaved for long.
 							journal_position.save()
 						# Keep the same pending read while the source is quiet.
 						if capture and capture_until is not None and time.time() < capture_until:
-							capture.sync()
+							if capture.dirty:
+								capture.sync()
 							continue
 						end_capture(time.time())
 						continue
@@ -2834,6 +2859,8 @@ class JournalPosition(object):
 		self.ordinal = 0
 		self.changed = False
 		self.next_save = 0
+		# Called before every write of a changed position; capture_messages sets it to sync the open capture first.
+		self.before_save = None
 		self.save_failed = False
 		# The time of self.stamp, for the context: a line read long after it was logged keeps its own time.
 		self.stamp_time = None
@@ -2930,12 +2957,16 @@ class JournalPosition(object):
 			self.before = None
 
 	def save(self, now=None, final=False):
-		"""Write the position atomically; a failure is logged once and retried at the next save."""
+		"""Write the position atomically; a failure is logged once and retried at the next save.
+
+		final is not used: every save is fsynced. Two test subclasses use it to tell the save at exit from the others."""
 		import json
 		now = time.time() if now is None else now
 		self.next_save = now + POSITION_SAVE_INTERVAL
 		if not self.changed:
 			return
+		if self.before_save is not None:
+			self.before_save()
 		self.changed = False
 		import tempfile
 		record = {
@@ -2953,7 +2984,8 @@ class JournalPosition(object):
 				f.write(json.dumps(record) + '\n')
 				# Every save, not only the final one: XFS does not flush a file's data when it is renamed over
 				# another, so after a hard reset an unsynced position could come back empty and the restart would
-				# lose the lead-up to the crash. At most one fsync of about 100 bytes per POSITION_SAVE_INTERVAL.
+				# lose the lead-up to the crash. About 100 bytes per fsync, at most once per POSITION_SAVE_INTERVAL, plus
+				# the save that comes with a capture opening.
 				# The directory is not synced: a rename that is lost leaves the previous position, which resume handles.
 				f.flush()
 				_fsync_fd(f.fileno())
