@@ -220,6 +220,26 @@ def test_save_survives_a_filesystem_without_fsync(tmp_path, monkeypatch):
     assert not position.save_failed
 
 
+def test_a_stop_inside_the_save_of_saw_does_not_take_back_the_line_before(tmp_path):
+    path = tmp_path / 'journal.position'
+    position = fw.JournalPosition(str(path), now=T)
+    position.saw(jline(0, 'A'), 100.0)
+    position.save(100.0)
+    position.saw(jline(1, 'B'), 100.5)  # B is handled in full
+
+    def stop():
+        raise KeyboardInterrupt  # where SIGTERM lands: in the capture or position fsync of this save
+
+    position.before_save = stop
+    with pytest.raises(KeyboardInterrupt):
+        position.saw(jline(2, 'C'), 101.5)  # C is in flight
+    position.unsee()  # what capture_messages does for the line in flight
+    position.before_save = None
+    position.save(final=True)
+    # B was handled, so the restart must not read it again
+    assert json.loads(path.read_text())['time'] == T + 1
+
+
 def test_save_without_a_new_line_writes_nothing(tmp_path):
     path = tmp_path / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)

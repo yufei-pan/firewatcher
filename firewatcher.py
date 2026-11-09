@@ -2934,6 +2934,9 @@ class JournalPosition(object):
 	def saw(self, line, now):
 		"""Record a line as read, before it is handled. The periodic save (at most once per POSITION_SAVE_INTERVAL)
 		runs first, so it never covers a line still being handled; unsee() takes the line back."""
+		# Cleared first: a stop that lands inside the save below must not make unsee() take back the line before
+		# this one, which was already handled in full.
+		self.before = None
 		if self.changed and now >= self.next_save:
 			self.save(now)
 		self.before = (self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed)
