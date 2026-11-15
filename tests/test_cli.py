@@ -108,9 +108,12 @@ def test_module_has_no_nebula_product_name():
     assert fw.__version__ == fw.version
 
 
-def test_print_flushes_by_default(capsys):
+def test_print_flushes_by_default(monkeypatch):
+    seen = []
+    monkeypatch.setattr(fw.builtins, 'print', lambda *args, **kwargs: seen.append(kwargs.get('flush')))
     fw.print('hello-flush')
-    assert 'hello-flush' in capsys.readouterr().out
+    fw.print('no-force', flush=False)
+    assert seen == [True, False]
 
 
 def test_module_entrypoint_version():
@@ -124,9 +127,10 @@ def test_module_entrypoint_version():
     assert fw.version in (result.stdout + result.stderr)
 
 
-def test_parser_workers_flag():
-    parsed = parse_cli(['--workers', '0', 'p.txt'])
-    assert parsed.workers == 0
+def test_parser_accepts_the_hidden_workers_flag():
+    # never implemented; accepted so units that pass it keep starting
+    assert parse_cli(['--workers', '0', 'p.txt']).workers == 0
+    assert '--workers' not in fw.build_parser().format_help()
 
 
 def test_main_install_defaults_pattern_dir(tmp_path, monkeypatch):
@@ -138,11 +142,6 @@ def test_main_install_defaults_pattern_dir(tmp_path, monkeypatch):
     assert fw.main(['--install-service', '--no-enable', '-o', str(tmp_path / 'out')]) == 0
     assert '\npatterns = %s\n' % fw.DEFAULT_PATTERNS_DIR in open(fw.DEFAULT_CONFIG_PATH, encoding='utf-8').read()
     assert calls == [('daemon-reload',)]
-
-
-def test_print_honors_explicit_flush_false(capsys):
-    fw.print('no-force', flush=False)
-    assert 'no-force' in capsys.readouterr().out
 
 
 def test_import_leaves_http_and_secret_modules_unloaded():
@@ -338,10 +337,6 @@ def test_sighup_reloads_the_pattern_files_of_a_running_daemon(tmp_path):
     assert proc.returncode == 0, output
     assert 'reloaded patterns: 0 regex, 1 plain' in output
     assert '-> NEW second' in capture_file.read_text()
-
-
-def test_parser_hides_unimplemented_workers_flag():
-    assert '--workers' not in fw.build_parser().format_help()
 
 
 def test_parser_accepts_hyphenated_spellings():

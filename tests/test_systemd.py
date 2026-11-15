@@ -107,14 +107,6 @@ def test_render_unit_repeatable_requires_mounts():
     assert unit.count('remote-fs.target') == 1
 
 
-def test_quote_unit_arg():
-    assert fw._quote_unit_arg('/usr/bin/firewatcher') == '/usr/bin/firewatcher'
-    assert fw._quote_unit_arg('/mnt/My Logs/out') == '"/mnt/My Logs/out"'
-    assert fw._quote_unit_arg('a"b') == '"a\\"b"'
-    assert fw._quote_unit_arg('a\\b') == '"a\\\\b"'
-    assert fw._quote_unit_arg('') == '""'
-
-
 def test_unit_name_sanitized():
     parsed = parse_cli(['--print-unit', '--unit-name', 'firewatcher.service', 'p.txt'])
     assert fw.unit_filename(parsed.unit_name) == 'firewatcher.service'
@@ -457,6 +449,11 @@ def systemd_words(exec_start):
 
 
 def test_quote_unit_arg_escapes_for_systemd():
+    assert fw._quote_unit_arg('/usr/bin/firewatcher') == '/usr/bin/firewatcher'
+    assert fw._quote_unit_arg('/mnt/My Logs/out') == '"/mnt/My Logs/out"'
+    assert fw._quote_unit_arg('a"b') == '"a\\"b"'
+    assert fw._quote_unit_arg('a\\b') == '"a\\\\b"'
+    assert fw._quote_unit_arg('') == '""'
     assert fw._quote_unit_arg('100%') == '100%%'
     assert fw._quote_unit_arg('$HOME') == '$$HOME'
     assert fw._quote_unit_arg("don't") == '"don\'t"'
