@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import firewatcher as fw
-from conftest import ROOT, parse_cli, fake_exists, incident_logs
+from conftest import ROOT, parse_cli, fake_exists, incident_logs, ok_systemctl
 
 # --- CLI / main ---
 
@@ -129,16 +129,15 @@ def test_parser_workers_flag():
     assert parsed.workers == 0
 
 
-def test_main_install_defaults_pattern_dir(monkeypatch):
-    seen = {}
-
-    def fake_install(parsed, raw=None):
-        seen['patterns'] = list(parsed.pattern_file)
-        return 0
-
-    monkeypatch.setattr(fw, 'install_service', fake_install)
-    assert fw.main(['--install-service']) == 0
-    assert seen['patterns'] == [fw.DEFAULT_PATTERNS_DIR]
+def test_main_install_defaults_pattern_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'systemd_is_available', lambda: True)
+    monkeypatch.setattr(fw, 'SYSTEMD_UNIT_DIR', str(tmp_path / 'units'))
+    monkeypatch.setattr(fw, 'resolve_executable', lambda: '/bin/fw')
+    calls = []
+    monkeypatch.setattr(fw, '_run_systemctl', lambda systemctl, *cmd: calls.append(cmd) or ok_systemctl())
+    assert fw.main(['--install-service', '--no-enable', '-o', str(tmp_path / 'out')]) == 0
+    assert '\npatterns = %s\n' % fw.DEFAULT_PATTERNS_DIR in open(fw.DEFAULT_CONFIG_PATH, encoding='utf-8').read()
+    assert calls == [('daemon-reload',)]
 
 
 def test_print_honors_explicit_flush_false(capsys):

@@ -126,11 +126,6 @@ def test_unit_name_sanitized():
         fw.unit_filename('/etc/systemd/system/x.service')
 
 
-def test_systemd_is_available(tmp_path):
-    assert fw.systemd_is_available(str(tmp_path)) is True
-    assert fw.systemd_is_available(str(tmp_path / 'missing')) is False
-
-
 def test_resolve_executable(monkeypatch):
     monkeypatch.setattr(fw.shutil, 'which', lambda name: '/usr/bin/firewatcher' if name == 'firewatcher' else None)
     assert fw.resolve_executable() == '/usr/bin/firewatcher'
@@ -341,7 +336,7 @@ def test_uninstall_service_reload_failure(tmp_path):
     assert rc == 4
 
 
-def test_systemd_is_available_uses_module_default(monkeypatch, tmp_path):
+def test_systemd_is_available(monkeypatch, tmp_path):
     monkeypatch.setattr(fw, 'SYSTEMD_RUNTIME_DIR', str(tmp_path))
     assert fw.systemd_is_available() is True
     monkeypatch.setattr(fw, 'SYSTEMD_RUNTIME_DIR', str(tmp_path / 'missing'))

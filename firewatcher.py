@@ -1180,15 +1180,13 @@ def _explicit_cli_args(raw):
 
 
 def _prepare_unit_settings(args, raw=None):
+	"""(settings, parsed command line) for a unit, which watches DEFAULT_PATTERNS_DIR when no pattern is given."""
 	if getattr(args, '_resolved', False):
-		resolved = args
-		if raw is None:
-			raw = args.raw
+		resolved, raw = args, args.raw if raw is None else raw
 	else:
-		raw = args
-		resolved = resolve_settings(args)
-		if not resolved.pattern_file and (getattr(raw, 'print_unit', False) or getattr(raw, 'install_service', False)):
-			resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
+		resolved, raw = resolve_settings(args), args
+	if not resolved.pattern_file:
+		resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
 	return resolved, raw
 
 
@@ -2378,11 +2376,9 @@ EXAMPLE_PATTERNS = {
 }
 
 
-def systemd_is_available(runtime_dir=None):
+def systemd_is_available():
 	"""True when this host is booted with systemd (PID 1)."""
-	if runtime_dir is None:
-		runtime_dir = SYSTEMD_RUNTIME_DIR
-	return os.path.isdir(runtime_dir)
+	return os.path.isdir(SYSTEMD_RUNTIME_DIR)
 
 
 def _is_pattern_filename(name):
@@ -2464,25 +2460,20 @@ def render_unit_file(args, executable=None, config_exists=None, raw=None):
 	if config_exists:
 		parts.extend(_explicit_cli_args(raw))
 		if not resolved.config_has_patterns and not getattr(raw, 'pattern_file', None):
-			parts.extend(resolved.pattern_file or [DEFAULT_PATTERNS_DIR])
+			parts.extend(resolved.pattern_file)
 	exec_start = ' '.join([_quote_unit_arg(executable, program=True)] + [_quote_unit_arg(p) for p in parts])
 	after = ['network-online.target']
-	wants = ['network-online.target']
 	if not resolved.log_file:
 		after.insert(0, 'systemd-journald.socket')
-	requires = []
-	for mount in (getattr(resolved, 'requires_mounts_for', None) or []):
-		requires.append(mount)
-		if 'remote-fs.target' not in after:
-			after.append('remote-fs.target')
+	if resolved.requires_mounts_for:
+		after.append('remote-fs.target')
 	lines = [
 		'[Unit]',
 		'Description=firewatcher: persist log context around incident patterns',
 		'After=' + ' '.join(after),
-		'Wants=' + ' '.join(wants),
+		'Wants=network-online.target',
 	]
-	for mount in requires:
-		lines.append('RequiresMountsFor=' + _quote_unit_path(mount))
+	lines.extend('RequiresMountsFor=' + _quote_unit_path(mount) for mount in resolved.requires_mounts_for)
 	stop_sec = max(30, int(resolved.llm_timeout) + int(resolved.ntfy_timeout) * (2 if resolved.events_url else 1) + 15)
 	lines.extend([
 		'',
@@ -2563,8 +2554,6 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	except ConfigError as exc:
 		print(str(exc), file=sys.stderr)
 		return 2
-	if not resolved.pattern_file:
-		resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
 	if unit_dir is None:
 		unit_dir = SYSTEMD_UNIT_DIR
 	os.makedirs(resolved.output_folder, exist_ok=True)
@@ -2589,7 +2578,7 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	if getattr(reload, 'returncode', 0):
 		print(f"systemctl daemon-reload failed (exit {reload.returncode})", file=sys.stderr)
 		return reload.returncode
-	if getattr(resolved, 'no_enable', False):
+	if resolved.no_enable:
 		return 0
 	enable = _run_systemctl(systemctl, 'enable', '--now', unit_filename(resolved.unit_name))
 	if getattr(enable, 'returncode', 0):
@@ -2970,11 +2959,8 @@ def main(argv=None):
 		resolved = resolve_settings(args)
 	except ConfigError as exc:
 		parser.error(str(exc))
-	if not resolved.pattern_file:
-		if args.install_service or args.print_unit:
-			resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
-		else:
-			parser.error('pattern file or directory required (for example /etc/firewatcher/patterns.d)')
+	if not resolved.pattern_file and not (args.install_service or args.print_unit):
+		parser.error('pattern file or directory required (for example /etc/firewatcher/patterns.d)')
 	for row in userinfo_warnings(resolved):
 		print(row, file=sys.stderr)
 	if args.print_unit:
