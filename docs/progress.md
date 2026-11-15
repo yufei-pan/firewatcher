@@ -8,6 +8,7 @@ Open work lives here and nowhere else (RULES, "Long work: the progress file"). E
 ## Open work
 
 ### Next release, 1.68 (no written plan; the 1.67 release notes name the first item)
+- **Building (started 2026-11-14):** branch feat/168 (worktree firewatcher-168), with the simplify pass and the install checks below; the rows of this section are in the build.
 - **Declare the license as an SPDX expression in `setup.py`.** State: not started. Where: `setup.py` on master effe920 still passes `license='GPLv3+'` and the `License :: OSI Approved ...` classifier. Copy the conditional from multiSSH3's `setup.py`: setuptools 77 or later gets `license_expression='GPL-3.0-or-later'` and no license classifier; older ones (all a Python 3.6 install has) get the free-text license and the classifier. `MANIFEST.in` already ships `LICENSE`. From: the 1.67 release notes, "What is planned next": "The license metadata as an SPDX expression, as the other cas tools have it".
 - **Add Python 3.11 to the GitHub CI matrix.** State: not started. Where: `.github/workflows/test.yml`, matrix `["3.9", "3.12", "3.14"]` plus the Python 3.6 container; add `"3.11"` in the commit of the release push. The 3.12 entry runs the coverage step (`--cov-fail-under=95`) and every other version the plain test step, so `"3.11"` takes the plain step as the file is written. From: the user, 2026-11-12: "Add 3.11 to CI (Recommended)", for every repo's next release.
 
