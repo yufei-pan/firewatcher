@@ -767,7 +767,7 @@ def test_install_writes_a_quoted_mount_path_to_the_unit(tmp_path):
 # --- values that are not UTF-8 ---
 # Python decodes argv, paths and the environment with surrogateescape: bytes the locale cannot decode (every
 # non-ASCII byte on Python 3.6 under a C locale) arrive as lone surrogates. An install refuses them, so no
-# service is handed a path it cannot encode.
+# install made under a locale hands its service a path that locale cannot encode.
 
 def not_utf8(path):
     return (str(path).encode() + b'/caf\xe9').decode('utf-8', 'surrogateescape')
