@@ -1160,7 +1160,7 @@ def _strict_utf8(text):
 	except UnicodeEncodeError:
 		raise ConfigError('a path or value is not valid UTF-8 text, so it cannot go into a config or unit file. '
 						  'On Python 3.6 a C locale reads every non-ASCII byte that way: run under a UTF-8 locale '
-						  '(for example LC_ALL=C.UTF-8)')
+						  '(one that `locale -a` lists, such as en_US.UTF-8 or C.UTF-8)')
 	return text
 
 

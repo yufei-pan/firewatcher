@@ -63,7 +63,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   first write. Not worse than 1.67.
 - Revisit when: 1.69. Plan: when `daemon-reload` or `enable --now` fails after this run created the config, remove the
   config and the unit this run wrote (it created the config with `O_EXCL`, so it is sure the file is its own), so the
-  rerun is a clean install. A config that existed before the run stays.
+  rerun is a clean install. A config that existed before the run stays, and so does a unit this run replaced rather than created.
 
 ### The journal replay treats a whole second as context when the saved line is no longer in the journal
 - Kind: deferred
@@ -79,11 +79,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   cannot reach the saved number (a line read again is the safe mistake), and test it with a journal that lost the start of
   the second.
 
+### On Python 3.6 under a C locale, a service given a non-ASCII path dies when it writes there
+- Kind: deferred
+- What the operator sees: firewatcher run by hand, or from a hand-written config, on Python 3.6 under a C locale with a
+  non-ASCII output folder, log file or note stops with `UnicodeEncodeError` at the first capture or at start. An install
+  no longer writes such a path (1.68 refuses it, exit 2), and Python 3.7 and later are not affected. 1.67 does the same.
+- Why: Python 3.6 reads non-ASCII bytes under a C locale as undecodable text, which its file calls then cannot encode.
+  Found by the 1.68 final review (2026-11-15, F2).
+- Revisit when: 1.69. Plan: give such values to the file calls as their bytes, as the local branch `superseded-local-1.61`
+  did with `_as_utf8` (kept as the tag `archive/superseded-local-1.61`), or stop and say to run under a UTF-8 locale.
+
 ### A command-line `--tail-lines ''` reaches `tail -n ''`, which the config file's empty value does not
 - Kind: deferred
 - What the operator sees: `firewatcher --tail-lines '' ...` (also `--tail_lines ''`, and a unit that carries it) starts
   `tail -n ''`, which exits with "invalid number of lines"; firewatcher then ends ("Processed 0 lines") and, under
-  systemd, restarts in a loop. An empty `tail_lines =` in the config file is ignored, as an unset value. 1.67 does the same.
+  systemd, restarts in a loop. Following the journal with no saved position fails the same way (`journalctl` answers "Failed to parse --lines=''"). An empty `tail_lines =` in the config file is ignored, as an unset value. 1.67 does the same.
 - Why: found by the 1.68 final review (2026-11-15). The command-line value is used as given, while the config loader skips
   an empty one.
 - Revisit when: 1.69. Plan: treat an empty `--tail-lines` as unset in the argument parser, the way the config file does.
