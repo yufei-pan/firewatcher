@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import firewatcher as fw
-from conftest import ROOT, parse_cli, fake_exists, incident_logs
+from conftest import ROOT, parse_cli, fake_exists, incident_logs, ok_systemctl
 
 # --- CLI / main ---
 
@@ -104,13 +104,16 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
     src = open(fw.__file__, encoding='utf-8').read().lower()
     assert 'nebula' not in src
-    assert fw.version == '1.67'
+    assert fw.version == '1.68'
     assert fw.__version__ == fw.version
 
 
-def test_print_flushes_by_default(capsys):
+def test_print_flushes_by_default(monkeypatch):
+    seen = []
+    monkeypatch.setattr(fw.builtins, 'print', lambda *args, **kwargs: seen.append(kwargs.get('flush')))
     fw.print('hello-flush')
-    assert 'hello-flush' in capsys.readouterr().out
+    fw.print('no-force', flush=False)
+    assert seen == [True, False]
 
 
 def test_module_entrypoint_version():
@@ -124,26 +127,21 @@ def test_module_entrypoint_version():
     assert fw.version in (result.stdout + result.stderr)
 
 
-def test_parser_workers_flag():
-    parsed = parse_cli(['--workers', '0', 'p.txt'])
-    assert parsed.workers == 0
+def test_parser_accepts_the_hidden_workers_flag():
+    # never implemented; accepted so units that pass it keep starting
+    assert parse_cli(['--workers', '0', 'p.txt']).workers == 0
+    assert '--workers' not in fw.build_parser().format_help()
 
 
-def test_main_install_defaults_pattern_dir(monkeypatch):
-    seen = {}
-
-    def fake_install(parsed, raw=None):
-        seen['patterns'] = list(parsed.pattern_file)
-        return 0
-
-    monkeypatch.setattr(fw, 'install_service', fake_install)
-    assert fw.main(['--install-service']) == 0
-    assert seen['patterns'] == [fw.DEFAULT_PATTERNS_DIR]
-
-
-def test_print_honors_explicit_flush_false(capsys):
-    fw.print('no-force', flush=False)
-    assert 'no-force' in capsys.readouterr().out
+def test_main_install_defaults_pattern_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'systemd_is_available', lambda: True)
+    monkeypatch.setattr(fw, 'SYSTEMD_UNIT_DIR', str(tmp_path / 'units'))
+    monkeypatch.setattr(fw, 'resolve_executable', lambda: '/bin/fw')
+    calls = []
+    monkeypatch.setattr(fw, '_run_systemctl', lambda systemctl, *cmd: calls.append(cmd) or ok_systemctl())
+    assert fw.main(['--install-service', '--no-enable', '-o', str(tmp_path / 'out')]) == 0
+    assert '\npatterns = %s\n' % fw.DEFAULT_PATTERNS_DIR in open(fw.DEFAULT_CONFIG_PATH, encoding='utf-8').read()
+    assert calls == [('daemon-reload',)]
 
 
 def test_import_leaves_http_and_secret_modules_unloaded():
@@ -339,10 +337,6 @@ def test_sighup_reloads_the_pattern_files_of_a_running_daemon(tmp_path):
     assert proc.returncode == 0, output
     assert 'reloaded patterns: 0 regex, 1 plain' in output
     assert '-> NEW second' in capture_file.read_text()
-
-
-def test_parser_hides_unimplemented_workers_flag():
-    assert '--workers' not in fw.build_parser().format_help()
 
 
 def test_parser_accepts_hyphenated_spellings():

@@ -16,7 +16,6 @@ def test_missing_default_config_uses_builtins():
     assert settings.filter_only is False
     assert settings.llm_enabled is False
     assert settings.notify_enabled is False
-    assert settings.config_existed is False
 
 
 def test_explicit_missing_config_is_an_error(tmp_path):
@@ -76,7 +75,7 @@ def test_env_overrides_secrets_and_percent_roundtrips(tmp_path):
     assert settings.llm_api_key == 'abc%def'
     assert settings.ntfy_token == 'tok%en'
     dest = tmp_path / 'written.conf'
-    fw.write_config_file(str(dest), settings)
+    fw.write_config_file(str(dest), fw.render_config_text(settings))
     assert (os.stat(dest).st_mode & 0o777) == 0o600
     again = fw.resolve_settings(parse_cli(['--config', str(dest)]), environ={})
     assert again.llm_api_key == 'abc%def'
@@ -93,7 +92,7 @@ def test_generated_config_prefills_compact_valid_ntfy_topic(tmp_path, monkeypatc
     monkeypatch.setattr(fw.socket, 'gethostname', lambda: hostname)
     conf = tmp_path / 'generated.conf'
     settings = fw.resolve_settings(parse_cli(['p.txt']), environ={})
-    fw.write_config_file(str(conf), settings)
+    fw.write_config_file(str(conf), fw.render_config_text(settings))
 
     loaded = fw.resolve_settings(parse_cli(['--config', str(conf)]), environ={})
     prefix = 'https://ntfy.sh/firewatcher-' + topic_host + '-'
@@ -111,15 +110,15 @@ def test_new_configs_get_distinct_topics_without_overwriting_existing_config(tmp
     settings = fw.resolve_settings(parse_cli(['p.txt']), environ={})
     first = tmp_path / 'first.conf'
     second = tmp_path / 'second.conf'
-    fw.write_config_file(str(first), settings)
-    fw.write_config_file(str(second), settings)
+    fw.write_config_file(str(first), fw.render_config_text(settings))
+    fw.write_config_file(str(second), fw.render_config_text(settings))
     first_settings = fw.resolve_settings(parse_cli(['--config', str(first)]), environ={})
     second_settings = fw.resolve_settings(parse_cli(['--config', str(second)]), environ={})
     assert first_settings.ntfy_url != second_settings.ntfy_url
 
     original = first.read_bytes()
     with pytest.raises(FileExistsError):
-        fw.write_config_file(str(first), settings)
+        fw.write_config_file(str(first), fw.render_config_text(settings))
     assert first.read_bytes() == original
 
 
@@ -132,7 +131,7 @@ def test_generated_config_preserves_explicit_url_and_special_values(tmp_path):
         fw.NTFY_TOKEN_ENV: 'token%with;semicolon # literal',
     })
     conf = tmp_path / 'generated.conf'
-    fw.write_config_file(str(conf), settings)
+    fw.write_config_file(str(conf), fw.render_config_text(settings))
     loaded = fw.resolve_settings(parse_cli(['--config', str(conf)]), environ={})
     assert loaded.ntfy_url == 'https://ntfy.example/my-topic'
     assert loaded.notify_enabled is True
@@ -362,7 +361,7 @@ def test_generated_config_round_trips_new_settings(tmp_path):
         '--capture-time-max', '900', '--fallback-folder', '', '--always-notify', '/a', '--always-notify', '/b', 'p.txt',
     ]), environ={})
     conf = tmp_path / 'generated.conf'
-    fw.write_config_file(str(conf), settings)
+    fw.write_config_file(str(conf), fw.render_config_text(settings))
     loaded = fw.resolve_settings(parse_cli(['--config', str(conf)]), environ={})
     assert loaded.capture_time_max == 900
     assert loaded.fallback_folder == ''
@@ -436,7 +435,7 @@ def test_disk_and_memory_limits_load_and_validate(tmp_path):
     cli = fw.resolve_settings(parse_cli(['--config', str(conf), '--min-free-percent', '2', '--buffer-max-mb', '8', 'p.txt']), environ={})
     assert (cli.min_free_percent, cli.buffer_max_mb) == (2, 8)
     generated = tmp_path / 'generated.conf'
-    fw.write_config_file(str(generated), cli)
+    fw.write_config_file(str(generated), fw.render_config_text(cli))
     again = fw.resolve_settings(parse_cli(['--config', str(generated)]), environ={})
     assert (again.min_free_percent, again.buffer_max_mb) == (2, 8)
     assert fw._explicit_cli_args(parse_cli(['--min-free-percent', '0.5', '--buffer-max-mb', '8', 'p.txt']))[:4] == [
@@ -484,7 +483,7 @@ def test_purge_interval_loads_validates_and_round_trips(tmp_path, monkeypatch):
     cli = fw.resolve_settings(parse_cli(['--config', str(conf), '--purge-interval', '0', 'p.txt']), environ={})
     assert cli.purge_interval == 0
     generated = tmp_path / 'generated.conf'
-    fw.write_config_file(str(generated), cli)
+    fw.write_config_file(str(generated), fw.render_config_text(cli))
     assert fw.resolve_settings(parse_cli(['--config', str(generated)]), environ={}).purge_interval == 0
     assert fw._explicit_cli_args(parse_cli(['--purge-interval', '60', 'p.txt']))[:2] == ['--purge-interval', '60']
     conf.write_text('[watch]\npurge_interval = -1\n')
@@ -514,7 +513,7 @@ def test_position_file_and_resume_max_load_validate_and_round_trip(tmp_path):
     cli = fw.resolve_settings(parse_cli(['--config', str(conf), '--position-file', '/x/pos', '--resume-max', '0', 'p.txt']), environ={})
     assert (cli.position_file, cli.resume_max) == ('/x/pos', 0)
     generated = tmp_path / 'generated.conf'
-    fw.write_config_file(str(generated), cli)
+    fw.write_config_file(str(generated), fw.render_config_text(cli))
     again = fw.resolve_settings(parse_cli(['--config', str(generated)]), environ={})
     assert (again.position_file, again.resume_max) == ('/x/pos', 0)
     assert fw._explicit_cli_args(parse_cli(['--position-file', '', '--resume-max', '60', 'p.txt']))[:4] == [
@@ -566,7 +565,7 @@ def test_notes_survive_a_generated_config_round_trip(tmp_path):
     note = 'loop/dm devices from pytest and /tmp/claude-*/scratchpad; OOMs in capped test containers are expected. 50% # ; = [x] "q" \\'
     settings = fw.resolve_settings(parse_cli(['--llm-notes', note + '\nand a second line', 'p.txt']), environ={})
     dest = tmp_path / 'written.conf'
-    fw.write_config_file(str(dest), settings)
+    fw.write_config_file(str(dest), fw.render_config_text(settings))
     text = dest.read_text()
     assert '# Optional note sent to the model' in text
     assert '\nnotes = ' + note + ' and a second line\n' in text
@@ -574,11 +573,11 @@ def test_notes_survive_a_generated_config_round_trip(tmp_path):
     # A settings object built by hand with a multi-line note still writes one line.
     settings.llm_notes = 'one\n\ttwo\r\nthree'
     again = tmp_path / 'again.conf'
-    fw.write_config_file(str(again), settings)
+    fw.write_config_file(str(again), fw.render_config_text(settings))
     assert '\nnotes = one two three\n' in again.read_text()
     assert notes_of(again) == 'one two three'
     empty = tmp_path / 'empty.conf'
-    fw.write_config_file(str(empty), fw.resolve_settings(parse_cli(['p.txt']), environ={}))
+    fw.write_config_file(str(empty), fw.render_config_text(fw.resolve_settings(parse_cli(['p.txt']), environ={})))
     assert '\nnotes = \n' in empty.read_text()
     assert notes_of(empty) == ''
 

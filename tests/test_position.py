@@ -170,7 +170,7 @@ def test_saw_saves_once_per_interval_and_round_trips(tmp_path):
     position.saw(jline(1, 'd'), 101.5)
     saved = json.loads(path.read_text())
     assert saved['time'] == T and saved['line'] == 3
-    position.save(final=True)
+    position.save()
     assert json.loads(path.read_text())['line'] == 1
     assert not [name for name in os.listdir(str(path.parent)) if name.endswith('.tmp')]
     # a restart reads 'd' again only as context
@@ -180,7 +180,7 @@ def test_saw_saves_once_per_interval_and_round_trips(tmp_path):
 
 def test_every_save_syncs_the_file_before_the_rename(tmp_path, monkeypatch):
     # XFS does not flush a file's data when it is renamed over another; after a hard reset an unsynced
-    # position could come back empty. Even a periodic save (final=False) must sync first.
+    # position could come back empty. Every save, periodic or at exit, must sync first.
     path = tmp_path / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
     events = []
@@ -202,7 +202,7 @@ def test_every_save_syncs_the_file_before_the_rename(tmp_path, monkeypatch):
     position.saw(jline(1, 'c'), 101.5)
     assert events == ['fsync', 'replace'] * 2
     position.changed = True
-    position.save(final=True)
+    position.save()
     assert events == ['fsync', 'replace'] * 3
     assert json.loads(path.read_text())['line'] == 1
 
@@ -235,7 +235,7 @@ def test_a_stop_inside_the_save_of_saw_does_not_take_back_the_line_before(tmp_pa
         position.saw(jline(2, 'C'), 101.5)  # C is in flight
     position.unsee()  # what capture_messages does for the line in flight
     position.before_save = None
-    position.save(final=True)
+    position.save()
     # B was handled, so the restart must not read it again
     assert json.loads(path.read_text())['time'] == T + 1
 
@@ -244,7 +244,7 @@ def test_save_without_a_new_line_writes_nothing(tmp_path):
     path = tmp_path / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
     position.saw('    not a journal line\n', 100.0)
-    position.save(final=True)
+    position.save()
     assert not path.exists()
 
 
@@ -451,13 +451,16 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
 
 
 def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monkeypatch):
+    # The periodic save (every POSITION_SAVE_INTERVAL of real time) must not fall inside this run, however slow
+    # the disk's fsync is: only the saves that come with the open and the exit are counted.
+    monkeypatch.setattr(fw, 'POSITION_SAVE_INTERVAL', 3600)
     saved = []
 
     class Recording(fw.JournalPosition):
-        def save(self, now=None, final=False):
+        def save(self, now=None):
             if self.changed:
                 saved.append(self.last_line.split(': ', 1)[1].strip())
-            super().save(now, final)
+            super().save(now)
 
     position = Recording(str(tmp_path / 'journal.position'), now=T)
     patch_popen(monkeypatch, ScriptedPopen([jline(0, 'quiet'), jline(0, 'HIT one'), jline(0, 'HIT two'), jline(0, 'after')]))
@@ -589,9 +592,9 @@ def test_a_position_save_never_covers_capture_lines_that_are_not_synced(tmp_path
     unsynced_at_save = []
 
     class Recording(fw.JournalPosition):
-        def save(self, now=None, final=False):
-            covers = self.changed and not final
-            super().save(now, final)
+        def save(self, now=None):
+            covers = self.changed
+            super().save(now)
             if covers:
                 # a write after the last sync would be on disk only by luck when the position reaches it
                 tail = events[len(events) - events[::-1].index('sync'):] if 'sync' in events else events
@@ -654,10 +657,13 @@ def test_a_stop_between_lines_keeps_the_last_one_read(tmp_path, monkeypatch):
 
 def test_a_stop_after_a_match_is_captured_does_not_capture_it_again(tmp_path, monkeypatch):
     class StopAtOpen(fw.JournalPosition):
-        def save(self, now=None, final=False):
-            if not final:
+        stopped = False
+
+        def save(self, now=None):
+            if self.changed and not self.stopped:
+                self.stopped = True
                 raise KeyboardInterrupt  # lands as the capture that holds the match is saved
-            super().save(now, final)
+            super().save(now)
 
     patch_popen(monkeypatch, ScriptedPopen([jline(0, 'HIT'), jline(0, 'post-1')]))
     pat = tmp_path / 'p.txt'
@@ -706,7 +712,7 @@ def test_save_never_follows_a_link_planted_where_the_file_is_written(tmp_path):
     (tmp_path / ('journal.position.%d.tmp' % os.getpid())).symlink_to(victim)
     position = fw.JournalPosition(str(path), now=T)
     position.saw(jline(0, 'a'), 100.0)
-    position.save(final=True)
+    position.save()
     assert victim.read_text() == 'keep me'
     assert json.loads(path.read_text())['time'] == T
     assert sorted(p.name for p in tmp_path.iterdir() if p.name.endswith('.tmp')) == ['journal.position.%d.tmp' % os.getpid()]

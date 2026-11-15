@@ -31,7 +31,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.67'
+version = '1.68'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -325,8 +325,7 @@ class Log_Compressor:
 				pathToDelete.append(path)
 			elif self.compressAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.compressAfterMonths*30 and path == month and os.path.isdir(os.path.join(self.logsDir,path)):
 				pathToCompress.append(path)
-		# Iterate copies: mutating the lists while looping skipped every other entry.
-		for dirName in list(pathToDelete):
+		for dirName in pathToDelete:
 			month = _month_of(dirName)
 			if not self._claim(month):
 				continue
@@ -346,7 +345,7 @@ class Log_Compressor:
 				print(f"Deleting {dirName} failed: {e}")
 			finally:
 				self._release(month)
-		for dirName in list(pathToCompress):
+		for dirName in pathToCompress:
 			if not self._claim(dirName):
 				continue
 			try:
@@ -534,31 +533,18 @@ def print(*args, **kwargs):
 	return builtins.print(*args, **kwargs)
 
 class bcolors:
-		HEADER = '\033[95m'
-		OKBLUE = '\033[94m'
-		OKCYAN = '\033[96m'
-		OKGREEN = '\033[92m'
 		warning = '\033[93m'
 		critical = '\033[91m'
-		info = '\033[0m'
-		debug = '\033[0m'
 		ENDC = '\033[0m'
-		BOLD = '\033[1m'
-		UNDERLINE = '\033[4m'
 
-def slugify(value, allow_unicode=False):
+def slugify(value):
 	"""
 	Taken from https://github.com/django/django/blob/master/django/utils/text.py
-	Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
-	dashes to single dashes. Remove characters that aren't alphanumerics,
-	underscores, or hyphens. Convert to lowercase. Also strip leading and
-	trailing whitespace, dashes, and underscores.
+	Convert to ASCII. Convert spaces or repeated dashes to single dashes. Remove
+	characters that aren't alphanumerics, underscores, or hyphens. Convert to
+	lowercase. Also strip leading and trailing whitespace, dashes, and underscores.
 	"""
-	value = str(value)
-	if allow_unicode:
-		value = unicodedata.normalize('NFKC', value)
-	else:
-		value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+	value = unicodedata.normalize('NFKD', str(value)).encode('ascii', 'ignore').decode('ascii')
 	value = re.sub(r'[^\w\s-]', '', value.lower())
 	value = re.sub(r'[-\s]+', '-', value).strip('-_')
 	if len(value) > SLUG_MAX_LEN:
@@ -585,11 +571,11 @@ def load_patterns(pattern_files):
 			# ignore invalid regex patterns
 			for pattern in patterns:
 				try:
-					pattern = re.compile(pattern)
-					if pattern:
-						rtn_patterns.setdefault('regex', set()).add(pattern)
+					compiled = re.compile(pattern)
 				except Exception:
 					print(f"Invalid regex pattern: {pattern}")
+					continue
+				rtn_patterns.setdefault('regex', set()).add(compiled)
 		# process fnmatch patterns if file ends with .fnmatch
 		else:
 			patterns = [f'*{pattern}*' for pattern in patterns]
@@ -670,7 +656,6 @@ class Settings(object):
 	def __init__(self):
 		self.raw = None
 		self.config_path = DEFAULT_CONFIG_PATH
-		self.config_existed = False
 		self.config_has_patterns = False
 		self.pattern_file = []
 		self.log_file = None
@@ -722,23 +707,16 @@ def _hostname():
 
 
 def _split_patterns(value):
-	if value is None:
-		return []
-	text = str(value).replace(',', '\n')
-	return [part.strip() for part in text.splitlines() if part.strip()]
+	return [part.strip() for part in value.replace(',', '\n').splitlines() if part.strip()]
 
 
 def _coerce_bool(value, key):
-	if isinstance(value, bool):
-		return value
-	text = str(value).strip().lower()
+	text = value.strip().lower()
 	if text in ('1', 'true', 'yes', 'on'):
 		return True
-	if text in ('0', 'false', 'no', 'off', ''):
-		if text == '':
-			raise ConfigError('invalid boolean for %s: empty' % key)
+	if text in ('0', 'false', 'no', 'off'):
 		return False
-	raise ConfigError('invalid boolean for %s: %s' % (key, value))
+	raise ConfigError('invalid boolean for %s: %s' % (key, value if text else 'empty'))
 
 
 def _coerce_float(value, key):
@@ -781,7 +759,7 @@ def _read_config_file(path):
 		else:
 			values[dest] = str(raw).strip()
 
-	take('watch', 'patterns', 'patterns', 'patterns')
+	take('watch', 'patterns', 'pattern_file', 'patterns')
 	take('watch', 'log_file', 'log_file', 'str')
 	take('watch', 'capture_time', 'capture_time', 'int')
 	take('watch', 'capture_time_max', 'capture_time_max', 'int')
@@ -827,6 +805,30 @@ def _config_error_summary(exc):
 	return str(exc)
 
 
+# The flags that set a setting, as (argparse dest, flag), in the order a unit's ExecStart repeats them. A boolean
+# False is --no-<flag>. An empty --log-file or -o means the default; any other empty value, such as --llm-notes '',
+# overrides the config.
+_SETTING_FLAGS = (
+	('log_file', '--log-file'), ('capture_time', '-t'), ('capture_time_max', '--capture-time-max'),
+	('output_folder', '-o'), ('fallback_folder', '--fallback-folder'), ('tail_lines', '--tail_lines'),
+	('filter_only', '--filter_only'), ('compress_after_months', '--compress-after-months'),
+	('capture_line_count_max', '--capture_line_count_max'), ('buffer_max_mb', '--buffer-max-mb'),
+	('min_free_percent', '--min-free-percent'), ('purge_interval', '--purge-interval'),
+	('position_file', '--position-file'), ('resume_max', '--resume-max'), ('delete_after_months', '--delete-after-months'),
+	('llm', '--llm'), ('llm_base_url', '--llm-base-url'), ('llm_model', '--llm-model'), ('llm_timeout', '--llm-timeout'),
+	('llm_max_bytes', '--llm-max-bytes'), ('llm_notes', '--llm-notes'), ('notify', '--notify'),
+	('ntfy_url', '--ntfy-url'), ('ntfy_priority', '--ntfy-priority'), ('ntfy_timeout', '--ntfy-timeout'),
+)
+
+
+def _setting_flags(args):
+	"""(Settings attribute, flag, value) for each setting flag in args that was passed."""
+	for dest, flag in _SETTING_FLAGS:
+		value = getattr(args, dest, None)
+		if value is not None and (value != '' or dest not in ('log_file', 'output_folder')):
+			yield {'llm': 'llm_enabled', 'notify': 'notify_enabled'}.get(dest, dest), flag, value
+
+
 def resolve_settings(args, environ=None):
 	"""Merge built-in defaults, the config file, explicit CLI flags, then secret env vars."""
 	if environ is None:
@@ -848,84 +850,16 @@ def resolve_settings(args, environ=None):
 	settings = Settings()
 	settings.raw = args
 	settings.config_path = config_path
-	settings.config_existed = existed
-	settings.config_has_patterns = bool(file_values.get('patterns'))
-	if 'patterns' in file_values:
-		settings.pattern_file = list(file_values['patterns'])
-	if 'log_file' in file_values:
-		settings.log_file = file_values['log_file'] or None
-	for key in ('capture_time', 'capture_time_max', 'compress_after_months', 'delete_after_months', 'capture_line_count_max',
-				'buffer_max_mb', 'min_free_percent', 'purge_interval', 'resume_max', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
-				'filter_only', 'llm_enabled', 'notify_enabled'):
-		if key in file_values:
-			setattr(settings, key, file_values[key])
-	if file_values.get('output_folder'):
-		settings.output_folder = file_values['output_folder']
-	# Unlike output_folder, an empty fallback_folder means no fallback, and an empty position_file no resuming.
-	if 'fallback_folder' in file_values:
-		settings.fallback_folder = file_values['fallback_folder']
-	if 'position_file' in file_values:
-		settings.position_file = file_values['position_file']
-	if 'always_notify' in file_values:
-		settings.always_notify = list(file_values['always_notify'])
-	if file_values.get('tail_lines'):
-		settings.tail_lines = file_values['tail_lines']
-	for key in ('llm_base_url', 'llm_model', 'llm_api_key', 'llm_notes', 'ntfy_url', 'ntfy_token', 'events_url', 'events_token'):
-		if key in file_values:
-			setattr(settings, key, file_values[key])
+	settings.config_has_patterns = bool(file_values.get('pattern_file'))
+	for key, value in file_values.items():
+		# An empty log_file, output_folder or tail_lines means the default. Any other empty value is kept: an
+		# empty fallback_folder means no fallback, and an empty position_file no resuming.
+		if value or key not in ('log_file', 'output_folder', 'tail_lines'):
+			setattr(settings, key, value)
 	if getattr(args, 'pattern_file', None):
 		settings.pattern_file = list(args.pattern_file)
-	if getattr(args, 'log_file', None):
-		settings.log_file = args.log_file
-	if getattr(args, 'output_folder', None):
-		settings.output_folder = args.output_folder
-	if getattr(args, 'tail_lines', None) is not None:
-		settings.tail_lines = str(args.tail_lines)
-	if getattr(args, 'capture_time', None) is not None:
-		settings.capture_time = args.capture_time
-	if getattr(args, 'capture_time_max', None) is not None:
-		settings.capture_time_max = args.capture_time_max
-	if getattr(args, 'fallback_folder', None) is not None:
-		settings.fallback_folder = args.fallback_folder
-	if getattr(args, 'compress_after_months', None) is not None:
-		settings.compress_after_months = args.compress_after_months
-	if getattr(args, 'delete_after_months', None) is not None:
-		settings.delete_after_months = args.delete_after_months
-	if getattr(args, 'capture_line_count_max', None) is not None:
-		settings.capture_line_count_max = args.capture_line_count_max
-	if getattr(args, 'buffer_max_mb', None) is not None:
-		settings.buffer_max_mb = args.buffer_max_mb
-	if getattr(args, 'min_free_percent', None) is not None:
-		settings.min_free_percent = args.min_free_percent
-	if getattr(args, 'purge_interval', None) is not None:
-		settings.purge_interval = args.purge_interval
-	if getattr(args, 'position_file', None) is not None:
-		settings.position_file = args.position_file
-	if getattr(args, 'resume_max', None) is not None:
-		settings.resume_max = args.resume_max
-	if getattr(args, 'filter_only', None) is not None:
-		settings.filter_only = bool(args.filter_only)
-	if getattr(args, 'llm', None) is not None:
-		settings.llm_enabled = bool(args.llm)
-	if getattr(args, 'llm_base_url', None) is not None:
-		settings.llm_base_url = args.llm_base_url.strip()
-	if getattr(args, 'llm_model', None) is not None:
-		settings.llm_model = args.llm_model.strip()
-	if getattr(args, 'llm_timeout', None) is not None:
-		settings.llm_timeout = args.llm_timeout
-	if getattr(args, 'llm_max_bytes', None) is not None:
-		settings.llm_max_bytes = args.llm_max_bytes
-	if getattr(args, 'llm_notes', None) is not None:
-		# --llm-notes '' clears a note set in the config.
-		settings.llm_notes = args.llm_notes
-	if getattr(args, 'notify', None) is not None:
-		settings.notify_enabled = bool(args.notify)
-	if getattr(args, 'ntfy_url', None) is not None:
-		settings.ntfy_url = args.ntfy_url.strip()
-	if getattr(args, 'ntfy_priority', None) is not None:
-		settings.ntfy_priority = args.ntfy_priority
-	if getattr(args, 'ntfy_timeout', None) is not None:
-		settings.ntfy_timeout = args.ntfy_timeout
+	for attr, _flag, value in _setting_flags(args):
+		setattr(settings, attr, value)
 	if getattr(args, 'always_notify', None) is not None:
 		# --always-notify '' clears a list set in the config.
 		settings.always_notify = [path for path in args.always_notify if path]
@@ -1186,7 +1120,7 @@ def render_config_text(settings):
 		'# Maximum capture bytes sent to the model.',
 		'max_bytes = %s' % int(settings.llm_max_bytes),
 		'# Optional note sent to the model with each capture, e.g. what is normal on this host.',
-		# Flattened here too: write_config_file takes any Settings, and a raw newline would add INI lines.
+		# Flattened here too: this takes any Settings, and a raw newline would add INI lines.
 		'notes = %s' % _note_text(settings.llm_notes),
 		'',
 		'[notify]',
@@ -1215,79 +1149,45 @@ def render_config_text(settings):
 	return '\n'.join(lines)
 
 
-def write_config_file(path, settings):
+def _strict_utf8(text):
+	"""text, if it can go into a config or unit file as UTF-8. Python decodes argv, paths and the environment
+	with surrogateescape, so a byte the locale could not decode (every non-ASCII byte on Python 3.6 under a C
+	locale) arrives as a lone surrogate. Such a value is refused, not restored or replaced: the service, started
+	under the same locale, could not encode a restored path either (UnicodeEncodeError at start or at the first
+	capture). The message shows no secret: values include the API key, the ntfy token and the private topic URL."""
+	try:
+		text.encode('utf-8')
+	except UnicodeEncodeError:
+		raise ConfigError('a path or value is not valid UTF-8 text, so it cannot go into a config or unit file. '
+						  'On Python 3.6 a C locale reads every non-ASCII byte that way: run under a UTF-8 locale '
+						  '(one that `locale -a` lists, such as en_US.UTF-8 or C.UTF-8)')
+	return text
+
+
+def write_config_file(path, text):
+	"""Write text as a new config file, mode 0600 (it may hold secrets); an existing file is never replaced."""
 	directory = os.path.dirname(path)
 	if directory:
 		os.makedirs(directory, exist_ok=True)
-	payload = render_config_text(settings).encode('utf-8')
+	payload = text.encode('utf-8')
 	fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 	try:
 		os.write(fd, payload)
 	finally:
 		os.close(fd)
-	os.chmod(path, 0o600)
 
 
 def _explicit_cli_args(raw):
 	"""Flags the operator actually passed. Omitted flags are not overrides."""
 	parts = []
-	if getattr(raw, 'log_file', None):
-		parts.extend(['--log-file', raw.log_file])
-	if getattr(raw, 'capture_time', None) is not None:
-		parts.extend(['-t', str(raw.capture_time)])
-	if getattr(raw, 'capture_time_max', None) is not None:
-		parts.extend(['--capture-time-max', str(raw.capture_time_max)])
-	if getattr(raw, 'output_folder', None):
-		parts.extend(['-o', raw.output_folder])
-	if getattr(raw, 'fallback_folder', None) is not None:
-		parts.extend(['--fallback-folder', raw.fallback_folder])
-	if getattr(raw, 'tail_lines', None) is not None:
-		parts.extend(['--tail_lines', str(raw.tail_lines)])
-	if getattr(raw, 'filter_only', None) is True:
-		parts.append('--filter_only')
-	elif getattr(raw, 'filter_only', None) is False:
-		parts.append('--no-filter_only')
-	if getattr(raw, 'compress_after_months', None) is not None:
-		parts.extend(['--compress-after-months', str(raw.compress_after_months)])
-	if getattr(raw, 'capture_line_count_max', None) is not None:
-		parts.extend(['--capture_line_count_max', str(raw.capture_line_count_max)])
-	if getattr(raw, 'buffer_max_mb', None) is not None:
-		parts.extend(['--buffer-max-mb', str(raw.buffer_max_mb)])
-	if getattr(raw, 'min_free_percent', None) is not None:
-		parts.extend(['--min-free-percent', '%g' % raw.min_free_percent])
-	if getattr(raw, 'purge_interval', None) is not None:
-		parts.extend(['--purge-interval', str(raw.purge_interval)])
-	if getattr(raw, 'position_file', None) is not None:
-		parts.extend(['--position-file', raw.position_file])
-	if getattr(raw, 'resume_max', None) is not None:
-		parts.extend(['--resume-max', str(raw.resume_max)])
-	if getattr(raw, 'delete_after_months', None) is not None:
-		parts.extend(['--delete-after-months', str(raw.delete_after_months)])
-	if getattr(raw, 'llm', None) is True:
-		parts.append('--llm')
-	elif getattr(raw, 'llm', None) is False:
-		parts.append('--no-llm')
-	if getattr(raw, 'llm_base_url', None) is not None:
-		parts.extend(['--llm-base-url', raw.llm_base_url])
-	if getattr(raw, 'llm_model', None) is not None:
-		parts.extend(['--llm-model', raw.llm_model])
-	if getattr(raw, 'llm_timeout', None) is not None:
-		parts.extend(['--llm-timeout', str(raw.llm_timeout)])
-	if getattr(raw, 'llm_max_bytes', None) is not None:
-		parts.extend(['--llm-max-bytes', str(raw.llm_max_bytes)])
-	if getattr(raw, 'llm_notes', None) is not None:
-		# One word, so a note starting with '-' is not read as an option.
-		parts.append('--llm-notes=' + _note_text(raw.llm_notes))
-	if getattr(raw, 'notify', None) is True:
-		parts.append('--notify')
-	elif getattr(raw, 'notify', None) is False:
-		parts.append('--no-notify')
-	if getattr(raw, 'ntfy_url', None) is not None:
-		parts.extend(['--ntfy-url', raw.ntfy_url])
-	if getattr(raw, 'ntfy_priority', None) is not None:
-		parts.extend(['--ntfy-priority', str(raw.ntfy_priority)])
-	if getattr(raw, 'ntfy_timeout', None) is not None:
-		parts.extend(['--ntfy-timeout', str(raw.ntfy_timeout)])
+	for attr, flag, value in _setting_flags(raw):
+		if isinstance(value, bool):
+			parts.append(flag if value else '--no-' + flag[2:])
+		elif attr == 'llm_notes':
+			# One word, so a note starting with '-' is not read as an option.
+			parts.append(flag + '=' + _note_text(value))
+		else:
+			parts.extend([flag, '%g' % value if isinstance(value, float) else str(value)])
 	for path in getattr(raw, 'always_notify', None) or []:
 		parts.extend(['--always-notify', path])
 	if getattr(raw, 'pattern_file', None):
@@ -1296,15 +1196,13 @@ def _explicit_cli_args(raw):
 
 
 def _prepare_unit_settings(args, raw=None):
+	"""(settings, parsed command line) for a unit, which watches DEFAULT_PATTERNS_DIR when no pattern is given."""
 	if getattr(args, '_resolved', False):
-		resolved = args
-		if raw is None:
-			raw = args.raw
+		resolved, raw = args, args.raw if raw is None else raw
 	else:
-		raw = args
-		resolved = resolve_settings(args)
-		if not resolved.pattern_file and (getattr(raw, 'print_unit', False) or getattr(raw, 'install_service', False)):
-			resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
+		resolved, raw = resolve_settings(args), args
+	if not resolved.pattern_file:
+		resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
 	return resolved, raw
 
 
@@ -1640,10 +1538,7 @@ class IncidentDispatcher(object):
 		self.seq = 0
 		self._seq_lock = threading.Lock()
 		self.thread = None
-		try:
-			syslog.openlog('firewatcher', syslog.LOG_PID | syslog.LOG_NDELAY, syslog.LOG_DAEMON)
-		except Exception:
-			pass
+		syslog.openlog('firewatcher', syslog.LOG_PID | syslog.LOG_NDELAY, syslog.LOG_DAEMON)
 		if start_thread:
 			self.thread = threading.Thread(target=self._run, name='firewatcher-notify', daemon=True)
 			self.thread.start()
@@ -1676,12 +1571,8 @@ class IncidentDispatcher(object):
 
 	def _run(self):
 		while True:
+			_priority, _seq, incident = self.queue.get()
 			try:
-				item = self.queue.get()
-			except Exception:
-				return
-			try:
-				_priority, _seq, incident = item
 				if incident is None:
 					return
 				self._process(incident)
@@ -1692,10 +1583,10 @@ class IncidentDispatcher(object):
 
 	def _overflow(self, incident):
 		if self.settings.events_url:
-			_journal(syslog.LOG_WARNING, 'queue full: posting the capture without waiting', status='queue full: posting the capture without waiting')
+			_journal(syslog.LOG_WARNING, 'queue full: posting the capture without waiting')
 			self._deliver_unjudged(incident, OVERFLOW_NOTIFY_TIMEOUT)
 			return
-		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full', status='analysis skipped, queue full')
+		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full')
 		self._deliver(incident, True, _programmatic_title(incident.get('hostname', ''), incident.get('pattern', '')), incident.get('matched_line') or '', OVERFLOW_NOTIFY_TIMEOUT)
 
 	def _deliver_unjudged(self, incident, timeout):
@@ -1739,10 +1630,8 @@ class IncidentDispatcher(object):
 					_append_note(incident['path'], _format_failure(exc))
 				except Exception:
 					pass
+				# Only the request and the note can raise, before the verdict, title or body change: they go out as generated.
 				_journal(syslog.LOG_ERR, 'LLM analysis failed: %s' % exc, status='LLM analysis failed')
-				should_push = True
-				title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
-				body_source = incident.get('matched_line') or ''
 		self._deliver(incident, should_push, title, body_source, self.settings.ntfy_timeout)
 
 	def _deliver(self, incident, should_push, title, body_source, timeout):
@@ -1948,8 +1837,6 @@ class CaptureFile(object):
 	"""
 
 	def __init__(self, paths, sync_interval, headroom=None):
-		if isinstance(paths, str):
-			paths = [paths]
 		self.remaining = list(paths)
 		self.path = self.remaining[0]
 		self.sync_interval = sync_interval
@@ -2445,7 +2332,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 						for log_compressor in log_compressors:
 							log_compressor.startCompressLogs()
 					if processed_line_counter % 10000 == 0:
-						print(f"Processed {processed_line_counter} lines.",flush=True)
+						print(f"Processed {processed_line_counter} lines.")
 			except KeyboardInterrupt:
 				if line_in_flight and journal_position is not None:
 					journal_position.unsee()
@@ -2467,7 +2354,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 		finally:
 			try:
 				if journal_position is not None:
-					journal_position.save(final=True)
+					journal_position.save()
 			finally:
 				if dispatcher is not None:
 					dispatcher.close()
@@ -2505,11 +2392,9 @@ EXAMPLE_PATTERNS = {
 }
 
 
-def systemd_is_available(runtime_dir=None):
+def systemd_is_available():
 	"""True when this host is booted with systemd (PID 1)."""
-	if runtime_dir is None:
-		runtime_dir = SYSTEMD_RUNTIME_DIR
-	return os.path.isdir(runtime_dir)
+	return os.path.isdir(SYSTEMD_RUNTIME_DIR)
 
 
 def _is_pattern_filename(name):
@@ -2540,13 +2425,24 @@ def expand_pattern_sources(paths):
 
 
 def unit_filename(unit_name):
-	name = (unit_name or DEFAULT_UNIT_NAME).strip()
+	name = (unit_name or '').strip() or DEFAULT_UNIT_NAME
 	if not name.endswith('.service'):
 		name = name + '.service'
 	base = os.path.basename(name)
 	if base != name or not base or base in ('.', '..'):
 		raise ValueError('unit name must be a simple filename, not a path')
 	return base
+
+
+def _check_new_unit_name(base):
+	"""ValueError unless systemd can load and enable a unit file named base: only its characters, at most 255 of
+	them (the '.service' suffix counts), and any '@' with a name before it and an instance after it. For install
+	only: uninstall must still remove a unit an older firewatcher installed under another name."""
+	prefix, at, instance = base[:-len('.service')].partition('@')
+	if len(base) > 255 or not prefix or (at and not instance) or not re.match(r'[A-Za-z0-9:_.@\\-]+\Z', base):
+		raise ValueError('unit name must be one systemd can load and enable: letters, digits and : _ . @ - \\, '
+						 'at most 255 characters with the .service suffix, and any @ with a name before it and '
+						 'an instance after it')
 
 
 def resolve_executable():
@@ -2591,25 +2487,20 @@ def render_unit_file(args, executable=None, config_exists=None, raw=None):
 	if config_exists:
 		parts.extend(_explicit_cli_args(raw))
 		if not resolved.config_has_patterns and not getattr(raw, 'pattern_file', None):
-			parts.extend(resolved.pattern_file or [DEFAULT_PATTERNS_DIR])
+			parts.extend(resolved.pattern_file)
 	exec_start = ' '.join([_quote_unit_arg(executable, program=True)] + [_quote_unit_arg(p) for p in parts])
 	after = ['network-online.target']
-	wants = ['network-online.target']
 	if not resolved.log_file:
 		after.insert(0, 'systemd-journald.socket')
-	requires = []
-	for mount in (getattr(resolved, 'requires_mounts_for', None) or []):
-		requires.append(mount)
-		if 'remote-fs.target' not in after:
-			after.append('remote-fs.target')
+	if resolved.requires_mounts_for:
+		after.append('remote-fs.target')
 	lines = [
 		'[Unit]',
 		'Description=firewatcher: persist log context around incident patterns',
 		'After=' + ' '.join(after),
-		'Wants=' + ' '.join(wants),
+		'Wants=network-online.target',
 	]
-	for mount in requires:
-		lines.append('RequiresMountsFor=' + _quote_unit_path(mount))
+	lines.extend('RequiresMountsFor=' + _quote_unit_path(mount) for mount in resolved.requires_mounts_for)
 	stop_sec = max(30, int(resolved.llm_timeout) + int(resolved.ntfy_timeout) * (2 if resolved.events_url else 1) + 15)
 	lines.extend([
 		'',
@@ -2685,44 +2576,48 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	if not systemd_available:
 		_warn_no_systemd('--install-service')
 		return 1
-	try:
-		resolved, raw = _prepare_unit_settings(args, raw=raw)
-	except ConfigError as exc:
-		print(str(exc), file=sys.stderr)
-		return 2
-	if not resolved.pattern_file:
-		resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
 	if unit_dir is None:
 		unit_dir = SYSTEMD_UNIT_DIR
+	# Everything is checked and rendered before anything is written, so a refused install leaves nothing behind
+	# (a left-over config would make the next install render a different unit).
+	try:
+		resolved, raw = _prepare_unit_settings(args, raw=raw)
+		unit_name = unit_filename(resolved.unit_name)
+		_check_new_unit_name(unit_name)
+		config_existed = os.path.isfile(resolved.config_path)
+		unit_text = _strict_utf8(render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw))
+		config_text = None if config_existed else _strict_utf8(render_config_text(resolved))
+	except (ConfigError, ValueError) as exc:
+		print(str(exc), file=sys.stderr)
+		return 2
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
-	config_existed = os.path.isfile(resolved.config_path)
-	if not config_existed:
+	if config_text is not None:
 		try:
-			write_config_file(resolved.config_path, resolved)
+			write_config_file(resolved.config_path, config_text)
 		except OSError as exc:
 			print('cannot write config %s: %s' % (resolved.config_path, exc), file=sys.stderr)
 			return 1
-	os.makedirs(unit_dir, exist_ok=True)
-	unit_path = os.path.join(unit_dir, unit_filename(resolved.unit_name))
 	if config_existed and getattr(raw, 'ntfy_url', None):
 		print(f"Warning: with an existing config, --ntfy-url goes on the unit's ExecStart, where any user can read it "
 			  f"(systemctl cat, ps). Set notify.ntfy_url in {resolved.config_path} instead.", file=sys.stderr)
-	text = render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw)
+	os.makedirs(unit_dir, exist_ok=True)
+	unit_path = os.path.join(unit_dir, unit_name)
 	with open(unit_path, 'w', encoding='utf-8') as fh:
-		fh.write(text)
+		fh.write(unit_text)
 	print(f"Wrote {unit_path}")
 	reload = _run_systemctl(systemctl, 'daemon-reload')
 	if getattr(reload, 'returncode', 0):
 		print(f"systemctl daemon-reload failed (exit {reload.returncode})", file=sys.stderr)
 		return reload.returncode
-	if getattr(resolved, 'no_enable', False):
+	if resolved.no_enable:
 		return 0
-	enable = _run_systemctl(systemctl, 'enable', '--now', unit_filename(resolved.unit_name))
+	# '--': a name starting with '-' is a name, not an option.
+	enable = _run_systemctl(systemctl, 'enable', '--now', '--', unit_name)
 	if getattr(enable, 'returncode', 0):
 		print(f"systemctl enable --now failed (exit {enable.returncode})", file=sys.stderr)
 		return enable.returncode
-	print(f"Enabled and started {unit_filename(resolved.unit_name)}")
+	print(f"Enabled and started {unit_name}")
 	return 0
 
 
@@ -2734,9 +2629,13 @@ def uninstall_service(args, systemd_available=None, unit_dir=None, systemctl=Non
 		return 1
 	if unit_dir is None:
 		unit_dir = SYSTEMD_UNIT_DIR
-	name = unit_filename(args.unit_name)
+	try:
+		name = unit_filename(args.unit_name)
+	except ValueError as exc:
+		print(str(exc), file=sys.stderr)
+		return 2
 	unit_path = os.path.join(unit_dir, name)
-	disable = _run_systemctl(systemctl, 'disable', '--now', name)
+	disable = _run_systemctl(systemctl, 'disable', '--now', '--', name)
 	if getattr(disable, 'returncode', 0) not in (0, None) and os.path.exists(unit_path):
 		print(f"systemctl disable --now {name} exited {disable.returncode}", file=sys.stderr)
 	if os.path.exists(unit_path):
@@ -2959,10 +2858,8 @@ class JournalPosition(object):
 			self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed = self.before
 			self.before = None
 
-	def save(self, now=None, final=False):
-		"""Write the position atomically; a failure is logged once and retried at the next save.
-
-		final is not used: every save is fsynced. Two test subclasses use it to tell the save at exit from the others."""
+	def save(self, now=None):
+		"""Write the position atomically; a failure is logged once and retried at the next save."""
 		import json
 		now = time.time() if now is None else now
 		self.next_save = now + POSITION_SAVE_INTERVAL
@@ -2985,7 +2882,7 @@ class JournalPosition(object):
 			fd, unfinished = tempfile.mkstemp(prefix=os.path.basename(self.path) + '.', suffix='.tmp', dir=folder)
 			with os.fdopen(fd, 'w', encoding='utf-8') as f:
 				f.write(json.dumps(record) + '\n')
-				# Every save, not only the final one: XFS does not flush a file's data when it is renamed over
+				# Every save is synced: XFS does not flush a file's data when it is renamed over
 				# another, so after a hard reset an unsynced position could come back empty and the restart would
 				# lose the lead-up to the crash. About 100 bytes per fsync, at most once per POSITION_SAVE_INTERVAL, plus
 				# the save that comes with a capture opening.
@@ -3099,11 +2996,8 @@ def main(argv=None):
 		resolved = resolve_settings(args)
 	except ConfigError as exc:
 		parser.error(str(exc))
-	if not resolved.pattern_file:
-		if args.install_service or args.print_unit:
-			resolved.pattern_file = [DEFAULT_PATTERNS_DIR]
-		else:
-			parser.error('pattern file or directory required (for example /etc/firewatcher/patterns.d)')
+	if not resolved.pattern_file and not (args.install_service or args.print_unit):
+		parser.error('pattern file or directory required (for example /etc/firewatcher/patterns.d)')
 	for row in userinfo_warnings(resolved):
 		print(row, file=sys.stderr)
 	if args.print_unit:

@@ -107,14 +107,6 @@ def test_render_unit_repeatable_requires_mounts():
     assert unit.count('remote-fs.target') == 1
 
 
-def test_quote_unit_arg():
-    assert fw._quote_unit_arg('/usr/bin/firewatcher') == '/usr/bin/firewatcher'
-    assert fw._quote_unit_arg('/mnt/My Logs/out') == '"/mnt/My Logs/out"'
-    assert fw._quote_unit_arg('a"b') == '"a\\"b"'
-    assert fw._quote_unit_arg('a\\b') == '"a\\\\b"'
-    assert fw._quote_unit_arg('') == '""'
-
-
 def test_unit_name_sanitized():
     parsed = parse_cli(['--print-unit', '--unit-name', 'firewatcher.service', 'p.txt'])
     assert fw.unit_filename(parsed.unit_name) == 'firewatcher.service'
@@ -124,11 +116,6 @@ def test_unit_name_sanitized():
         fw.unit_filename('../evil.service')
     with pytest.raises(ValueError):
         fw.unit_filename('/etc/systemd/system/x.service')
-
-
-def test_systemd_is_available(tmp_path):
-    assert fw.systemd_is_available(str(tmp_path)) is True
-    assert fw.systemd_is_available(str(tmp_path / 'missing')) is False
 
 
 def test_resolve_executable(monkeypatch):
@@ -341,7 +328,7 @@ def test_uninstall_service_reload_failure(tmp_path):
     assert rc == 4
 
 
-def test_systemd_is_available_uses_module_default(monkeypatch, tmp_path):
+def test_systemd_is_available(monkeypatch, tmp_path):
     monkeypatch.setattr(fw, 'SYSTEMD_RUNTIME_DIR', str(tmp_path))
     assert fw.systemd_is_available() is True
     monkeypatch.setattr(fw, 'SYSTEMD_RUNTIME_DIR', str(tmp_path / 'missing'))
@@ -423,8 +410,62 @@ def test_uninstall_disable_failure_still_removes_unit(tmp_path, capsys):
 
 def test_unit_filename_none_and_whitespace():
     assert fw.unit_filename(None) == 'firewatcher.service'
-    # whitespace-only is truthy, so it does not fall back to the default name
-    assert fw.unit_filename('   ') == '.service'
+    # a blank name means the default, as an empty one does
+    assert fw.unit_filename('   ') == 'firewatcher.service'
+    assert fw.unit_filename('fw@a:b_c-1.d') == 'fw@a:b_c-1.d.service'
+
+
+def test_the_unit_name_check_accepts_and_refuses_what_systemd_257_does():
+    for good in ('firewatcher.service', 'fw@a:b_c-1.d.service', 'fw-2.service', 'fw@a@b.service', '-fw.service',
+                 'x' * 247 + '.service'):
+        fw._check_new_unit_name(good)
+    for bad in ('fw\u00e9.service', 'my fw.service', '@fw.service', 'fw@.service', 'x' * 248 + '.service'):
+        with pytest.raises(ValueError):
+            fw._check_new_unit_name(bad)
+
+
+def test_a_refused_unit_name_leaves_nothing_behind(tmp_path, monkeypatch, capsys):
+    # The default config path does not exist yet, so the install would write one: a refusal must come first.
+    root = tmp_path / 'root'
+    root.mkdir()
+    monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(root / 'patterns.d'))
+    monkeypatch.setattr(fw, 'DEFAULT_CONFIG_PATH', str(root / 'etc' / 'firewatcher.conf'))
+    for name in ('sub/fw', 'fw\u00e9', 'my fw', '@fw', 'fw@', 'x' * 248):
+        args = parse_cli(['--install-service', '-o', str(root / 'out'), '--unit-name=' + name])
+        assert fw.install_service(args, systemd_available=True, unit_dir=str(root / 'units'),
+                                  systemctl=ok_systemctl, executable='/bin/fw') == 2, name
+        assert os.listdir(str(root)) == [], name
+        assert 'unit name must be' in capsys.readouterr().err
+    monkeypatch.setattr(fw, 'systemd_is_available', lambda: True)
+    assert fw.main(['--install-service', '-o', str(root / 'out'), '--unit-name', 'a/b']) == 2
+    assert 'Traceback' not in capsys.readouterr().err and os.listdir(str(root)) == []
+
+
+def test_unit_names_reach_systemctl_after_a_double_dash(tmp_path):
+    # A name starting with '-' (which systemd loads) is a name to systemctl, not an option.
+    calls = []
+    args = parse_cli(['--install-service', '-o', str(tmp_path / 'out'), '--unit-name=-fw', str(tmp_path / 'p.d')])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=systemctl_recorder(calls), executable='/bin/fw') == 0
+    assert ('enable', '--now', '--', '-fw.service') in calls
+    del calls[:]
+    args = parse_cli(['--uninstall-service', '--unit-name=-fw'])
+    assert fw.uninstall_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                                systemctl=systemctl_recorder(calls)) == 0
+    assert ('disable', '--now', '--', '-fw.service') in calls
+
+
+def test_uninstall_still_removes_a_unit_an_older_firewatcher_named_freely(tmp_path):
+    unit_dir = tmp_path / 'system'
+    unit_dir.mkdir()
+    unit = unit_dir / 'my fw.service'
+    unit.write_text('[Service]\n')
+    parsed = parse_cli(['--uninstall-service', '--unit-name', 'my fw'])
+    assert fw.uninstall_service(parsed, systemd_available=True, unit_dir=str(unit_dir), systemctl=systemctl_recorder([])) == 0
+    assert not unit.exists()
+    # a path is refused there too, without a traceback
+    parsed = parse_cli(['--uninstall-service', '--unit-name', '../fw'])
+    assert fw.uninstall_service(parsed, systemd_available=True, unit_dir=str(unit_dir), systemctl=systemctl_recorder([])) == 2
 
 
 def test_render_unit_resolves_executable_when_omitted(monkeypatch):
@@ -462,6 +503,11 @@ def systemd_words(exec_start):
 
 
 def test_quote_unit_arg_escapes_for_systemd():
+    assert fw._quote_unit_arg('/usr/bin/firewatcher') == '/usr/bin/firewatcher'
+    assert fw._quote_unit_arg('/mnt/My Logs/out') == '"/mnt/My Logs/out"'
+    assert fw._quote_unit_arg('a"b') == '"a\\"b"'
+    assert fw._quote_unit_arg('a\\b') == '"a\\\\b"'
+    assert fw._quote_unit_arg('') == '""'
     assert fw._quote_unit_arg('100%') == '100%%'
     assert fw._quote_unit_arg('$HOME') == '$$HOME'
     assert fw._quote_unit_arg("don't") == '"don\'t"'
@@ -716,3 +762,92 @@ def test_install_writes_a_quoted_mount_path_to_the_unit(tmp_path):
     assert fw.install_service(parsed, systemd_available=True, unit_dir=str(unit_dir),
                               systemctl=ok_systemctl, executable='/bin/fw') == 0
     assert 'RequiresMountsFor="/mnt/my logs"\n' in (unit_dir / 'firewatcher.service').read_text()
+
+
+# --- values that are not UTF-8 ---
+# Python decodes argv, paths and the environment with surrogateescape: bytes the locale cannot decode (every
+# non-ASCII byte on Python 3.6 under a C locale) arrive as lone surrogates. An install refuses them, so no
+# install made under a locale hands its service a path that locale cannot encode.
+
+def not_utf8(path):
+    return (str(path).encode() + b'/caf\xe9').decode('utf-8', 'surrogateescape')
+
+
+def c_locale_utf8(path):
+    # valid UTF-8 that Python 3.6 under a C locale reads as escaped bytes
+    return (str(path).encode() + b'/caf\xc3\xa9').decode('ascii', 'surrogateescape')
+
+
+def install_refused_and_nothing_written(root, flags, capsys):
+    args = parse_cli(['--install-service', '--ntfy-url', 'https://ntfy.sh/private-topic'] + flags)
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(root / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 2, flags
+    assert os.listdir(str(root)) == [], flags
+    err = capsys.readouterr().err
+    # the message never shows a secret: one value may be the private ntfy topic
+    assert 'UTF-8' in err and 'private-topic' not in err and 'Traceback' not in err, flags
+    return err
+
+
+def test_a_value_that_is_not_utf8_is_refused_before_anything_is_written(tmp_path, monkeypatch, capsys):
+    root = tmp_path / 'root'
+    root.mkdir()
+    monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(root / 'patterns.d'))
+    monkeypatch.setattr(fw, 'DEFAULT_CONFIG_PATH', str(root / 'etc' / 'firewatcher.conf'))
+    for flags in (['-o', not_utf8(root)], ['--llm-notes', not_utf8('note')], [not_utf8(root)],
+                  ['-o', str(root / 'out'), '--requires-mounts-for', not_utf8(root)]):
+        install_refused_and_nothing_written(root, flags, capsys)
+
+
+def test_a_utf8_value_that_python_read_as_escaped_bytes_is_refused_too(tmp_path, monkeypatch, capsys):
+    # Python 3.6 under a C locale: a service started there could not encode the restored path ("café") either,
+    # so an install that restored it would report success for a service that stops at start.
+    root = tmp_path / 'root'
+    root.mkdir()
+    monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(root / 'patterns.d'))
+    monkeypatch.setattr(fw, 'DEFAULT_CONFIG_PATH', str(root / 'etc' / 'firewatcher.conf'))
+    for flags in (['-o', c_locale_utf8(root)], ['--llm-notes', c_locale_utf8('note')], [c_locale_utf8(root)]):
+        err = install_refused_and_nothing_written(root, flags, capsys)
+        assert 'UTF-8 locale' in err, flags
+
+
+def test_a_value_that_is_not_utf8_is_refused_with_a_config_that_exists(tmp_path, capsys):
+    # The folder goes on ExecStart then, and only the unit text holds it: that text is checked too.
+    root = tmp_path / 'root'
+    root.mkdir()
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\npatterns = %s\n' % (tmp_path / 'p.txt'))
+    for folder in (not_utf8(root), c_locale_utf8(root)):
+        args = parse_cli(['--install-service', '--no-enable', '--config', str(conf), '-o', folder])
+        assert fw.install_service(args, systemd_available=True, unit_dir=str(root / 'units'),
+                                  systemctl=ok_systemctl, executable='/bin/fw') == 2
+        assert os.listdir(str(root)) == [] and not os.path.exists(folder)
+        assert 'UTF-8' in capsys.readouterr().err
+
+
+def test_a_non_ascii_path_and_note_are_written_as_utf8(tmp_path):
+    # Under a UTF-8 locale (Python 3.7 and later under a C locale too) 'café' arrives as text and is installed.
+    folder = str(tmp_path / 'café')
+    args = parse_cli(['--install-service', '--no-enable', '-o', folder, '--llm-notes', 'café build box',
+                      str(tmp_path / 'p.d')])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    again = fw.resolve_settings(parse_cli(['--config', fw.DEFAULT_CONFIG_PATH]), environ={})
+    assert again.output_folder == folder and again.llm_notes == 'café build box'
+    # with the config there, the folder goes on ExecStart instead
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    unit = (tmp_path / 'units' / 'firewatcher.service').read_bytes().decode('utf-8')
+    assert ' -o %s ' % folder in unit
+
+
+def test_a_secret_that_is_not_written_is_no_reason_to_refuse(tmp_path, monkeypatch):
+    # With a config already there, the API key from the environment goes into neither file.
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\npatterns = %s\n' % (tmp_path / 'p.txt'))
+    monkeypatch.setenv('FIREWATCHER_LLM_API_KEY', b'k\xe9'.decode('utf-8', 'surrogateescape'))
+    args = parse_cli(['--install-service', '--no-enable', '--config', str(conf), '-o', str(tmp_path / 'out')])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    assert (tmp_path / 'units' / 'firewatcher.service').exists()
+    assert fw.main(['--print-unit', '--config', str(conf), 'p.txt']) == 0
