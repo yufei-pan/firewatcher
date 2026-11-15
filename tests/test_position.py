@@ -451,6 +451,9 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
 
 
 def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monkeypatch):
+    # The periodic save (every POSITION_SAVE_INTERVAL of real time) must not fall inside this run, however slow
+    # the disk's fsync is: only the saves that come with the open and the exit are counted.
+    monkeypatch.setattr(fw, 'POSITION_SAVE_INTERVAL', 3600)
     saved = []
 
     class Recording(fw.JournalPosition):

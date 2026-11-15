@@ -15,7 +15,7 @@ def test_slugify_normalizes_and_strips():
     assert len(fw.slugify('a' * (fw.SLUG_MAX_LEN + 20))) == fw.SLUG_MAX_LEN
 
 
-def test_slugify_unicode_nfkc_and_empty_after_strip():
+def test_slugify_fullwidth_letters_and_empty_after_strip():
     # fullwidth letters collapse to ASCII under NFKD
     assert fw.slugify('ＡＢＣ') == 'abc'
     assert fw.slugify('!!!') == ''

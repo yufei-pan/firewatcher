@@ -415,7 +415,7 @@ def test_unit_filename_none_and_whitespace():
     assert fw.unit_filename('fw@a:b_c-1.d') == 'fw@a:b_c-1.d.service'
 
 
-def test_new_unit_names_are_ones_systemd_can_load_and_enable():
+def test_the_unit_name_check_accepts_and_refuses_what_systemd_257_does():
     for good in ('firewatcher.service', 'fw@a:b_c-1.d.service', 'fw-2.service', 'fw@a@b.service', '-fw.service',
                  'x' * 247 + '.service'):
         fw._check_new_unit_name(good)
