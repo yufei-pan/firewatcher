@@ -759,7 +759,7 @@ def _read_config_file(path):
 		else:
 			values[dest] = str(raw).strip()
 
-	take('watch', 'patterns', 'patterns', 'patterns')
+	take('watch', 'patterns', 'pattern_file', 'patterns')
 	take('watch', 'log_file', 'log_file', 'str')
 	take('watch', 'capture_time', 'capture_time', 'int')
 	take('watch', 'capture_time_max', 'capture_time_max', 'int')
@@ -805,6 +805,30 @@ def _config_error_summary(exc):
 	return str(exc)
 
 
+# The flags that set a setting, as (argparse dest, flag), in the order a unit's ExecStart repeats them. A boolean
+# False is --no-<flag>. An empty --log-file or -o means the default; any other empty value, such as --llm-notes '',
+# overrides the config.
+_SETTING_FLAGS = (
+	('log_file', '--log-file'), ('capture_time', '-t'), ('capture_time_max', '--capture-time-max'),
+	('output_folder', '-o'), ('fallback_folder', '--fallback-folder'), ('tail_lines', '--tail_lines'),
+	('filter_only', '--filter_only'), ('compress_after_months', '--compress-after-months'),
+	('capture_line_count_max', '--capture_line_count_max'), ('buffer_max_mb', '--buffer-max-mb'),
+	('min_free_percent', '--min-free-percent'), ('purge_interval', '--purge-interval'),
+	('position_file', '--position-file'), ('resume_max', '--resume-max'), ('delete_after_months', '--delete-after-months'),
+	('llm', '--llm'), ('llm_base_url', '--llm-base-url'), ('llm_model', '--llm-model'), ('llm_timeout', '--llm-timeout'),
+	('llm_max_bytes', '--llm-max-bytes'), ('llm_notes', '--llm-notes'), ('notify', '--notify'),
+	('ntfy_url', '--ntfy-url'), ('ntfy_priority', '--ntfy-priority'), ('ntfy_timeout', '--ntfy-timeout'),
+)
+
+
+def _setting_flags(args):
+	"""(Settings attribute, flag, value) for each setting flag in args that was passed."""
+	for dest, flag in _SETTING_FLAGS:
+		value = getattr(args, dest, None)
+		if value is not None and (value != '' or dest not in ('log_file', 'output_folder')):
+			yield {'llm': 'llm_enabled', 'notify': 'notify_enabled'}.get(dest, dest), flag, value
+
+
 def resolve_settings(args, environ=None):
 	"""Merge built-in defaults, the config file, explicit CLI flags, then secret env vars."""
 	if environ is None:
@@ -826,83 +850,16 @@ def resolve_settings(args, environ=None):
 	settings = Settings()
 	settings.raw = args
 	settings.config_path = config_path
-	settings.config_has_patterns = bool(file_values.get('patterns'))
-	if 'patterns' in file_values:
-		settings.pattern_file = list(file_values['patterns'])
-	if 'log_file' in file_values:
-		settings.log_file = file_values['log_file'] or None
-	for key in ('capture_time', 'capture_time_max', 'compress_after_months', 'delete_after_months', 'capture_line_count_max',
-				'buffer_max_mb', 'min_free_percent', 'purge_interval', 'resume_max', 'llm_timeout', 'llm_max_bytes', 'ntfy_priority', 'ntfy_timeout',
-				'filter_only', 'llm_enabled', 'notify_enabled'):
-		if key in file_values:
-			setattr(settings, key, file_values[key])
-	if file_values.get('output_folder'):
-		settings.output_folder = file_values['output_folder']
-	# Unlike output_folder, an empty fallback_folder means no fallback, and an empty position_file no resuming.
-	if 'fallback_folder' in file_values:
-		settings.fallback_folder = file_values['fallback_folder']
-	if 'position_file' in file_values:
-		settings.position_file = file_values['position_file']
-	if 'always_notify' in file_values:
-		settings.always_notify = list(file_values['always_notify'])
-	if file_values.get('tail_lines'):
-		settings.tail_lines = file_values['tail_lines']
-	for key in ('llm_base_url', 'llm_model', 'llm_api_key', 'llm_notes', 'ntfy_url', 'ntfy_token', 'events_url', 'events_token'):
-		if key in file_values:
-			setattr(settings, key, file_values[key])
+	settings.config_has_patterns = bool(file_values.get('pattern_file'))
+	for key, value in file_values.items():
+		# An empty log_file, output_folder or tail_lines means the default. Any other empty value is kept: an
+		# empty fallback_folder means no fallback, and an empty position_file no resuming.
+		if value or key not in ('log_file', 'output_folder', 'tail_lines'):
+			setattr(settings, key, value)
 	if getattr(args, 'pattern_file', None):
 		settings.pattern_file = list(args.pattern_file)
-	if getattr(args, 'log_file', None):
-		settings.log_file = args.log_file
-	if getattr(args, 'output_folder', None):
-		settings.output_folder = args.output_folder
-	if getattr(args, 'tail_lines', None) is not None:
-		settings.tail_lines = str(args.tail_lines)
-	if getattr(args, 'capture_time', None) is not None:
-		settings.capture_time = args.capture_time
-	if getattr(args, 'capture_time_max', None) is not None:
-		settings.capture_time_max = args.capture_time_max
-	if getattr(args, 'fallback_folder', None) is not None:
-		settings.fallback_folder = args.fallback_folder
-	if getattr(args, 'compress_after_months', None) is not None:
-		settings.compress_after_months = args.compress_after_months
-	if getattr(args, 'delete_after_months', None) is not None:
-		settings.delete_after_months = args.delete_after_months
-	if getattr(args, 'capture_line_count_max', None) is not None:
-		settings.capture_line_count_max = args.capture_line_count_max
-	if getattr(args, 'buffer_max_mb', None) is not None:
-		settings.buffer_max_mb = args.buffer_max_mb
-	if getattr(args, 'min_free_percent', None) is not None:
-		settings.min_free_percent = args.min_free_percent
-	if getattr(args, 'purge_interval', None) is not None:
-		settings.purge_interval = args.purge_interval
-	if getattr(args, 'position_file', None) is not None:
-		settings.position_file = args.position_file
-	if getattr(args, 'resume_max', None) is not None:
-		settings.resume_max = args.resume_max
-	if getattr(args, 'filter_only', None) is not None:
-		settings.filter_only = bool(args.filter_only)
-	if getattr(args, 'llm', None) is not None:
-		settings.llm_enabled = bool(args.llm)
-	if getattr(args, 'llm_base_url', None) is not None:
-		settings.llm_base_url = args.llm_base_url.strip()
-	if getattr(args, 'llm_model', None) is not None:
-		settings.llm_model = args.llm_model.strip()
-	if getattr(args, 'llm_timeout', None) is not None:
-		settings.llm_timeout = args.llm_timeout
-	if getattr(args, 'llm_max_bytes', None) is not None:
-		settings.llm_max_bytes = args.llm_max_bytes
-	if getattr(args, 'llm_notes', None) is not None:
-		# --llm-notes '' clears a note set in the config.
-		settings.llm_notes = args.llm_notes
-	if getattr(args, 'notify', None) is not None:
-		settings.notify_enabled = bool(args.notify)
-	if getattr(args, 'ntfy_url', None) is not None:
-		settings.ntfy_url = args.ntfy_url.strip()
-	if getattr(args, 'ntfy_priority', None) is not None:
-		settings.ntfy_priority = args.ntfy_priority
-	if getattr(args, 'ntfy_timeout', None) is not None:
-		settings.ntfy_timeout = args.ntfy_timeout
+	for attr, _flag, value in _setting_flags(args):
+		setattr(settings, attr, value)
 	if getattr(args, 'always_notify', None) is not None:
 		# --always-notify '' clears a list set in the config.
 		settings.always_notify = [path for path in args.always_notify if path]
@@ -1207,63 +1164,14 @@ def write_config_file(path, settings):
 def _explicit_cli_args(raw):
 	"""Flags the operator actually passed. Omitted flags are not overrides."""
 	parts = []
-	if getattr(raw, 'log_file', None):
-		parts.extend(['--log-file', raw.log_file])
-	if getattr(raw, 'capture_time', None) is not None:
-		parts.extend(['-t', str(raw.capture_time)])
-	if getattr(raw, 'capture_time_max', None) is not None:
-		parts.extend(['--capture-time-max', str(raw.capture_time_max)])
-	if getattr(raw, 'output_folder', None):
-		parts.extend(['-o', raw.output_folder])
-	if getattr(raw, 'fallback_folder', None) is not None:
-		parts.extend(['--fallback-folder', raw.fallback_folder])
-	if getattr(raw, 'tail_lines', None) is not None:
-		parts.extend(['--tail_lines', str(raw.tail_lines)])
-	if getattr(raw, 'filter_only', None) is True:
-		parts.append('--filter_only')
-	elif getattr(raw, 'filter_only', None) is False:
-		parts.append('--no-filter_only')
-	if getattr(raw, 'compress_after_months', None) is not None:
-		parts.extend(['--compress-after-months', str(raw.compress_after_months)])
-	if getattr(raw, 'capture_line_count_max', None) is not None:
-		parts.extend(['--capture_line_count_max', str(raw.capture_line_count_max)])
-	if getattr(raw, 'buffer_max_mb', None) is not None:
-		parts.extend(['--buffer-max-mb', str(raw.buffer_max_mb)])
-	if getattr(raw, 'min_free_percent', None) is not None:
-		parts.extend(['--min-free-percent', '%g' % raw.min_free_percent])
-	if getattr(raw, 'purge_interval', None) is not None:
-		parts.extend(['--purge-interval', str(raw.purge_interval)])
-	if getattr(raw, 'position_file', None) is not None:
-		parts.extend(['--position-file', raw.position_file])
-	if getattr(raw, 'resume_max', None) is not None:
-		parts.extend(['--resume-max', str(raw.resume_max)])
-	if getattr(raw, 'delete_after_months', None) is not None:
-		parts.extend(['--delete-after-months', str(raw.delete_after_months)])
-	if getattr(raw, 'llm', None) is True:
-		parts.append('--llm')
-	elif getattr(raw, 'llm', None) is False:
-		parts.append('--no-llm')
-	if getattr(raw, 'llm_base_url', None) is not None:
-		parts.extend(['--llm-base-url', raw.llm_base_url])
-	if getattr(raw, 'llm_model', None) is not None:
-		parts.extend(['--llm-model', raw.llm_model])
-	if getattr(raw, 'llm_timeout', None) is not None:
-		parts.extend(['--llm-timeout', str(raw.llm_timeout)])
-	if getattr(raw, 'llm_max_bytes', None) is not None:
-		parts.extend(['--llm-max-bytes', str(raw.llm_max_bytes)])
-	if getattr(raw, 'llm_notes', None) is not None:
-		# One word, so a note starting with '-' is not read as an option.
-		parts.append('--llm-notes=' + _note_text(raw.llm_notes))
-	if getattr(raw, 'notify', None) is True:
-		parts.append('--notify')
-	elif getattr(raw, 'notify', None) is False:
-		parts.append('--no-notify')
-	if getattr(raw, 'ntfy_url', None) is not None:
-		parts.extend(['--ntfy-url', raw.ntfy_url])
-	if getattr(raw, 'ntfy_priority', None) is not None:
-		parts.extend(['--ntfy-priority', str(raw.ntfy_priority)])
-	if getattr(raw, 'ntfy_timeout', None) is not None:
-		parts.extend(['--ntfy-timeout', str(raw.ntfy_timeout)])
+	for attr, flag, value in _setting_flags(raw):
+		if isinstance(value, bool):
+			parts.append(flag if value else '--no-' + flag[2:])
+		elif attr == 'llm_notes':
+			# One word, so a note starting with '-' is not read as an option.
+			parts.append(flag + '=' + _note_text(value))
+		else:
+			parts.extend([flag, '%g' % value if isinstance(value, float) else str(value)])
 	for path in getattr(raw, 'always_notify', None) or []:
 		parts.extend(['--always-notify', path])
 	if getattr(raw, 'pattern_file', None):
