@@ -1120,7 +1120,7 @@ def render_config_text(settings):
 		'# Maximum capture bytes sent to the model.',
 		'max_bytes = %s' % int(settings.llm_max_bytes),
 		'# Optional note sent to the model with each capture, e.g. what is normal on this host.',
-		# Flattened here too: write_config_file takes any Settings, and a raw newline would add INI lines.
+		# Flattened here too: this takes any Settings, and a raw newline would add INI lines.
 		'notes = %s' % _note_text(settings.llm_notes),
 		'',
 		'[notify]',
@@ -1149,11 +1149,12 @@ def render_config_text(settings):
 	return '\n'.join(lines)
 
 
-def write_config_file(path, settings):
+def write_config_file(path, text):
+	"""Write text as a new config file, mode 0600 (it may hold secrets); an existing file is never replaced."""
 	directory = os.path.dirname(path)
 	if directory:
 		os.makedirs(directory, exist_ok=True)
-	payload = render_config_text(settings).encode('utf-8')
+	payload = text.encode('utf-8')
 	fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 	try:
 		os.write(fd, payload)
@@ -2409,13 +2410,23 @@ def expand_pattern_sources(paths):
 
 
 def unit_filename(unit_name):
-	name = (unit_name or DEFAULT_UNIT_NAME).strip()
+	name = (unit_name or '').strip() or DEFAULT_UNIT_NAME
 	if not name.endswith('.service'):
 		name = name + '.service'
 	base = os.path.basename(name)
 	if base != name or not base or base in ('.', '..'):
 		raise ValueError('unit name must be a simple filename, not a path')
 	return base
+
+
+def _check_new_unit_name(base):
+	"""ValueError unless systemd can load and enable a unit file named base: only its characters, at most 255 of
+	them, and any '@' with a name before it and an instance after it. For install only: uninstall must still
+	remove a unit an older firewatcher installed under another name."""
+	prefix, at, instance = base[:-len('.service')].partition('@')
+	if len(base) > 255 or not prefix or (at and not instance) or not re.match(r'[A-Za-z0-9:_.@\\-]+\Z', base):
+		raise ValueError('unit name must be one systemd can load and enable: letters, digits and : _ . @ - \\, '
+						 'at most 255, and any @ with a name before it and an instance after it')
 
 
 def resolve_executable():
@@ -2549,30 +2560,35 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	if not systemd_available:
 		_warn_no_systemd('--install-service')
 		return 1
-	try:
-		resolved, raw = _prepare_unit_settings(args, raw=raw)
-	except ConfigError as exc:
-		print(str(exc), file=sys.stderr)
-		return 2
 	if unit_dir is None:
 		unit_dir = SYSTEMD_UNIT_DIR
+	# Everything is checked and rendered before anything is written, so a refused install leaves nothing behind
+	# (a left-over config would make the next install render a different unit).
+	try:
+		resolved, raw = _prepare_unit_settings(args, raw=raw)
+		unit_name = unit_filename(resolved.unit_name)
+		_check_new_unit_name(unit_name)
+	except (ConfigError, ValueError) as exc:
+		print(str(exc), file=sys.stderr)
+		return 2
+	config_existed = os.path.isfile(resolved.config_path)
+	unit_text = render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw)
+	config_text = None if config_existed else render_config_text(resolved)
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
-	config_existed = os.path.isfile(resolved.config_path)
-	if not config_existed:
+	if config_text is not None:
 		try:
-			write_config_file(resolved.config_path, resolved)
+			write_config_file(resolved.config_path, config_text)
 		except OSError as exc:
 			print('cannot write config %s: %s' % (resolved.config_path, exc), file=sys.stderr)
 			return 1
-	os.makedirs(unit_dir, exist_ok=True)
-	unit_path = os.path.join(unit_dir, unit_filename(resolved.unit_name))
 	if config_existed and getattr(raw, 'ntfy_url', None):
 		print(f"Warning: with an existing config, --ntfy-url goes on the unit's ExecStart, where any user can read it "
 			  f"(systemctl cat, ps). Set notify.ntfy_url in {resolved.config_path} instead.", file=sys.stderr)
-	text = render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw)
+	os.makedirs(unit_dir, exist_ok=True)
+	unit_path = os.path.join(unit_dir, unit_name)
 	with open(unit_path, 'w', encoding='utf-8') as fh:
-		fh.write(text)
+		fh.write(unit_text)
 	print(f"Wrote {unit_path}")
 	reload = _run_systemctl(systemctl, 'daemon-reload')
 	if getattr(reload, 'returncode', 0):
@@ -2580,11 +2596,11 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		return reload.returncode
 	if resolved.no_enable:
 		return 0
-	enable = _run_systemctl(systemctl, 'enable', '--now', unit_filename(resolved.unit_name))
+	enable = _run_systemctl(systemctl, 'enable', '--now', unit_name)
 	if getattr(enable, 'returncode', 0):
 		print(f"systemctl enable --now failed (exit {enable.returncode})", file=sys.stderr)
 		return enable.returncode
-	print(f"Enabled and started {unit_filename(resolved.unit_name)}")
+	print(f"Enabled and started {unit_name}")
 	return 0
 
 
@@ -2596,7 +2612,11 @@ def uninstall_service(args, systemd_available=None, unit_dir=None, systemctl=Non
 		return 1
 	if unit_dir is None:
 		unit_dir = SYSTEMD_UNIT_DIR
-	name = unit_filename(args.unit_name)
+	try:
+		name = unit_filename(args.unit_name)
+	except ValueError as exc:
+		print(str(exc), file=sys.stderr)
+		return 2
 	unit_path = os.path.join(unit_dir, name)
 	disable = _run_systemctl(systemctl, 'disable', '--now', name)
 	if getattr(disable, 'returncode', 0) not in (0, None) and os.path.exists(unit_path):

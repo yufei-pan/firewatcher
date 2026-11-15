@@ -410,8 +410,48 @@ def test_uninstall_disable_failure_still_removes_unit(tmp_path, capsys):
 
 def test_unit_filename_none_and_whitespace():
     assert fw.unit_filename(None) == 'firewatcher.service'
-    # whitespace-only is truthy, so it does not fall back to the default name
-    assert fw.unit_filename('   ') == '.service'
+    # a blank name means the default, as an empty one does
+    assert fw.unit_filename('   ') == 'firewatcher.service'
+    assert fw.unit_filename('fw@a:b_c-1.d') == 'fw@a:b_c-1.d.service'
+
+
+def test_new_unit_names_are_ones_systemd_can_load_and_enable():
+    for good in ('firewatcher.service', 'fw@a:b_c-1.d.service', 'fw-2.service', 'fw@a@b.service', '-fw.service',
+                 'x' * 247 + '.service'):
+        fw._check_new_unit_name(good)
+    for bad in ('fw\u00e9.service', 'my fw.service', '@fw.service', 'fw@.service', 'x' * 248 + '.service'):
+        with pytest.raises(ValueError):
+            fw._check_new_unit_name(bad)
+
+
+def test_a_refused_unit_name_leaves_nothing_behind(tmp_path, monkeypatch, capsys):
+    # The default config path does not exist yet, so the install would write one: a refusal must come first.
+    root = tmp_path / 'root'
+    root.mkdir()
+    monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(root / 'patterns.d'))
+    monkeypatch.setattr(fw, 'DEFAULT_CONFIG_PATH', str(root / 'etc' / 'firewatcher.conf'))
+    for name in ('sub/fw', 'fw\u00e9', 'my fw', '@fw', 'fw@', 'x' * 248):
+        args = parse_cli(['--install-service', '-o', str(root / 'out'), '--unit-name=' + name])
+        assert fw.install_service(args, systemd_available=True, unit_dir=str(root / 'units'),
+                                  systemctl=ok_systemctl, executable='/bin/fw') == 2, name
+        assert os.listdir(str(root)) == [], name
+        assert 'unit name must be' in capsys.readouterr().err
+    monkeypatch.setattr(fw, 'systemd_is_available', lambda: True)
+    assert fw.main(['--install-service', '-o', str(root / 'out'), '--unit-name', 'a/b']) == 2
+    assert 'Traceback' not in capsys.readouterr().err and os.listdir(str(root)) == []
+
+
+def test_uninstall_still_removes_a_unit_an_older_firewatcher_named_freely(tmp_path):
+    unit_dir = tmp_path / 'system'
+    unit_dir.mkdir()
+    unit = unit_dir / 'my fw.service'
+    unit.write_text('[Service]\n')
+    parsed = parse_cli(['--uninstall-service', '--unit-name', 'my fw'])
+    assert fw.uninstall_service(parsed, systemd_available=True, unit_dir=str(unit_dir), systemctl=systemctl_recorder([])) == 0
+    assert not unit.exists()
+    # a path is refused there too, without a traceback
+    parsed = parse_cli(['--uninstall-service', '--unit-name', '../fw'])
+    assert fw.uninstall_service(parsed, systemd_available=True, unit_dir=str(unit_dir), systemctl=systemctl_recorder([])) == 2
 
 
 def test_render_unit_resolves_executable_when_omitted(monkeypatch):

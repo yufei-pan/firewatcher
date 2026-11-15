@@ -404,7 +404,7 @@ def test_init_config_lists_events_keys(tmp_path):
     settings.events_url = 'https://hk.example/api/events'
     settings.events_token = 'tok'
     path = tmp_path / 'written.conf'
-    fw.write_config_file(str(path), settings)
+    fw.write_config_file(str(path), fw.render_config_text(settings))
     again = settings_from(tmp_path, path.read_text())
     assert again.events_url == 'https://hk.example/api/events'
     assert again.events_token == 'tok'
