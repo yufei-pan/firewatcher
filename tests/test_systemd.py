@@ -762,3 +762,64 @@ def test_install_writes_a_quoted_mount_path_to_the_unit(tmp_path):
     assert fw.install_service(parsed, systemd_available=True, unit_dir=str(unit_dir),
                               systemctl=ok_systemctl, executable='/bin/fw') == 0
     assert 'RequiresMountsFor="/mnt/my logs"\n' in (unit_dir / 'firewatcher.service').read_text()
+
+
+# --- values that are not UTF-8 ---
+# Python decodes argv, paths and the environment with surrogateescape: bytes the locale cannot decode (every
+# non-ASCII byte on Python 3.6 under a C locale) arrive as lone surrogates.
+
+def not_utf8(path):
+    return (str(path).encode() + b'/caf\xe9').decode('utf-8', 'surrogateescape')
+
+
+def test_a_value_that_is_not_utf8_is_refused_before_anything_is_written(tmp_path, monkeypatch, capsys):
+    root = tmp_path / 'root'
+    root.mkdir()
+    monkeypatch.setattr(fw, 'DEFAULT_PATTERNS_DIR', str(root / 'patterns.d'))
+    monkeypatch.setattr(fw, 'DEFAULT_CONFIG_PATH', str(root / 'etc' / 'firewatcher.conf'))
+    for flags in (['-o', not_utf8(root)], ['--llm-notes', not_utf8('note')], [not_utf8(root)],
+                  ['-o', str(root / 'out'), '--requires-mounts-for', not_utf8(root)]):
+        args = parse_cli(['--install-service', '--ntfy-url', 'https://ntfy.sh/private-topic'] + flags)
+        assert fw.install_service(args, systemd_available=True, unit_dir=str(root / 'units'),
+                                  systemctl=ok_systemctl, executable='/bin/fw') == 2, flags
+        assert os.listdir(str(root)) == [], flags
+        err = capsys.readouterr().err
+        # the message never shows a value: one may be the private ntfy topic
+        assert 'not UTF-8' in err and 'private-topic' not in err, flags
+
+
+def test_print_unit_refuses_a_value_that_is_not_utf8(tmp_path, capsys):
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\npatterns = p.txt\n')
+    with pytest.raises(SystemExit) as exit_info:
+        fw.main(['--print-unit', '--config', str(conf), '-o', not_utf8(tmp_path), 'p.txt'])
+    assert exit_info.value.code == 2
+    assert 'not UTF-8' in capsys.readouterr().err
+
+
+def test_utf8_that_python_decoded_as_escaped_bytes_is_written_as_utf8(tmp_path):
+    # Python 3.6 under a C locale hands over 'café' as escaped bytes; the config and the unit get the text.
+    folder = (str(tmp_path).encode() + b'/caf\xc3\xa9').decode('ascii', 'surrogateescape')
+    note = b'caf\xc3\xa9 build box'.decode('ascii', 'surrogateescape')
+    args = parse_cli(['--install-service', '--no-enable', '-o', folder, '--llm-notes', note, str(tmp_path / 'p.d')])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    again = fw.resolve_settings(parse_cli(['--config', fw.DEFAULT_CONFIG_PATH]), environ={})
+    assert again.output_folder == str(tmp_path) + '/café' and again.llm_notes == 'café build box'
+    # with the config there, the folder goes on ExecStart instead
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    unit = (tmp_path / 'units' / 'firewatcher.service').read_bytes().decode('utf-8')
+    assert ' -o %s/café ' % tmp_path in unit
+
+
+def test_a_secret_that_is_not_written_is_no_reason_to_refuse(tmp_path, monkeypatch):
+    # With a config already there, the API key from the environment goes into neither file.
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\npatterns = %s\n' % (tmp_path / 'p.txt'))
+    monkeypatch.setenv('FIREWATCHER_LLM_API_KEY', b'k\xe9'.decode('utf-8', 'surrogateescape'))
+    args = parse_cli(['--install-service', '--no-enable', '--config', str(conf), '-o', str(tmp_path / 'out')])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=ok_systemctl, executable='/bin/fw') == 0
+    assert (tmp_path / 'units' / 'firewatcher.service').exists()
+    assert fw.main(['--print-unit', '--config', str(conf), 'p.txt']) == 0

@@ -1149,6 +1149,17 @@ def render_config_text(settings):
 	return '\n'.join(lines)
 
 
+def _strict_utf8(text):
+	"""text for a config or unit file, with the bytes Python decoded with surrogateescape (argv, paths and the
+	environment: bytes the locale could not decode, such as every non-ASCII byte on Python 3.6 under a C locale)
+	restored. Bytes that are not UTF-8 are refused, not replaced, which would point the service at another
+	path. The message shows no value: values include the API key, the ntfy token and the private topic URL."""
+	try:
+		return text.encode('utf-8', 'surrogateescape').decode('utf-8')
+	except UnicodeError:
+		raise ConfigError('a path or value is not UTF-8, so it cannot go into a config or unit file')
+
+
 def write_config_file(path, text):
 	"""Write text as a new config file, mode 0600 (it may hold secrets); an existing file is never replaced."""
 	directory = os.path.dirname(path)
@@ -2568,12 +2579,12 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		resolved, raw = _prepare_unit_settings(args, raw=raw)
 		unit_name = unit_filename(resolved.unit_name)
 		_check_new_unit_name(unit_name)
+		config_existed = os.path.isfile(resolved.config_path)
+		unit_text = _strict_utf8(render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw))
+		config_text = None if config_existed else _strict_utf8(render_config_text(resolved))
 	except (ConfigError, ValueError) as exc:
 		print(str(exc), file=sys.stderr)
 		return 2
-	config_existed = os.path.isfile(resolved.config_path)
-	unit_text = render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw)
-	config_text = None if config_existed else render_config_text(resolved)
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
 	if config_text is not None:
@@ -2985,7 +2996,13 @@ def main(argv=None):
 	for row in userinfo_warnings(resolved):
 		print(row, file=sys.stderr)
 	if args.print_unit:
-		print(render_unit_file(resolved, raw=args), end='')
+		text = render_unit_file(resolved, raw=args)
+		try:
+			_strict_utf8(text)
+		except ConfigError as exc:
+			parser.error(str(exc))
+		# Printed as Python decoded it, so stdout writes back the bytes it came from, whatever the locale.
+		print(text, end='')
 		return 0
 	if args.install_service:
 		return install_service(resolved, raw=args)
