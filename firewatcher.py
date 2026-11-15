@@ -1150,14 +1150,18 @@ def render_config_text(settings):
 
 
 def _strict_utf8(text):
-	"""text for a config or unit file, with the bytes Python decoded with surrogateescape (argv, paths and the
-	environment: bytes the locale could not decode, such as every non-ASCII byte on Python 3.6 under a C locale)
-	restored. Bytes that are not UTF-8 are refused, not replaced, which would point the service at another
-	path. The message shows no value: values include the API key, the ntfy token and the private topic URL."""
+	"""text, if it can go into a config or unit file as UTF-8. Python decodes argv, paths and the environment
+	with surrogateescape, so a byte the locale could not decode (every non-ASCII byte on Python 3.6 under a C
+	locale) arrives as a lone surrogate. Such a value is refused, not restored or replaced: the service, started
+	under the same locale, could not encode a restored path either (UnicodeEncodeError at start or at the first
+	capture). The message shows no secret: values include the API key, the ntfy token and the private topic URL."""
 	try:
-		return text.encode('utf-8', 'surrogateescape').decode('utf-8')
-	except UnicodeError:
-		raise ConfigError('a path or value is not UTF-8, so it cannot go into a config or unit file')
+		text.encode('utf-8')
+	except UnicodeEncodeError:
+		raise ConfigError('a path or value is not valid UTF-8 text, so it cannot go into a config or unit file. '
+						  'On Python 3.6 a C locale reads every non-ASCII byte that way: run under a UTF-8 locale '
+						  '(for example LC_ALL=C.UTF-8)')
+	return text
 
 
 def write_config_file(path, text):
@@ -2996,13 +3000,7 @@ def main(argv=None):
 	for row in userinfo_warnings(resolved):
 		print(row, file=sys.stderr)
 	if args.print_unit:
-		text = render_unit_file(resolved, raw=args)
-		try:
-			_strict_utf8(text)
-		except ConfigError as exc:
-			parser.error(str(exc))
-		# Printed as Python decoded it, so stdout writes back the bytes it came from, whatever the locale.
-		print(text, end='')
+		print(render_unit_file(resolved, raw=args), end='')
 		return 0
 	if args.install_service:
 		return install_service(resolved, raw=args)
