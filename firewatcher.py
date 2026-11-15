@@ -2596,7 +2596,8 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		return reload.returncode
 	if resolved.no_enable:
 		return 0
-	enable = _run_systemctl(systemctl, 'enable', '--now', unit_name)
+	# '--': a name starting with '-' is a name, not an option.
+	enable = _run_systemctl(systemctl, 'enable', '--now', '--', unit_name)
 	if getattr(enable, 'returncode', 0):
 		print(f"systemctl enable --now failed (exit {enable.returncode})", file=sys.stderr)
 		return enable.returncode
@@ -2618,7 +2619,7 @@ def uninstall_service(args, systemd_available=None, unit_dir=None, systemctl=Non
 		print(str(exc), file=sys.stderr)
 		return 2
 	unit_path = os.path.join(unit_dir, name)
-	disable = _run_systemctl(systemctl, 'disable', '--now', name)
+	disable = _run_systemctl(systemctl, 'disable', '--now', '--', name)
 	if getattr(disable, 'returncode', 0) not in (0, None) and os.path.exists(unit_path):
 		print(f"systemctl disable --now {name} exited {disable.returncode}", file=sys.stderr)
 	if os.path.exists(unit_path):

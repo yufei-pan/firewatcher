@@ -441,6 +441,20 @@ def test_a_refused_unit_name_leaves_nothing_behind(tmp_path, monkeypatch, capsys
     assert 'Traceback' not in capsys.readouterr().err and os.listdir(str(root)) == []
 
 
+def test_unit_names_reach_systemctl_after_a_double_dash(tmp_path):
+    # A name starting with '-' (which systemd loads) is a name to systemctl, not an option.
+    calls = []
+    args = parse_cli(['--install-service', '-o', str(tmp_path / 'out'), '--unit-name=-fw', str(tmp_path / 'p.d')])
+    assert fw.install_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                              systemctl=systemctl_recorder(calls), executable='/bin/fw') == 0
+    assert ('enable', '--now', '--', '-fw.service') in calls
+    del calls[:]
+    args = parse_cli(['--uninstall-service', '--unit-name=-fw'])
+    assert fw.uninstall_service(args, systemd_available=True, unit_dir=str(tmp_path / 'units'),
+                                systemctl=systemctl_recorder(calls)) == 0
+    assert ('disable', '--now', '--', '-fw.service') in calls
+
+
 def test_uninstall_still_removes_a_unit_an_older_firewatcher_named_freely(tmp_path):
     unit_dir = tmp_path / 'system'
     unit_dir.mkdir()
