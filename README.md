@@ -242,9 +242,9 @@ Lines firewatcher writes back to the journal are a single physical line containi
 
 Nothing to change. What is different:
 
-- `--install-service` refuses a unit name systemd cannot load, and a path or value that is not UTF-8, before it writes anything (exit 2, and the message shows no value). 1.67 could write the config first and then stop with a traceback, or install a unit under a name systemd skips. A blank `--unit-name` now means `firewatcher`, as an empty one did.
+- `--install-service` refuses a unit name systemd cannot load, and a path or value that is not UTF-8, before it writes anything (exit 2). 1.67 could write the config first and then stop with a traceback, or install a unit under a name systemd skips. A blank `--unit-name` now means `firewatcher`, as an empty one did.
 - `systemctl enable --now` and `disable --now` get `--` before the unit name, so a name starting with `-` works.
-- On Python 3.6 under a C locale, a non-ASCII path or note given on the command line is written to the config and the unit as UTF-8; 1.67 stopped with a `UnicodeEncodeError`.
+- On Python 3.6 under a C locale, a non-ASCII UTF-8 path or note given on the command line is written to the config and the unit as UTF-8; 1.67 stopped with a `UnicodeEncodeError`.
 - The package declares its license as the SPDX expression `GPL-3.0-or-later` when built with setuptools 77 or later.
 - Dead code and duplicated rules are gone (about 140 lines of code); nothing else an operator sees changed.
 
