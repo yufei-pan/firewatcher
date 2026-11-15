@@ -81,7 +81,7 @@ After deleting, firewatcher syncs and reads the free space again. A filesystem t
 
 Memory is bounded too. The `--capture-time` seconds before a match are kept compressed (zlib, about 3 times smaller for a busy host's varied lines) within `--buffer-max-mb` (default 16 MiB); past it the oldest lines are dropped, and the capture says so. The newest lines, up to 256 KiB before they are compressed, are always kept, so the buffer can go over the limit by about that much. A line longer than 1 MiB is read and matched in pieces, so a pattern split across a 1 MiB boundary is missed.
 
-Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`. The directory is removed only after `tar` succeeds and the archive is synced to disk. An existing archive is never overwritten: the new one becomes `YYYY-MM.1.tar.xz`, and so on.
+Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`. The directory is removed only after `tar` succeeds and the archive and its folder are synced to disk; if a sync fails, the month stays and is archived again later, nothing lost. An existing archive is never overwritten: the new one becomes `YYYY-MM.1.tar.xz`, and so on.
 
 ## systemd service
 
@@ -91,7 +91,7 @@ sudo firewatcher --print-unit
 sudo firewatcher --uninstall-service
 ```
 
-`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`.
+`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`. It checks first, and writes nothing (exit 2) for a unit name systemd cannot load (letters, digits and `: _ . @ - \`, at most 255, any `@` between a name and an instance) or a path or value that is not UTF-8.
 
 `systemctl reload firewatcher` reloads the pattern files without a restart; see SIGHUP above.
 
@@ -237,6 +237,16 @@ Captures are posted whatever `push` says, so the service sees them all. Any 2xx 
 
 Lines firewatcher writes back to the journal are a single physical line containing `firewatcher-self`, so a summary that quotes `panic` or `I/O error` does not start another capture. In journalctl and syslog output, firewatcher recognizes its own lines by the identifier field after the timestamp and host (`firewatcher[PID]:`), not by text elsewhere in the line, so a process or user name chosen to look like firewatcher cannot hide a kernel or daemon message. Lines in other formats are checked for `firewatcher-self` or `firewatcher[PID]:` anywhere. The capture files themselves stay in the log stream's original format.
 
+
+## Upgrading to 1.68 from 1.67
+
+Nothing to change. What is different:
+
+- `--install-service` refuses a unit name systemd cannot load, and a path or value that is not UTF-8, before it writes anything (exit 2, and the message shows no value). 1.67 could write the config first and then stop with a traceback, or install a unit under a name systemd skips. A blank `--unit-name` now means `firewatcher`, as an empty one did.
+- `systemctl enable --now` and `disable --now` get `--` before the unit name, so a name starting with `-` works.
+- On Python 3.6 under a C locale, a non-ASCII path or note given on the command line is written to the config and the unit as UTF-8; 1.67 stopped with a `UnicodeEncodeError`.
+- The package declares its license as the SPDX expression `GPL-3.0-or-later` when built with setuptools 77 or later.
+- Dead code and duplicated rules are gone (about 140 lines of code); nothing else an operator sees changed.
 
 ## Development
 

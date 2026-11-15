@@ -31,7 +31,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.67'
+version = '1.68'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
