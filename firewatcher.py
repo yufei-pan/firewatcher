@@ -325,8 +325,7 @@ class Log_Compressor:
 				pathToDelete.append(path)
 			elif self.compressAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.compressAfterMonths*30 and path == month and os.path.isdir(os.path.join(self.logsDir,path)):
 				pathToCompress.append(path)
-		# Iterate copies: mutating the lists while looping skipped every other entry.
-		for dirName in list(pathToDelete):
+		for dirName in pathToDelete:
 			month = _month_of(dirName)
 			if not self._claim(month):
 				continue
@@ -346,7 +345,7 @@ class Log_Compressor:
 				print(f"Deleting {dirName} failed: {e}")
 			finally:
 				self._release(month)
-		for dirName in list(pathToCompress):
+		for dirName in pathToCompress:
 			if not self._claim(dirName):
 				continue
 			try:
@@ -534,31 +533,18 @@ def print(*args, **kwargs):
 	return builtins.print(*args, **kwargs)
 
 class bcolors:
-		HEADER = '\033[95m'
-		OKBLUE = '\033[94m'
-		OKCYAN = '\033[96m'
-		OKGREEN = '\033[92m'
 		warning = '\033[93m'
 		critical = '\033[91m'
-		info = '\033[0m'
-		debug = '\033[0m'
 		ENDC = '\033[0m'
-		BOLD = '\033[1m'
-		UNDERLINE = '\033[4m'
 
-def slugify(value, allow_unicode=False):
+def slugify(value):
 	"""
 	Taken from https://github.com/django/django/blob/master/django/utils/text.py
-	Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
-	dashes to single dashes. Remove characters that aren't alphanumerics,
-	underscores, or hyphens. Convert to lowercase. Also strip leading and
-	trailing whitespace, dashes, and underscores.
+	Convert to ASCII. Convert spaces or repeated dashes to single dashes. Remove
+	characters that aren't alphanumerics, underscores, or hyphens. Convert to
+	lowercase. Also strip leading and trailing whitespace, dashes, and underscores.
 	"""
-	value = str(value)
-	if allow_unicode:
-		value = unicodedata.normalize('NFKC', value)
-	else:
-		value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+	value = unicodedata.normalize('NFKD', str(value)).encode('ascii', 'ignore').decode('ascii')
 	value = re.sub(r'[^\w\s-]', '', value.lower())
 	value = re.sub(r'[-\s]+', '-', value).strip('-_')
 	if len(value) > SLUG_MAX_LEN:
@@ -585,11 +571,11 @@ def load_patterns(pattern_files):
 			# ignore invalid regex patterns
 			for pattern in patterns:
 				try:
-					pattern = re.compile(pattern)
-					if pattern:
-						rtn_patterns.setdefault('regex', set()).add(pattern)
+					compiled = re.compile(pattern)
 				except Exception:
 					print(f"Invalid regex pattern: {pattern}")
+					continue
+				rtn_patterns.setdefault('regex', set()).add(compiled)
 		# process fnmatch patterns if file ends with .fnmatch
 		else:
 			patterns = [f'*{pattern}*' for pattern in patterns]
@@ -670,7 +656,6 @@ class Settings(object):
 	def __init__(self):
 		self.raw = None
 		self.config_path = DEFAULT_CONFIG_PATH
-		self.config_existed = False
 		self.config_has_patterns = False
 		self.pattern_file = []
 		self.log_file = None
@@ -722,23 +707,16 @@ def _hostname():
 
 
 def _split_patterns(value):
-	if value is None:
-		return []
-	text = str(value).replace(',', '\n')
-	return [part.strip() for part in text.splitlines() if part.strip()]
+	return [part.strip() for part in value.replace(',', '\n').splitlines() if part.strip()]
 
 
 def _coerce_bool(value, key):
-	if isinstance(value, bool):
-		return value
-	text = str(value).strip().lower()
+	text = value.strip().lower()
 	if text in ('1', 'true', 'yes', 'on'):
 		return True
-	if text in ('0', 'false', 'no', 'off', ''):
-		if text == '':
-			raise ConfigError('invalid boolean for %s: empty' % key)
+	if text in ('0', 'false', 'no', 'off'):
 		return False
-	raise ConfigError('invalid boolean for %s: %s' % (key, value))
+	raise ConfigError('invalid boolean for %s: %s' % (key, value if text else 'empty'))
 
 
 def _coerce_float(value, key):
@@ -848,7 +826,6 @@ def resolve_settings(args, environ=None):
 	settings = Settings()
 	settings.raw = args
 	settings.config_path = config_path
-	settings.config_existed = existed
 	settings.config_has_patterns = bool(file_values.get('patterns'))
 	if 'patterns' in file_values:
 		settings.pattern_file = list(file_values['patterns'])
@@ -1225,7 +1202,6 @@ def write_config_file(path, settings):
 		os.write(fd, payload)
 	finally:
 		os.close(fd)
-	os.chmod(path, 0o600)
 
 
 def _explicit_cli_args(raw):
@@ -1640,10 +1616,7 @@ class IncidentDispatcher(object):
 		self.seq = 0
 		self._seq_lock = threading.Lock()
 		self.thread = None
-		try:
-			syslog.openlog('firewatcher', syslog.LOG_PID | syslog.LOG_NDELAY, syslog.LOG_DAEMON)
-		except Exception:
-			pass
+		syslog.openlog('firewatcher', syslog.LOG_PID | syslog.LOG_NDELAY, syslog.LOG_DAEMON)
 		if start_thread:
 			self.thread = threading.Thread(target=self._run, name='firewatcher-notify', daemon=True)
 			self.thread.start()
@@ -1676,12 +1649,8 @@ class IncidentDispatcher(object):
 
 	def _run(self):
 		while True:
+			_priority, _seq, incident = self.queue.get()
 			try:
-				item = self.queue.get()
-			except Exception:
-				return
-			try:
-				_priority, _seq, incident = item
 				if incident is None:
 					return
 				self._process(incident)
@@ -1692,10 +1661,10 @@ class IncidentDispatcher(object):
 
 	def _overflow(self, incident):
 		if self.settings.events_url:
-			_journal(syslog.LOG_WARNING, 'queue full: posting the capture without waiting', status='queue full: posting the capture without waiting')
+			_journal(syslog.LOG_WARNING, 'queue full: posting the capture without waiting')
 			self._deliver_unjudged(incident, OVERFLOW_NOTIFY_TIMEOUT)
 			return
-		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full', status='analysis skipped, queue full')
+		_journal(syslog.LOG_WARNING, 'analysis skipped, queue full')
 		self._deliver(incident, True, _programmatic_title(incident.get('hostname', ''), incident.get('pattern', '')), incident.get('matched_line') or '', OVERFLOW_NOTIFY_TIMEOUT)
 
 	def _deliver_unjudged(self, incident, timeout):
@@ -1739,10 +1708,8 @@ class IncidentDispatcher(object):
 					_append_note(incident['path'], _format_failure(exc))
 				except Exception:
 					pass
+				# Only the request and the note can raise, before the verdict, title or body change: they go out as generated.
 				_journal(syslog.LOG_ERR, 'LLM analysis failed: %s' % exc, status='LLM analysis failed')
-				should_push = True
-				title = _programmatic_title(incident.get('hostname', ''), incident.get('pattern', ''))
-				body_source = incident.get('matched_line') or ''
 		self._deliver(incident, should_push, title, body_source, self.settings.ntfy_timeout)
 
 	def _deliver(self, incident, should_push, title, body_source, timeout):
@@ -1948,8 +1915,6 @@ class CaptureFile(object):
 	"""
 
 	def __init__(self, paths, sync_interval, headroom=None):
-		if isinstance(paths, str):
-			paths = [paths]
 		self.remaining = list(paths)
 		self.path = self.remaining[0]
 		self.sync_interval = sync_interval
@@ -2445,7 +2410,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 						for log_compressor in log_compressors:
 							log_compressor.startCompressLogs()
 					if processed_line_counter % 10000 == 0:
-						print(f"Processed {processed_line_counter} lines.",flush=True)
+						print(f"Processed {processed_line_counter} lines.")
 			except KeyboardInterrupt:
 				if line_in_flight and journal_position is not None:
 					journal_position.unsee()
@@ -2467,7 +2432,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 		finally:
 			try:
 				if journal_position is not None:
-					journal_position.save(final=True)
+					journal_position.save()
 			finally:
 				if dispatcher is not None:
 					dispatcher.close()
@@ -2959,10 +2924,8 @@ class JournalPosition(object):
 			self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed = self.before
 			self.before = None
 
-	def save(self, now=None, final=False):
-		"""Write the position atomically; a failure is logged once and retried at the next save.
-
-		final is not used: every save is fsynced. Two test subclasses use it to tell the save at exit from the others."""
+	def save(self, now=None):
+		"""Write the position atomically; a failure is logged once and retried at the next save."""
 		import json
 		now = time.time() if now is None else now
 		self.next_save = now + POSITION_SAVE_INTERVAL

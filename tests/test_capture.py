@@ -508,7 +508,7 @@ def test_fsync_error_moves_the_capture_with_its_unsynced_lines(tmp_path, monkeyp
 
 
 def test_capture_file_after_close_ignores_writes(tmp_path):
-    cap = fw.CaptureFile(str(tmp_path / 'c.log'), 1.0)
+    cap = fw.CaptureFile([str(tmp_path / 'c.log')], 1.0)
     cap.write('one\n')
     cap.close()
     cap.close()
@@ -521,7 +521,7 @@ def test_capture_file_after_close_ignores_writes(tmp_path):
 @pytest.mark.parametrize('where', ['trailer', 'close'])
 def test_interrupted_end_of_capture_still_hands_over_the_incident(tmp_path, monkeypatch, where):
     dispatcher = RecordingDispatcher()
-    cap = fw.CaptureFile(str(tmp_path / 'c.log'), 1.0)
+    cap = fw.CaptureFile([str(tmp_path / 'c.log')], 1.0)
     real_write, real_sync = cap.write, cap.sync
 
     def interrupted_write(text):
@@ -1426,7 +1426,7 @@ def test_capture_file_bounds_text_kept_for_a_move(tmp_path, monkeypatch):
     fsyncs = []
     real_fsync = fw.os.fsync
     monkeypatch.setattr(fw.os, 'fsync', lambda fd: fsyncs.append(fd) or real_fsync(fd))
-    capture = fw.CaptureFile(str(tmp_path / 'x.log'), 1.0)
+    capture = fw.CaptureFile([str(tmp_path / 'x.log')], 1.0)
     for i in range(100):
         capture.write('line %03d %s\n' % (i, 'x' * 90))
         assert capture.unsynced_size <= 1000 and sum(map(len, capture.unsynced)) == capture.unsynced_size

@@ -16,7 +16,6 @@ def test_missing_default_config_uses_builtins():
     assert settings.filter_only is False
     assert settings.llm_enabled is False
     assert settings.notify_enabled is False
-    assert settings.config_existed is False
 
 
 def test_explicit_missing_config_is_an_error(tmp_path):

@@ -313,8 +313,6 @@ def test_notify_only_jobs_use_higher_priority(tmp_path, monkeypatch):
 
 
 def test_helper_edges(tmp_path, monkeypatch, capsys):
-    assert fw._split_patterns(None) == []
-    assert fw._coerce_bool(True, 'k') is True
     assert fw._coerce_bool('yes', 'k') is True
     with pytest.raises(fw.ConfigError):
         fw._coerce_bool('   ', 'k')
