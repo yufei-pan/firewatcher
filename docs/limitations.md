@@ -50,3 +50,40 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `_syncfs` does, and skip the sync where syncfs is missing (a filesystem that then shows freed space late costs a move
   to the fallback folder when one is set, or dropped writes for the rest of that capture when not, never the floor, as
   today).
+
+### A failed `systemctl` step after the install's writes leaves the config and the unit, and a rerun puts the flags on ExecStart
+- Kind: deferred
+- What the operator sees: `--install-service` checks and renders everything before it writes, but `daemon-reload` and
+  `enable --now` run after the writes. When one of them fails, the install prints "systemctl ... failed (exit N)", returns
+  that code, and leaves `firewatcher.conf` (mode 0600) and the unit in place. The same command run again finds the config,
+  so it renders the command-line flags onto the unit's `ExecStart` instead of into the config. The ntfy URL, a secret like
+  a password, is then in the world-readable unit (the run prints a warning for it). A clean install keeps `ExecStart` to
+  `--config <path>`. 1.67 does the same.
+- Why: found by the 1.68 final review (2026-11-15); the 1.68 change moved only the checks and the rendering before the
+  first write. Not worse than 1.67.
+- Revisit when: 1.69. Plan: when `daemon-reload` or `enable --now` fails after this run created the config, remove the
+  config and the unit this run wrote (it created the config with `O_EXCL`, so it is sure the file is its own), so the
+  rerun is a clean install. A config that existed before the run stays.
+
+### The journal replay treats a whole second as context when the saved line is no longer in the journal
+- Kind: deferred
+- What the operator sees: at a restart, firewatcher reads the journal back from the saved position. When the journal holds
+  fewer lines of the saved second than the saved line number says (the journal file that held the start of that second
+  was rotated away while firewatcher was stopped), the saved line is never found. Every line that follows it in that
+  second is replayed as context only and never matched, so a line in it that matches a pattern opens no capture. The
+  next second's lines are matched as usual. The README says that when unsure, firewatcher reads a line again rather than
+  skip it; this case skips. Rare: it needs that second's lines split over a rotation. 1.67 does the same.
+- Why: found by the 1.68 final review (2026-11-15). The replay ends at the saved line, found by its number in the second
+  and its digest; it has no rule for a line number that cannot be reached.
+- Revisit when: 1.69. Plan: end the replay at the first line of the saved second whose digest matches when the count
+  cannot reach the saved number (a line read again is the safe mistake), and test it with a journal that lost the start of
+  the second.
+
+### A command-line `--tail-lines ''` reaches `tail -n ''`, which the config file's empty value does not
+- Kind: deferred
+- What the operator sees: `firewatcher --tail-lines '' ...` (also `--tail_lines ''`, and a unit that carries it) starts
+  `tail -n ''`, which exits with "invalid number of lines"; firewatcher then ends ("Processed 0 lines") and, under
+  systemd, restarts in a loop. An empty `tail_lines =` in the config file is ignored, as an unset value. 1.67 does the same.
+- Why: found by the 1.68 final review (2026-11-15). The command-line value is used as given, while the config loader skips
+  an empty one.
+- Revisit when: 1.69. Plan: treat an empty `--tail-lines` as unset in the argument parser, the way the config file does.
