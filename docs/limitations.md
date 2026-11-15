@@ -48,4 +48,5 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: found during the 1.68 simplify pass (2026-11-14), after the 1.68 scope was set; present since 1.61.
 - Revisit when: 1.69. Plan: sync only the filesystem the folder is on, with syncfs(2) through ctypes as hpcp's
   `_syncfs` does, and skip the sync where syncfs is missing (a filesystem that then shows freed space late costs a move
-  to the fallback folder, never the floor, as today).
+  to the fallback folder when one is set, or dropped writes for the rest of that capture when not, never the floor, as
+  today).

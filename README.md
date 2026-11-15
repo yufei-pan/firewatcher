@@ -62,7 +62,7 @@ When firewatcher follows the journal (not a log file), it saves how far it has r
 
 To tell where it stopped, firewatcher reads the journal with `journalctl -o short-iso`, so journal lines in captures carry the year and time zone: `2026-10-23T17:52:41+00:00 host sshd[812]: …` instead of `Oct 23 17:52:41 host sshd[812]: …`. Lines logged while firewatcher was stopped arrive all at once. A capture opened by one of them takes its context from the `--capture-time` before that line by the time each line was logged, and holds the lines after it as they are read, up to `--capture-line-count-max`.
 
-The position is the second of the last line read, its place in that second, and a digest of it. When unsure, firewatcher reads a line again rather than skip it, so identical lines logged in one second can be captured again after a restart. A failed save is logged once, and a restart then reads again from the last position saved. If the clock is set back after a save (a boot with a wrong hardware clock), new lines stamped before the saved second count as already read; a position more than a minute in the future is ignored.
+The position is the second of the last line read, its place in that second, and a digest of it. When unsure, firewatcher reads a line again rather than skip it, so identical lines logged in one second can be captured again after a restart. A failed save is logged once, and a restart then reads again from the last position saved. If the clock is set back after a save (a boot with a wrong hardware clock), the lines after the saved line are still matched, even when they are stamped before the saved second; a position more than a minute in the future is ignored.
 
 Only one firewatcher uses a position file at a time: another one started with the same file, such as a test run in a terminal with the default settings, reads the last `--tail-lines` lines and saves nothing. An empty `--position-file` turns resuming off, and so does a journalctl that does not accept `-o short-iso` and `--since=@`, which firewatcher checks at start.
 
@@ -91,7 +91,7 @@ sudo firewatcher --print-unit
 sudo firewatcher --uninstall-service
 ```
 
-`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`. It checks first, and writes nothing (exit 2) for a unit name systemd cannot load (letters, digits and `: _ . @ - \`, at most 255, any `@` between a name and an instance) or a path or value that is not UTF-8.
+`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`. It checks first, and writes nothing (exit 2) for a unit name systemd cannot load (letters, digits and `: _ . @ - \`, at most 255 characters with the `.service` suffix, any `@` between a name and an instance) or a path or value that is not UTF-8.
 
 `systemctl reload firewatcher` reloads the pattern files without a restart; see SIGHUP above.
 
@@ -246,7 +246,8 @@ Nothing to change. What is different:
 - `systemctl enable --now` and `disable --now` get `--` before the unit name, so a name starting with `-` works.
 - On Python 3.6 under a C locale, a non-ASCII path or note given on the command line reads as undecodable bytes, and a service started under that locale could not encode it, so `--install-service` refuses it (exit 2, nothing written) and says to run under a UTF-8 locale (`LC_ALL=C.UTF-8`). 1.67 stopped there with a `UnicodeEncodeError`. Under a UTF-8 locale, and on Python 3.7 and later, such a path installs as before.
 - The package declares its license as the SPDX expression `GPL-3.0-or-later` when built with setuptools 77 or later.
-- Dead code and duplicated rules are gone (about 140 lines of code); nothing else an operator sees changed.
+- `--uninstall-service --unit-name` with a path (`a/b`) now prints a message and exits 2; 1.67 stopped with a traceback. It still takes any other name an older firewatcher may have installed.
+- Dead code and duplicated rules are gone (`firewatcher.py` went from 3,227 to 3,084 lines before the install checks were added); nothing else an operator sees changed.
 
 ## Development
 

@@ -2436,12 +2436,13 @@ def unit_filename(unit_name):
 
 def _check_new_unit_name(base):
 	"""ValueError unless systemd can load and enable a unit file named base: only its characters, at most 255 of
-	them, and any '@' with a name before it and an instance after it. For install only: uninstall must still
-	remove a unit an older firewatcher installed under another name."""
+	them (the '.service' suffix counts), and any '@' with a name before it and an instance after it. For install
+	only: uninstall must still remove a unit an older firewatcher installed under another name."""
 	prefix, at, instance = base[:-len('.service')].partition('@')
 	if len(base) > 255 or not prefix or (at and not instance) or not re.match(r'[A-Za-z0-9:_.@\\-]+\Z', base):
 		raise ValueError('unit name must be one systemd can load and enable: letters, digits and : _ . @ - \\, '
-						 'at most 255, and any @ with a name before it and an instance after it')
+						 'at most 255 characters with the .service suffix, and any @ with a name before it and '
+						 'an instance after it')
 
 
 def resolve_executable():
@@ -2881,7 +2882,7 @@ class JournalPosition(object):
 			fd, unfinished = tempfile.mkstemp(prefix=os.path.basename(self.path) + '.', suffix='.tmp', dir=folder)
 			with os.fdopen(fd, 'w', encoding='utf-8') as f:
 				f.write(json.dumps(record) + '\n')
-				# Every save, not only the final one: XFS does not flush a file's data when it is renamed over
+				# Every save is synced: XFS does not flush a file's data when it is renamed over
 				# another, so after a hard reset an unsynced position could come back empty and the restart would
 				# lose the lead-up to the crash. About 100 bytes per fsync, at most once per POSITION_SAVE_INTERVAL, plus
 				# the save that comes with a capture opening.
