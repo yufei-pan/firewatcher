@@ -39,20 +39,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: a way to tell such a URL from a real host and path appears, or someone hits it.
 - Approved: 2026-11-01, the user ticked "fw: digits shown as port". The no-warning sentence added 2026-11-04, the user: "Add it to the wording".
 
-### The journal replay treats a whole second as context when the saved line is no longer in the journal
-- Kind: deferred
-- What the operator sees: at a restart, firewatcher reads the journal back from the saved position. When the journal holds
-  fewer lines of the saved second than the saved line number says (the journal file that held the start of that second
-  was rotated away while firewatcher was stopped), the saved line is never found. Every line that follows it in that
-  second is replayed as context only and never matched, so a line in it that matches a pattern opens no capture. The
-  next second's lines are matched as usual. The README says that when unsure, firewatcher reads a line again rather than
-  skip it; this case skips. Rare: it needs that second's lines split over a rotation. 1.67 does the same.
-- Why: found by the 1.68 final review (2026-11-15). The replay ends at the saved line, found by its number in the second
-  and its digest; it has no rule for a line number that cannot be reached.
-- Revisit when: 1.69. Plan: end the replay at the first line of the saved second whose digest matches when the count
-  cannot reach the saved number (a line read again is the safe mistake), and test it with a journal that lost the start of
-  the second.
-
 ### On Python 3.6 under a C locale, a service given a non-ASCII path dies when it writes there
 - Kind: deferred
 - What the operator sees: firewatcher run by hand, or from a hand-written config, on Python 3.6 under a C locale with a

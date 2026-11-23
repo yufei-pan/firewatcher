@@ -66,6 +66,9 @@ DEFAULT_RESUME_MAX = 3600
 POSITION_SAVE_INTERVAL = 1.0
 # A journal line read this many seconds after its timestamp was logged while firewatcher was stopped.
 BACKLOG_LAG = 2
+# Longest a journalctl run at start may take (the probe, and reading the saved second) before it counts as hung:
+# reading one second of a 4 GB journal took 0.08 s on a test host.
+JOURNAL_PROBE_TIMEOUT = 30
 # journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
 _ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
 DEFAULT_UNIT_NAME = 'firewatcher'
@@ -2778,7 +2781,8 @@ class JournalPosition(object):
 	The file holds the second of the last line read (from journalctl -o short-iso), which line of
 	that second it was, and a digest of it. At start, journalctl reads from capture_time before
 	that line, at most resume_max seconds back: the lines up to the saved one only refill the
-	context kept before a match, and the lines after it are matched as usual.
+	context kept before a match, and the lines after it are matched as usual. locate() first finds
+	the saved line in the journal as it is now, which may have lost it.
 	"""
 
 	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None):
@@ -2842,6 +2846,26 @@ class JournalPosition(object):
 		if self.since is not None:
 			command = ['--since=@%d' % self.since if part.startswith('--lines=') else part for part in command]
 		return command
+
+	def locate(self, command):
+		"""Before replaying, find the saved line in the journal as it is now, by reading its second once with
+		command (the resumed journalctl command). The journal may have lost the start of that second, or the line
+		itself, while firewatcher was stopped (a journal file rotated away, a crash before journald wrote it), and
+		then the line's number no longer finds it. The replay then ends at the first line of that second with the
+		line's digest, and with no such line nothing is replayed: every line from the start of the replay is
+		matched. Both read lines again rather than skip them. When journalctl cannot tell, nothing changes."""
+		if not self.replaying:
+			return
+		saved_time, ordinal, digest = self.saved
+		digests = _journal_second(command, saved_time)
+		if digests is None or digests[ordinal - 1:ordinal] == [digest]:
+			return
+		if digest in digests:
+			self.saved = (saved_time, digests.index(digest) + 1, digest)
+			return
+		self.replaying = False
+		self.note = 'The journal no longer holds the last line read before the stop (%s); matching every line from %s.' % (
+			datetime.datetime.fromtimestamp(saved_time).isoformat(), datetime.datetime.fromtimestamp(self.since).isoformat())
 
 	def replay_time(self, line):
 		"""While replaying: the time of a line from before the saved position, for the context. None from the first line after it."""
@@ -2947,10 +2971,45 @@ def _journal_can_resume(journalctl):
 	try:
 		probe = subprocess.run(
 			[journalctl, '--quiet', '--no-pager', '--output=short-iso', '--since=@%d' % int(time.time()), '--lines=0'],
-			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=JOURNAL_PROBE_TIMEOUT)
 	except (OSError, subprocess.SubprocessError):
 		return False
 	return probe.returncode == 0
+
+
+def _journal_second(command, second):
+	"""The digests of the journal lines stamped in that second, in their order, read with command (journalctl
+	-o short-iso) without --follow, from that second on; None when journalctl fails or takes longer than
+	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line of another second."""
+	command = [part for part in command if part != '--follow' and not part.startswith('--since=')]
+	try:
+		proc = subprocess.Popen(command + ['--since=@%d' % second], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+								stderr=subprocess.DEVNULL)
+	except OSError:
+		return None
+	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
+	timer.start()
+	digests = []
+	ended = True
+	try:
+		# Read as the capture loop reads, so each line has the digest it had there.
+		stream = io.TextIOWrapper(proc.stdout, encoding='utf-8', errors='replace', newline='\n')
+		for line in iter(lambda: stream.readline(MAX_LINE_CHARS), ''):
+			stamp = _iso_stamp(line)
+			if stamp is None:
+				continue
+			if stamp[0] != second:
+				break
+			digests.append(_line_digest(line, stamp[1]))
+		else:
+			ended = False
+	finally:
+		timer.cancel()
+		proc.kill()
+		returncode = proc.wait()
+		proc.stdout.close()
+	# Output that ended inside the second is whole only if journalctl finished by itself, not killed by the timer.
+	return digests if ended or returncode == 0 else None
 
 
 def _journald_present():
@@ -3079,6 +3138,7 @@ def _watch(resolved):
 		elif _journal_can_resume(command_to_run[0]):
 			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines)
 			command_to_run = journal_position.journal_command(command_to_run)
+			journal_position.locate(command_to_run)
 			print(journal_position.note)
 		else:
 			print(f"This journalctl cannot resume from a saved position (that needs -o short-iso and --since=@); reading the last {resolved.tail_lines} lines.")

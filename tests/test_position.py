@@ -156,6 +156,84 @@ def test_a_changed_time_zone_still_finds_the_saved_line(tmp_path):
     assert replay(position, lines) == ['old', 'old', 'new']
 
 
+# --- finding the saved line in the journal as it is at the restart ---
+
+def fake_journalctl(tmp_path, journal):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake = bin_dir / 'journalctl'
+    fake.write_text(FAKE_JOURNALCTL % sys.executable)
+    fake.chmod(0o755)
+    (bin_dir / 'journal.txt').write_text(journal)
+    return str(fake)
+
+
+def script(tmp_path, body):
+    path = tmp_path / 'journalctl'
+    path.write_text('#!%s\nimport sys, time\n%s\n' % (sys.executable, body))
+    path.chmod(0o755)
+    return str(path)
+
+
+def located(tmp_path, ordinal, text, journalctl):
+    position = resumed(tmp_path, 0, ordinal, text)
+    position.locate([journalctl, '--output=short-iso', '--all', '--no-pager', '--since=@%d' % position.since, '--follow'])
+    return position
+
+
+def test_locate_keeps_the_saved_line_where_the_journal_still_has_it(tmp_path):
+    lines = [jline(-1, 'x'), jline(0, 'a'), jline(0, 'b'), jline(0, 'c'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 2
+    assert replay(position, lines) == ['old', 'old', 'old', 'new', 'new']
+    # the saved second read once, from that second on, without --follow
+    assert (tmp_path / 'bin' / 'calls.txt').read_text() == '--output=short-iso --all --no-pager --since=@%d\n' % T
+    # a journal that ends inside the saved second
+    other = tmp_path / 'other'
+    other.mkdir()
+    position = located(other, 2, 'b', fake_journalctl(other, jline(0, 'a') + jline(0, 'b')))
+    assert position.replaying and position.saved[1] == 2
+
+
+def test_a_journal_that_lost_the_start_of_the_saved_second_ends_the_replay_at_the_saved_line(tmp_path):
+    # the saved line was the third of its second; the first two went with a rotated journal file
+    position = located(tmp_path, 3, 'c', fake_journalctl(tmp_path, jline(0, 'c') + jline(0, 'HIT') + jline(1, 'd')))
+    assert position.saved[1] == 1
+    assert replay(position, [jline(0, 'c'), jline(0, 'HIT'), jline(1, 'd')]) == ['old', 'new', 'new']
+
+
+def test_with_the_start_of_the_second_lost_identical_lines_are_read_again_never_skipped(tmp_path):
+    # the saved line was the fourth of four identical lines: which one it is now cannot be told, so the first
+    lines = [jline(0, 'same'), jline(0, 'same'), jline(0, 'x'), jline(1, 'y')]
+    position = located(tmp_path, 4, 'same', fake_journalctl(tmp_path, ''.join(lines)))
+    assert replay(position, lines) == ['old', 'new', 'new', 'new']
+
+
+@pytest.mark.parametrize('journal', [
+    jline(0, 'c') + jline(0, 'HIT') + jline(1, 'd'),  # the saved line went, the rest of its second stayed
+    jline(5, 'HIT later'),  # its whole second went
+    '',  # nothing at or after it: "-- No entries --"
+    jline(0, 'c') + jline(-100, 'b'),  # the clock set back after it: reading stops at the first line of another second
+])
+def test_a_journal_without_the_saved_line_replays_nothing(tmp_path, journal):
+    position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, journal))
+    assert not position.replaying
+    assert 'no longer holds the last line read' in position.note
+    assert replay(position, [jline(-30, 'HIT earlier'), jline(0, 'HIT')]) == ['new', 'new']
+
+
+def test_when_journalctl_cannot_tell_the_replay_goes_by_the_saved_number(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 1)
+    second = jline(0, 'c') + jline(0, 'HIT')
+    for journalctl in (str(tmp_path / 'missing'),
+                       script(tmp_path, 'sys.stdout.write(%r)\nsys.exit(1)' % second),
+                       script(tmp_path, 'sys.stdout.write(%r)\nsys.stdout.flush()\ntime.sleep(600)' % second)):
+        start = time.time()
+        position = located(tmp_path, 3, 'c', journalctl)
+        assert time.time() - start < 15, journalctl
+        assert position.replaying and position.saved[1] == 3, journalctl
+
+
 def test_saw_saves_once_per_interval_and_round_trips(tmp_path):
     path = tmp_path / 'state' / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
@@ -359,7 +437,8 @@ def test_journal_can_resume_probes_journalctl(tmp_path):
 
 
 FAKE_JOURNALCTL = r'''#!%s
-"""Prints journal.txt like journalctl -o short-iso, from --since=@N or the last --lines=N, then waits."""
+"""Prints journal.txt like journalctl -o short-iso: from the first line at or after --since=@N (later lines too, whatever
+their time, as journalctl seeks and then reads on), or the last --lines=N; then, with --follow, waits."""
 import calendar, os, sys, time
 lines = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'journal.txt')).read().splitlines(True)
 args = sys.argv[1:]
@@ -367,47 +446,59 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calls.txt'),
     f.write(' '.join(args) + '\n')
 if '--lines=0' in args:
     sys.exit(0)
+
+def at_or_after(line, since):
+    try:
+        return calendar.timegm(time.strptime(line[:19], '%%Y-%%m-%%dT%%H:%%M:%%S')) >= since
+    except ValueError:
+        return False
+
 for arg in args:
     if arg.startswith('--since=@'):
         since = int(arg[len('--since=@'):])
-        lines = [l for l in lines if calendar.timegm(time.strptime(l[:19], '%%Y-%%m-%%dT%%H:%%M:%%S')) >= since]
+        first = next((n for n, l in enumerate(lines) if at_or_after(l, since)), len(lines))
+        lines = lines[first:] or ['-- No entries --\n']
     if arg.startswith('--lines='):
         lines = lines[-int(arg[len('--lines='):]):]
 sys.stdout.write(''.join(lines))
 sys.stdout.flush()
-time.sleep(600)
+if '--follow' in args:
+    time.sleep(600)
 '''
 
 
-def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir()
-    fake = bin_dir / 'journalctl'
-    fake.write_text(FAKE_JOURNALCTL % sys.executable)
-    fake.chmod(0o755)
-    now = int(time.time())
+class Daemon(object):
+    """firewatcher as a daemon on a journald host, reading a fake journalctl (FAKE_JOURNALCTL, its journal.txt beside
+    it) and saving its position, until done() or 20 seconds, then stopped with SIGTERM."""
 
-    def line(offset, text):
-        return '%s host app[1]: %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime(now + offset)), text)
+    def __init__(self, tmp_path):
+        self.bin_dir = tmp_path / 'bin'
+        self.bin_dir.mkdir()
+        fake = self.bin_dir / 'journalctl'
+        fake.write_text(FAKE_JOURNALCTL % sys.executable)
+        fake.chmod(0o755)
+        self.journal = self.bin_dir / 'journal.txt'
+        self.now = int(time.time())
+        self.pat = tmp_path / 'p.txt'
+        self.pat.write_text('HIT\n')
+        self.conf = tmp_path / 'empty.conf'
+        self.conf.write_text('')
+        self.out = tmp_path / 'out'
+        self.position_file = tmp_path / 'journal.position'
+        self.env = dict(os.environ, PATH='%s%s%s' % (self.bin_dir, os.pathsep, os.environ.get('PATH', '')))
 
-    journal = bin_dir / 'journal.txt'
-    journal.write_text(line(-40, 'quiet') + line(-30, 'HIT first') + line(-20, 'after the first'))
-    pat = tmp_path / 'p.txt'
-    pat.write_text('HIT\n')
-    conf = tmp_path / 'empty.conf'
-    conf.write_text('')
-    out = tmp_path / 'out'
-    position_file = tmp_path / 'journal.position'
-    env = dict(os.environ, PATH='%s%s%s' % (bin_dir, os.pathsep, os.environ.get('PATH', '')))
+    def line(self, offset, text):
+        return '%s host app[1]: %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime(self.now + offset)), text)
 
-    def run_until(done):
+    def run_until(self, done):
         proc = subprocess.Popen(
             # as on a journald host, whatever runs on the machine running the tests
             [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import firewatcher as fw; '
              'fw._journald_present = lambda: True; sys.exit(fw.main(sys.argv[2:]))', str(ROOT),
-             '--config', str(conf), '-o', str(out), '-t', '60',
-             '--fallback-folder', '', '--position-file', str(position_file), str(pat)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=env,
+             '--config', str(self.conf), '-o', str(self.out), '-t', '60',
+             '--fallback-folder', '', '--position-file', str(self.position_file), str(self.pat)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+            env=self.env,
         )
         try:
             deadline = time.time() + 20
@@ -422,32 +513,71 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
         assert proc.returncode == 0, output
         return output
 
-    def captured(count, text, saved):
-        # The capture shows a line before the loop marks it handled, so the saved position is waited for too.
-        logs = incident_logs(out)
-        if not (len(logs) == count and text in logs[-1].read_text()):
-            return False
+    def saved(self):
         try:
-            return json.loads(position_file.read_text())['time'] == saved
-        except (OSError, ValueError, KeyError, TypeError):
-            return False
+            return json.loads(self.position_file.read_text())
+        except (OSError, ValueError):
+            return {}
 
-    first = run_until(lambda: captured(1, 'after the first', now - 20))
+    def captured(self, count, text, saved):
+        # The capture shows a line before the loop marks it handled, so the saved position is waited for too.
+        logs = incident_logs(self.out)
+        return len(logs) == count and text in logs[-1].read_text() and self.saved().get('time') == saved
+
+
+def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    daemon.journal.write_text(line(-40, 'quiet') + line(-30, 'HIT first') + line(-20, 'after the first'))
+    first = daemon.run_until(lambda: daemon.captured(1, 'after the first', now - 20))
     assert 'No journal position saved' in first
-    assert json.loads(position_file.read_text())['time'] == now - 20
-    journal.write_text(journal.read_text() + line(-10, 'logged while stopped') + line(-5, 'HIT second'))
-    second = run_until(lambda: captured(2, 'HIT second', now - 5))
+    assert daemon.saved()['time'] == now - 20
+    daemon.journal.write_text(daemon.journal.read_text() + line(-10, 'logged while stopped') + line(-5, 'HIT second'))
+    second = daemon.run_until(lambda: daemon.captured(2, 'HIT second', now - 5))
     assert 'Resuming the journal after' in second
-    logs = incident_logs(out)
+    logs = incident_logs(daemon.out)
     assert len(logs) == 2
     text = logs[1].read_text()
     assert 'Matched line:    %s' % line(-5, 'HIT second').strip() in text
     # read again as context only, so 'HIT first' did not open a capture of its own
     assert 'logged while stopped' in text and 'after the first' in text and 'HIT first' in text
-    assert json.loads(position_file.read_text())['time'] == now - 5
-    calls = (bin_dir / 'calls.txt').read_text().splitlines()
+    assert daemon.saved()['time'] == now - 5
+    calls = (daemon.bin_dir / 'calls.txt').read_text().splitlines()
     assert any('--lines=20' in call for call in calls)
     assert any('--since=@%d' % (now - 20 - 60) in call for call in calls)
+    # the saved second, read once before resuming, without --follow
+    assert any(call.endswith('--since=@%d' % (now - 20)) and '--follow' not in call for call in calls)
+
+
+def test_a_restart_after_the_journal_lost_the_start_of_the_saved_second_matches_what_followed(tmp_path):
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    daemon.journal.write_text(line(-40, 'HIT first') + line(-20, 'a') + line(-20, 'b') + line(-20, 'c'))
+    daemon.run_until(lambda: daemon.captured(1, 'c', now - 20))
+    assert daemon.saved()['line'] == 3
+    # While stopped, the journal file that held the start of that second was rotated away, and a match was logged
+    # in that second. 1.68 counted 'c' as the second's first line, never found the saved third one, and replayed
+    # the rest of the second as context only.
+    daemon.journal.write_text(line(-20, 'c') + line(-20, 'HIT logged while stopped') + line(-5, 'later'))
+    daemon.run_until(lambda: daemon.captured(2, 'later', now - 5))
+    logs = incident_logs(daemon.out)
+    assert len(logs) == 2
+    assert 'Matched line:    %s' % line(-20, 'HIT logged while stopped').strip() in logs[1].read_text()
+
+
+def test_a_restart_on_a_journal_without_the_saved_line_and_a_clock_set_back_matches_every_line(tmp_path):
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    daemon.journal.write_text(line(-40, 'HIT first') + line(-20, 'last line read'))
+    daemon.run_until(lambda: daemon.captured(1, 'last line read', now - 20))
+    # A reboot with a volatile journal (CentOS 7's default) lost the saved line, and the clock came back behind it.
+    # 1.68 replayed every line stamped before the saved second as context, until the clock passed it.
+    daemon.journal.write_text(line(-50, 'booted with the clock behind') + line(-49, 'HIT after the reboot'))
+    second = daemon.run_until(lambda: len(incident_logs(daemon.out)) == 2 and daemon.saved().get('time') == now - 49)
+    assert 'no longer holds the last line read' in second
+    logs = incident_logs(daemon.out)
+    assert len(logs) == 2
+    assert 'Matched line:    %s' % line(-49, 'HIT after the reboot').strip() in logs[1].read_text()
 
 
 def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monkeypatch):
