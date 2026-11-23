@@ -244,26 +244,37 @@ def test_a_line_shown_as_the_saved_second_can_come_after_one_shown_as_the_next(t
     # d was sent in the saved second and stored after c, which was sent in the next one
     lines = [jline(0, 'a'), stored(1, jline(1, 'c')), stored(1, jline(0, 'd'))]
     position = located(tmp_path, 1, 'd', fake_journalctl(tmp_path, ''.join(lines)))
-    # the saved d was the first line of its second as the capture loop numbered it (c came before), and is now the second
-    assert position.replaying and position.saved[1] == 2
+    # the saved d was the first line of its run as the capture loop numbered it (c came before); it is there at that
+    # number or after it, so the saved number stays
+    assert position.replaying and position.saved[1] == 1
     assert 'no longer holds' not in position.note
 
 
 def test_a_line_shown_as_the_second_before_inside_the_saved_second_does_not_end_the_replay_early(tmp_path):
     # journald stored h (sent in the second before) between lines of the saved second, as in a stall. The capture
     # loop counted the saved A as the 2nd of its run (h ended the run, B began a new one), and the journal holds an
-    # earlier A: counted among all lines of the second, an earlier build of 1.69 took that one, and read h, B, A and d again
+    # earlier A: e379c34 took that one as the saved line and read h, B, A and d again; the replay ends as 1.68's did
     lines = [jline(0, 'A'), stored(0, jline(-1, 'h')), jline(0, 'B'), jline(0, 'A'), jline(1, 'd')]
     position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
-    assert position.replaying and position.saved[1] == 3
+    assert position.replaying and position.saved[1] == 2
     shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
     assert replay(position, shown) == ['old', 'old', 'old', 'old', 'new']
 
 
+def test_a_journal_that_lost_lines_before_the_saved_one_skips_no_line_1_68_matched(tmp_path):
+    # the capture loop read [B, A] and saved A as the 2nd of its run; B went with a rotated file, and while firewatcher
+    # was stopped C, A, h (sent in the second before, stored inside it: a stall), D, A and E came. With A's text at
+    # its number or after it, the replay ends where 1.68's did; a later line with A's text and number skipped C to A
+    lines = [jline(0, 'A'), jline(0, 'C'), jline(0, 'A'), stored(0, jline(-1, 'h')), jline(0, 'D'), jline(0, 'A'), jline(1, 'E')]
+    position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
+    shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'new', 'new', 'new', 'new']
+
+
 def test_a_saved_number_that_is_right_among_all_lines_of_the_second_is_kept(tmp_path):
     # after a resume the saved number counts all lines of the second (replay_time), whatever ends the capture loop's
-    # runs: the second X is the 2nd line of its second, and is 1st in its run, after h. The replay ends there, and
-    # the next X is read as new, not skipped.
+    # runs: the first X is the 2nd line of its second and the 1st of its run (h ended Y's): the replay ends there,
+    # and the next X is read as new, not skipped.
     lines = [jline(0, 'Y'), stored(0, jline(-1, 'h')), jline(0, 'X'), jline(0, 'X'), jline(1, 'd')]
     position = located(tmp_path, 2, 'X', fake_journalctl(tmp_path, ''.join(lines)))
     assert position.saved[1] == 2
