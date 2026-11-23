@@ -8,7 +8,7 @@ Open work lives here and nowhere else (RULES, "Long work: the progress file"). E
 ## Open work
 
 ### firewatcher 1.70 (no written plan: the entries of kind "deferred" naming 1.70 in docs/limitations.md, each with its plan)
-- **Resuming, a design check first:** weigh resuming by journal cursor (journalctl 219 has `--after-cursor` and `--cursor`) before adding saved state; it settles the A-6 entry (a restart after the journal lost the saved line, or lines before it in its second, with a twin line; and the rare views where 1.69 reads a line again that 1.68 found exactly) and the entry "A restart where a line shown far later was stored first says the journal no longer holds the last line". State: not started. From: 1.69's reviews (2026-11-23), deferrals, not asked.
+- **Resuming, a design check first:** weigh resuming by journal cursor (journalctl 219 has `--after-cursor` and `--cursor`) before adding saved state; it settles the A-6 entry (a restart after the journal lost the saved line, or lines before it in its second, with a twin line; and the rare views where 1.69 reads a line again that 1.68 found exactly) and the entry "A restart where a line shown far later was stored first says the journal no longer holds the last line". State: the design check runs (2026-11-23). From: 1.69's reviews (2026-11-23), deferrals, not asked.
 - **`--print-unit` runs the install's checks; a dangling symlink at the unit path; a byte-order mark at the start of a pattern file** (the last two older than 1.69). State: not started. From: 1.69's reviews (2026-11-23), deferrals, not asked.
 
 ### Standing rows
