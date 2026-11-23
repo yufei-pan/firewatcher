@@ -2638,7 +2638,7 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		return 2
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
-	# The files this run creates, removed again if a systemctl step fails.
+	# The files this run creates, removed again if a later step fails.
 	created = []
 	if config_text is not None:
 		try:
@@ -2650,26 +2650,24 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	if config_existed and getattr(raw, 'ntfy_url', None):
 		print(f"Warning: with an existing config, --ntfy-url goes on the unit's ExecStart, where any user can read it "
 			  f"(systemctl cat, ps). Set notify.ntfy_url in {resolved.config_path} instead.", file=sys.stderr)
+
 	def failed(message, returncode):
 		print(message, file=sys.stderr)
 		# So the same command, run again, installs from scratch: a config left here would make it put the
 		# command-line flags, the ntfy URL among them, on the unit's ExecStart, which any user can read.
 		# A config or unit that was there before this run stays.
 		for path in created:
-			try:
-				os.remove(path)
-			except OSError as exc:
-				print(f"cannot remove {path}: {exc}", file=sys.stderr)
-			else:
-				print(f"Removed {path}, which this install created", file=sys.stderr)
+			os.remove(path)
+			print(f"Removed {path}, which this install created", file=sys.stderr)
 		return returncode
 
 	unit_path = os.path.join(unit_dir, unit_name)
 	try:
 		os.makedirs(unit_dir, exist_ok=True)
-		if not os.path.lexists(unit_path):
-			created.append(unit_path)
+		existed = os.path.lexists(unit_path)
 		with open(unit_path, 'w', encoding='utf-8') as fh:
+			if not existed:
+				created.append(unit_path)
 			fh.write(unit_text)
 	except OSError as exc:
 		return failed('cannot write unit %s: %s' % (unit_path, exc), 1)
@@ -3016,7 +3014,7 @@ def _journal_second(command, second):
 	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
 	timer.start()
 	digests = []
-	ended = True
+	second_ended = True
 	try:
 		# Read as the capture loop reads, so each line has the digest it had there.
 		stream = io.TextIOWrapper(proc.stdout, encoding='utf-8', errors='replace', newline='\n')
@@ -3028,14 +3026,14 @@ def _journal_second(command, second):
 				break
 			digests.append(_line_digest(line, stamp[1]))
 		else:
-			ended = False
+			second_ended = False
 	finally:
 		timer.cancel()
 		proc.kill()
 		returncode = proc.wait()
 		proc.stdout.close()
 	# Output that ended inside the second is whole only if journalctl finished by itself, not killed by the timer.
-	return digests if ended or returncode == 0 else None
+	return digests if second_ended or returncode == 0 else None
 
 
 def _journald_present():
