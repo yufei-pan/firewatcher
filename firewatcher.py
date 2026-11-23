@@ -71,8 +71,9 @@ BACKLOG_LAG = 2
 JOURNAL_PROBE_TIMEOUT = 30
 # journalctl seeks and orders by the time journald stored a line, but shows the time it was sent: a line shown as the
 # second before the saved one can come first, and one shown as the saved second can come after one shown as the next.
-# The saved second's lines are collected until one this many seconds away. 30: the largest gap seen between sending and
-# storing was 15.7 s (one journald stall in 14 days of a 1.7 million entry journal), so 30 covers it about twice.
+# The saved second's lines are collected until one this many seconds away. 30: in 34.7 days of one host's journal (4.5
+# million entries with a sent time) the largest gap between sending and storing was 15.7 s, apart from two stalls of the
+# host (370 s and 458 s; a restart then reads the capture window again, which is safe), so 30 covers it about twice.
 JOURNAL_STAMP_SKEW = 30
 # journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
 _ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')

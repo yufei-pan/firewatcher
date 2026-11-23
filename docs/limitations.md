@@ -38,3 +38,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   use. Credentials in a URL are never sent anyway (README: use `events_token`, `token` or `api_key`).
 - Revisit when: a way to tell such a URL from a real host and path appears, or someone hits it.
 - Approved: 2026-11-01, the user ticked "fw: digits shown as port". The no-warning sentence added 2026-11-04, the user: "Add it to the wording".
+
+### A restart after the journal lost the saved line can skip lines that follow it
+- Kind: deferred
+- What the operator sees: when the journal lost the saved line (a rotated file, a crash or a reboot) but still holds a later line of that second with the same text, the replay ends at that twin. The lines between the lost line and the twin were never read, and they are used as context only, not matched. 1.68 did the same. A message logged several times in one second is the usual twin.
+- Why: the position holds the second of the saved line, its number in that second and a digest of its text, and a twin has the same digest and can have the same number.
+- Plan (1.70): save the digest of the line before the saved one as well, and take a line as the saved one only where that line also comes before it; otherwise treat the saved line as lost and read again.
+- Revisit when: 1.70.

@@ -386,6 +386,24 @@ def test_a_unit_that_fills_the_disk_leaves_no_half_written_unit(tmp_path, capsys
     assert 'cannot write unit' in capsys.readouterr().err
 
 
+def test_a_unit_that_cannot_be_put_back_is_said(tmp_path, capsys):
+    # the disk fills again while the old text is written back: the message says what is left
+    unit_dir = tmp_path / 'system'
+    unit_dir.mkdir()
+    unit_path = unit_dir / 'firewatcher.service'
+    unit_path.write_text(OLD_UNIT)
+    with open(fw.DEFAULT_CONFIG_PATH, 'w') as config:
+        config.write('[watch]\n')
+    patterns = tmp_path / 'p.txt'
+    patterns.write_text('HIT\n')
+    with file_size_limit(10):
+        rc = fw.install_service(parse_cli(['--install-service', '--no-enable', str(patterns)]), systemd_available=True,
+                                unit_dir=str(unit_dir), executable='/bin/fw', systemctl=ok_systemctl)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert 'cannot write unit' in err and 'cannot put back %s' % unit_path in err and 'Traceback' not in err
+
+
 def test_a_config_that_fills_the_disk_leaves_no_partial_config(tmp_path, capsys):
     # 1.69 as built: one os.write, whose short count went unnoticed, and a partial file kept when it failed
     path = tmp_path / 'etc' / 'firewatcher.conf'
