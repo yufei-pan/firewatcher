@@ -253,7 +253,7 @@ def test_a_line_shown_as_the_saved_second_can_come_after_one_shown_as_the_next(t
 def test_a_line_shown_as_the_second_before_inside_the_saved_second_does_not_end_the_replay_early(tmp_path):
     # journald stored h (sent in the second before) between lines of the saved second, as in a stall. The capture
     # loop counted the saved A as the 2nd of its run (h ended the run, B began a new one), and the journal holds an
-    # earlier A: e379c34 took that one as the saved line and read h, B, A and d again; the replay ends as 1.68's did
+    # earlier A: e379c34 took that one as the saved line and read h, B and A again; the replay ends as 1.68's did
     lines = [jline(0, 'A'), stored(0, jline(-1, 'h')), jline(0, 'B'), jline(0, 'A'), jline(1, 'd')]
     position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
     assert position.replaying and position.saved[1] == 2
@@ -280,6 +280,58 @@ def test_a_saved_number_that_is_right_among_all_lines_of_the_second_is_kept(tmp_
     assert position.saved[1] == 2
     shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
     assert replay(position, shown) == ['old', 'old', 'old', 'new', 'new']
+
+
+def test_a_burst_of_identical_lines_in_the_saved_second_is_found_at_the_saved_one(tmp_path):
+    # the saved A was the 2nd of two identical lines, with x and d after it: the journal is as it was, so the replay
+    # ends at the 2nd A, as 1.68's did, and the first A is not taken for it (a lower number would read the 2nd again)
+    lines = [jline(0, 'A'), jline(0, 'A'), jline(0, 'x'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.saved[1] == 2
+    assert replay(position, lines) == ['old', 'old', 'new', 'new']
+
+
+def test_one_line_lost_before_the_saved_one_is_not_made_up_for_by_a_line_after_it(tmp_path):
+    # the saved b was the 2nd line of its second and the 1st went with a rotated file: the saved line is now the 1st,
+    # and HIT after it is new (a number two lower would count HIT as context, a skip)
+    lines = [jline(0, 'b'), jline(0, 'HIT'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, ''.join(lines)))
+    assert replay(position, lines) == ['old', 'new', 'new']
+
+
+def test_a_stall_that_stores_the_far_earlier_line_first_still_finds_the_saved_line(tmp_path):
+    # journald stalled and stored a line sent 100 s before the saved second first, then the lines of that second (all
+    # at T + 5): --since=@T starts with the far line. Reading stopped there in 1.69 as built, which then said the
+    # journal no longer holds the saved line and matched the whole window again; 1.68 replayed up to the saved line
+    lines = [stored(5, jline(-100, 'Q')), stored(5, jline(0, 'A')), stored(5, jline(0, 'T')), stored(5, jline(1, 'U'))]
+    position = located(tmp_path, 2, 'T', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 2
+    shown = [line.partition(' ')[2] for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'new']
+
+
+def test_a_stalled_head_of_far_earlier_lines_does_not_hide_a_lost_saved_second(tmp_path):
+    skew = fw.JOURNAL_STAMP_SKEW
+    # far earlier lines and then a line far later: the read ends there, and nothing of the saved second is in it
+    journal = stored(5, jline(-100, 'Q')) + stored(5, jline(-99, 'R')) + jline(skew + 1, 'S') + jline(0, 'b')
+    position = located(tmp_path, 1, 'b', fake_journalctl(tmp_path, journal))
+    assert not position.replaying and 'no longer holds' in position.note
+    # far earlier lines to the end of the journal
+    other = tmp_path / 'other'
+    other.mkdir()
+    position = located(other, 1, 'b', fake_journalctl(other, stored(5, jline(-100, 'Q')) + stored(5, jline(-99, 'R'))))
+    assert not position.replaying and 'no longer holds' in position.note
+
+
+def test_a_stalled_head_that_never_ends_is_bounded_by_the_probe_timeout(tmp_path, monkeypatch):
+    # journalctl keeps writing far earlier lines: the bound is the probe's, and where it cannot tell, locate leaves the position as saved
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 1)
+    head = ''.join(jline(-100, 'Q%d' % n) for n in range(3))
+    journalctl = script(tmp_path, 'sys.stdout.write(%r)\nsys.stdout.flush()\ntime.sleep(600)' % head, 'endless')
+    start = time.time()
+    position = located(tmp_path, 3, 'c', journalctl)
+    assert time.time() - start < 15
+    assert position.replaying and position.saved[1] == 3
 
 
 def test_a_journal_that_runs_on_far_from_the_saved_second_is_read_no_further(tmp_path):

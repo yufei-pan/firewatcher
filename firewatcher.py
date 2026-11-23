@@ -71,9 +71,11 @@ BACKLOG_LAG = 2
 JOURNAL_PROBE_TIMEOUT = 30
 # journalctl seeks and orders by the time journald stored a line, but shows the time it was sent: a line shown as the
 # second before the saved one can come first, and one shown as the saved second can come after one shown as the next.
-# The saved second's lines are collected until one this many seconds away. 30: in 34.7 days of one host's journal (4.5
-# million entries with a sent time) the largest gap between sending and storing was 15.7 s, apart from two stalls of the
-# host (370 s and 458 s; a restart then reads the capture window again, which is safe), so 30 covers it about twice.
+# The saved second's lines are collected until a line shown this many seconds after it, or, once one of its lines was
+# read, this many before it (a stall can store lines shown far earlier first). 30: in 34.7 days of one host's journal
+# (4.5 million entries with a sent time) the largest gap between sending and storing was 15.7 s, apart from two stalls
+# of the host (370 s and 458 s; a restart that finds a far line between the lines of the second reads the capture
+# window again, which is safe), so 30 covers it about twice.
 JOURNAL_STAMP_SKEW = 30
 # journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
 _ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
@@ -3071,7 +3073,9 @@ def _journal_can_resume(journalctl):
 def _journal_second(command, second):
 	"""The digests of the journal lines stamped in that second, in their order, read with command (journalctl
 	-o short-iso) without --follow, from that second on; None when journalctl fails or takes longer than
-	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line more than JOURNAL_STAMP_SKEW seconds from it."""
+	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line shown more than JOURNAL_STAMP_SKEW seconds after it, or,
+	once a line of the second was read, more than that before it: a stall of journald can store lines shown far
+	earlier first, and the lines of the second follow them."""
 	command = [part for part in command if part != '--follow' and not part.startswith('--since=')]
 	try:
 		proc = subprocess.Popen(command + ['--since=@%d' % second], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -3091,7 +3095,7 @@ def _journal_second(command, second):
 				continue
 			if stamp[0] == second:
 				digests.append(_line_digest(line, stamp[1]))
-			elif abs(stamp[0] - second) > JOURNAL_STAMP_SKEW:
+			elif stamp[0] - second > JOURNAL_STAMP_SKEW or (digests and second - stamp[0] > JOURNAL_STAMP_SKEW):
 				break
 		else:
 			second_ended = False
