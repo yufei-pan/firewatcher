@@ -2936,14 +2936,24 @@ class JournalPosition(object):
 		"""Before replaying, find the saved line in the journal as it is now, by reading its second once with
 		command (the resumed journalctl command). The journal may have lost the start of that second, or the line
 		itself, while firewatcher was stopped (a journal file rotated away, a crash before journald wrote it), and
-		then the line's number no longer finds it. The replay then ends at the first line of that second with the
-		line's digest, and with no such line nothing is replayed: every line from the start of the replay is
-		matched. Both read lines again rather than skip them. When journalctl cannot tell, nothing changes."""
+		then the line's number no longer finds it. The replay then ends at the line with its digest and the number
+		the capture loop gave it, else at the first line of that second with its digest, and with no such line
+		nothing is replayed: every line from the start of the replay is matched. Those read lines again rather than
+		skip them. When journalctl cannot tell, nothing changes."""
 		if not self.replaying:
 			return
 		saved_time, ordinal, digest = self.saved
-		digests = _journal_second(command, saved_time)
-		if digests is None or digests[ordinal - 1:ordinal] == [digest]:
+		pairs = _journal_second(command, saved_time)
+		if pairs is None:
+			return
+		digests = [d for d, _ in pairs]
+		if digests[ordinal - 1:ordinal] == [digest]:
+			return
+		# The saved number is the capture loop's (within a run of lines with the same stamp, which a line shown as
+		# another second, stored in between, ends) or, after a resume, replay_time's (among all lines of the second).
+		# The first kind is looked for here.
+		if (digest, ordinal) in pairs:
+			self.saved = (saved_time, pairs.index((digest, ordinal)) + 1, digest)
 			return
 		if digest in digests:
 			self.saved = (saved_time, digests.index(digest) + 1, digest)
@@ -3063,8 +3073,9 @@ def _journal_can_resume(journalctl):
 
 
 def _journal_second(command, second):
-	"""The digests of the journal lines stamped in that second, in their order, read with command (journalctl
-	-o short-iso) without --follow, from that second on; None when journalctl fails or takes longer than
+	"""The journal lines stamped in that second, in their order, as (digest, number) pairs: the number is the one
+	JournalPosition.saw() gives the line (within its run of lines with the same stamp). Read with command
+	(journalctl -o short-iso) without --follow, from that second on; None when journalctl fails or takes longer than
 	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line more than JOURNAL_STAMP_SKEW seconds from it."""
 	command = [part for part in command if part != '--follow' and not part.startswith('--since=')]
 	try:
@@ -3074,7 +3085,8 @@ def _journal_second(command, second):
 		return None
 	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
 	timer.start()
-	digests = []
+	pairs = []
+	run_stamp, run = None, 0
 	second_ended = True
 	try:
 		# Read as the capture loop reads, so each line has the digest it had there.
@@ -3083,8 +3095,13 @@ def _journal_second(command, second):
 			stamp = _iso_stamp(line)
 			if stamp is None:
 				continue
+			# Numbered as JournalPosition.saw() numbers lines: within a run of lines with the same stamp.
+			if run_stamp is not None and line.startswith(run_stamp):
+				run += 1
+			else:
+				run_stamp, run = line[:stamp[1]], 1
 			if stamp[0] == second:
-				digests.append(_line_digest(line, stamp[1]))
+				pairs.append((_line_digest(line, stamp[1]), run))
 			elif abs(stamp[0] - second) > JOURNAL_STAMP_SKEW:
 				break
 		else:
@@ -3095,7 +3112,7 @@ def _journal_second(command, second):
 		returncode = proc.wait()
 		proc.stdout.close()
 	# Output that ended inside the second is whole only if journalctl finished by itself, not killed by the timer.
-	return digests if second_ended or returncode == 0 else None
+	return pairs if second_ended or returncode == 0 else None
 
 
 def _journald_present():

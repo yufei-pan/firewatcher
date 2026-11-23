@@ -219,7 +219,7 @@ def test_with_the_start_of_the_second_lost_identical_lines_are_read_again_never_
     jline(0, 'a'),  # the journal ends inside the saved second, before the saved line
     jline(5, 'HIT later'),  # its whole second went
     '',  # nothing at or after it: "-- No entries --"
-    jline(0, 'c') + jline(-100, 'b'),  # the clock set back after it: reading stops at the first line of another second
+    jline(0, 'c') + jline(-100, 'b'),  # the clock set back after it: reading stops at the first line more than JOURNAL_STAMP_SKEW away
 ])
 def test_a_journal_without_the_saved_line_replays_nothing(tmp_path, journal):
     position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, journal))
@@ -247,6 +247,28 @@ def test_a_line_shown_as_the_saved_second_can_come_after_one_shown_as_the_next(t
     # the saved d was the first line of its second as the capture loop numbered it (c came before), and is now the second
     assert position.replaying and position.saved[1] == 2
     assert 'no longer holds' not in position.note
+
+
+def test_a_line_shown_as_the_second_before_inside_the_saved_second_does_not_end_the_replay_early(tmp_path):
+    # journald stored h (sent in the second before) between lines of the saved second, as in a stall. The capture
+    # loop counted the saved A as the 2nd of its run (h ended the run, B began a new one), and the journal holds an
+    # earlier A: counted among all lines of the second, an earlier build of 1.69 took that one, and read h, B, A and d again
+    lines = [jline(0, 'A'), stored(0, jline(-1, 'h')), jline(0, 'B'), jline(0, 'A'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 3
+    shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'old', 'new']
+
+
+def test_a_saved_number_that_is_right_among_all_lines_of_the_second_is_kept(tmp_path):
+    # after a resume the saved number counts all lines of the second (replay_time), whatever ends the capture loop's
+    # runs: the second X is the 2nd line of its second, and is 1st in its run, after h. The replay ends there, and
+    # the next X is read as new, not skipped.
+    lines = [jline(0, 'Y'), stored(0, jline(-1, 'h')), jline(0, 'X'), jline(0, 'X'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'X', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.saved[1] == 2
+    shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'new', 'new']
 
 
 def test_a_journal_that_runs_on_far_from_the_saved_second_is_read_no_further(tmp_path):
