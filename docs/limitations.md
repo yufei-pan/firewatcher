@@ -39,18 +39,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: a way to tell such a URL from a real host and path appears, or someone hits it.
 - Approved: 2026-11-01, the user ticked "fw: digits shown as port". The no-warning sentence added 2026-11-04, the user: "Add it to the wording".
 
-### A purge for free space syncs every filesystem, so a hung NFS share can stall reading
-- Kind: deferred
-- What the operator sees: right after firewatcher deletes old months to stay above `--min-free-percent`, it calls
-  `sync`, which writes every filesystem on the host. If some hard-mounted NFS share is not answering and holds unwritten
-  data, that `sync` waits until its server comes back, and firewatcher reads no log lines meanwhile. It happens only
-  after such a purge, on a host with such a share.
-- Why: found during the 1.68 simplify pass (2026-11-14), after the 1.68 scope was set; present since 1.61.
-- Revisit when: 1.69. Plan: sync only the filesystem the folder is on, with syncfs(2) through ctypes as hpcp's
-  `_syncfs` does, and skip the sync where syncfs is missing (a filesystem that then shows freed space late costs a move
-  to the fallback folder when one is set, or dropped writes for the rest of that capture when not, never the floor, as
-  today).
-
 ### A failed `systemctl` step after the install's writes leaves the config and the unit, and a rerun puts the flags on ExecStart
 - Kind: deferred
 - What the operator sees: `--install-service` checks and renders everything before it writes, but `daemon-reload` and

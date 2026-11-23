@@ -725,6 +725,44 @@ def test_purge_deletes_only_the_oldest_months_it_needs(tmp_path, monkeypatch):
         'firewatcher-self deleting 2020-01 from %s to keep 10%% of the disk free' % out]
 
 
+def test_a_purge_syncs_only_the_filesystem_it_purged(tmp_path, monkeypatch):
+    # 1.68 ran sync(2), which writes every filesystem on the host and waits for a hung NFS share
+    journal_records(monkeypatch)
+
+    def every_filesystem():
+        raise AssertionError('synced every filesystem')
+
+    synced = []
+    monkeypatch.setattr(fw.os, 'sync', every_filesystem)
+    monkeypatch.setattr(fw, '_syncfs', synced.append)
+    out = tmp_path / 'out'
+    months(out, **{'2020-01': 200_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-100_000, 0.10)
+    assert guard_for(out).headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert synced == [str(out)]
+
+
+def test_syncfs_syncs_the_filesystem_of_the_path_and_never_raises(tmp_path, monkeypatch):
+    import ctypes
+    fw._syncfs(str(tmp_path))  # the real call, where libc has syncfs
+    synced = []
+
+    class Libc(object):
+        def syncfs(self, fd):
+            synced.append(os.fstat(fd).st_ino)
+            return 0
+
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name, use_errno=False: Libc())
+    fw._syncfs(str(tmp_path))
+    assert synced == [os.stat(str(tmp_path)).st_ino]
+    fw._syncfs(str(tmp_path / 'gone'))
+    # a libc without syncfs, such as macOS's: nothing is synced
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name, use_errno=False: object())
+    fw._syncfs(str(tmp_path))
+    assert synced == [os.stat(str(tmp_path)).st_ino]
+
+
 def test_purge_keeps_history_when_it_cannot_make_room(tmp_path, monkeypatch):
     records = journal_records(monkeypatch)
     out = tmp_path / 'out'

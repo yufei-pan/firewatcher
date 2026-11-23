@@ -147,6 +147,21 @@ def _fsync_path(path):
 	finally:
 		os.close(fd)
 
+def _syncfs(path):
+	"""Write the filesystem path is on, and no other: syncfs(2), through ctypes (Python has no os.syncfs). os.sync
+	writes every filesystem on the host, and waits for a hung NFS share. Without libc, without syncfs in it (macOS),
+	or on an error, nothing is synced."""
+	try:
+		import ctypes
+		libc = ctypes.CDLL(None, use_errno=True)
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+		try:
+			libc.syncfs(fd)
+		finally:
+			os.close(fd)
+	except (OSError, AttributeError, ImportError):
+		pass
+
 # What firewatcher itself creates in an output folder: YYYY-MM month folders, their YYYY-MM[.N].tar.xz
 # archives, and YYYY-MM[.N].tar.xz.PID.partial while tar writes one. Anything else is never touched.
 _MONTH_ENTRY_RE = re.compile(r'(\d{4}-\d{2})(?:(?:\.\d+)?\.tar\.xz(?:\.\d+\.partial)?)?')
@@ -473,9 +488,9 @@ class DiskGuard(object):
 		if headroom is None or headroom - need >= MIN_HEADROOM:
 			return headroom
 		if self._purge(folder, path, MIN_HEADROOM + need - headroom):
-			# Only statvfs says what may be written. sync lets filesystems that free space at their next
+			# Only statvfs says what may be written. A sync of that filesystem lets one that frees space at its next
 			# commit (btrfs, ZFS) show it now; one that still lags costs a move, never the floor.
-			os.sync()
+			_syncfs(folder)
 			headroom = self._measure(folder, path)
 			if headroom is None:
 				return None
