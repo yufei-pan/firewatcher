@@ -31,7 +31,7 @@ A directory argument loads every non-hidden pattern file inside it. Files ending
 
 `firewatcher` exits with an error when no pattern loads, for example when a pattern path is mistyped or every regex is invalid, instead of running while matching nothing.
 
-`--install-service` seeds `/etc/firewatcher/patterns.d` with example patterns when that directory is empty. The `examples/` directory in the source tree is not installed onto `PATH` by `pip install`; copy the pattern files from a clone, or let `--install-service` write them.
+`--install-service` seeds `/etc/firewatcher/patterns.d` with example patterns when it holds no pattern file. The `examples/` directory in the source tree is not installed onto `PATH` by `pip install`; copy the pattern files from a clone, or let `--install-service` write them.
 
 On a match, `firewatcher` writes:
 
@@ -91,7 +91,7 @@ sudo firewatcher --print-unit
 sudo firewatcher --uninstall-service
 ```
 
-`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`. It checks first, and writes nothing (exit 2) for a unit name systemd cannot load (letters, digits and `: _ . @ - \`, at most 255 characters with the `.service` suffix, any `@` between a name and an instance) or a path or value that is not UTF-8.
+`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if it holds no pattern file**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`. It checks first, and writes nothing (exit 2) for a unit name systemd cannot load or a path or value that is not UTF-8. If writing the unit or a `systemctl` step fails, it removes the config and the unit it created, so the same command can run again.
 
 `systemctl reload firewatcher` reloads the pattern files without a restart; see SIGHUP above.
 

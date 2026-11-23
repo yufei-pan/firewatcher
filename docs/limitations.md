@@ -39,20 +39,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: a way to tell such a URL from a real host and path appears, or someone hits it.
 - Approved: 2026-11-01, the user ticked "fw: digits shown as port". The no-warning sentence added 2026-11-04, the user: "Add it to the wording".
 
-### A failed `systemctl` step after the install's writes leaves the config and the unit, and a rerun puts the flags on ExecStart
-- Kind: deferred
-- What the operator sees: `--install-service` checks and renders everything before it writes, but `daemon-reload` and
-  `enable --now` run after the writes. When one of them fails, the install prints "systemctl ... failed (exit N)", returns
-  that code, and leaves `firewatcher.conf` (mode 0600) and the unit in place. The same command run again finds the config,
-  so it renders the command-line flags onto the unit's `ExecStart` instead of into the config. The ntfy URL, a secret like
-  a password, is then in the world-readable unit (the run prints a warning for it). A clean install keeps `ExecStart` to
-  `--config <path>`. 1.67 does the same.
-- Why: found by the 1.68 final review (2026-11-15); the 1.68 change moved only the checks and the rendering before the
-  first write. Not worse than 1.67.
-- Revisit when: 1.69. Plan: when `daemon-reload` or `enable --now` fails after this run created the config, remove the
-  config and the unit this run wrote (it created the config with `O_EXCL`, so it is sure the file is its own), so the
-  rerun is a clean install. A config that existed before the run stays, and so does a unit this run replaced rather than created.
-
 ### The journal replay treats a whole second as context when the saved line is no longer in the journal
 - Kind: deferred
 - What the operator sees: at a restart, firewatcher reads the journal back from the saved position. When the journal holds

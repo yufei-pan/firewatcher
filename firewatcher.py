@@ -2609,31 +2609,51 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		return 2
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
+	# The files this run creates, removed again if a systemctl step fails.
+	created = []
 	if config_text is not None:
 		try:
 			write_config_file(resolved.config_path, config_text)
 		except OSError as exc:
 			print('cannot write config %s: %s' % (resolved.config_path, exc), file=sys.stderr)
 			return 1
+		created.append(resolved.config_path)
 	if config_existed and getattr(raw, 'ntfy_url', None):
 		print(f"Warning: with an existing config, --ntfy-url goes on the unit's ExecStart, where any user can read it "
 			  f"(systemctl cat, ps). Set notify.ntfy_url in {resolved.config_path} instead.", file=sys.stderr)
-	os.makedirs(unit_dir, exist_ok=True)
+	def failed(message, returncode):
+		print(message, file=sys.stderr)
+		# So the same command, run again, installs from scratch: a config left here would make it put the
+		# command-line flags, the ntfy URL among them, on the unit's ExecStart, which any user can read.
+		# A config or unit that was there before this run stays.
+		for path in created:
+			try:
+				os.remove(path)
+			except OSError as exc:
+				print(f"cannot remove {path}: {exc}", file=sys.stderr)
+			else:
+				print(f"Removed {path}, which this install created", file=sys.stderr)
+		return returncode
+
 	unit_path = os.path.join(unit_dir, unit_name)
-	with open(unit_path, 'w', encoding='utf-8') as fh:
-		fh.write(unit_text)
+	try:
+		os.makedirs(unit_dir, exist_ok=True)
+		if not os.path.lexists(unit_path):
+			created.append(unit_path)
+		with open(unit_path, 'w', encoding='utf-8') as fh:
+			fh.write(unit_text)
+	except OSError as exc:
+		return failed('cannot write unit %s: %s' % (unit_path, exc), 1)
 	print(f"Wrote {unit_path}")
 	reload = _run_systemctl(systemctl, 'daemon-reload')
 	if getattr(reload, 'returncode', 0):
-		print(f"systemctl daemon-reload failed (exit {reload.returncode})", file=sys.stderr)
-		return reload.returncode
+		return failed(f"systemctl daemon-reload failed (exit {reload.returncode})", reload.returncode)
 	if resolved.no_enable:
 		return 0
 	# '--': a name starting with '-' is a name, not an option.
 	enable = _run_systemctl(systemctl, 'enable', '--now', '--', unit_name)
 	if getattr(enable, 'returncode', 0):
-		print(f"systemctl enable --now failed (exit {enable.returncode})", file=sys.stderr)
-		return enable.returncode
+		return failed(f"systemctl enable --now failed (exit {enable.returncode})", enable.returncode)
 	print(f"Enabled and started {unit_name}")
 	return 0
 
