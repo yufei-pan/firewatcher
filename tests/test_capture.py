@@ -798,7 +798,7 @@ def test_purge_runs_at_most_once_an_hour_per_folder(tmp_path, monkeypatch):
 def test_lagging_statvfs_costs_a_move_never_the_floor(tmp_path, monkeypatch):
     journal_records(monkeypatch)
     synced = []
-    monkeypatch.setattr(fw.os, 'sync', lambda: synced.append(1))
+    monkeypatch.setattr(fw, '_syncfs', synced.append)
     out = tmp_path / 'out'
     months(out, **{'2020-01': 300_000, '2020-02': 300_000, '2020-03': 300_000})
     disk = FakeDisk(monkeypatch, out, 10_000_000, lag=True)  # never shows the deletion
@@ -807,7 +807,7 @@ def test_lagging_statvfs_costs_a_move_never_the_floor(tmp_path, monkeypatch):
     path = str(out / '2026-10' / 'hit.log')
     # only what statvfs reports authorizes a write, so this capture moves on
     assert guard.headroom(path) < fw.MIN_HEADROOM
-    assert synced == [1]
+    assert synced == [str(out)]
     # and the lag does not cost more history than the room needed
     assert sorted(p.name for p in out.iterdir()) == ['2020-02', '2020-03']
     assert guard.headroom(path) < fw.MIN_HEADROOM
