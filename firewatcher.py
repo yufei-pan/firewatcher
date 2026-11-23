@@ -546,9 +546,15 @@ class DiskGuard(object):
 
 
 def print(*args, **kwargs):
-	'''Print with flush=True by default.'''
+	'''Print with flush=True by default. Text the stream cannot encode, such as a non-ASCII log line on Python 3.6
+	under a C locale (stdout is ASCII there), is printed with backslash escapes instead of stopping firewatcher.'''
 	kwargs.setdefault('flush', True)
-	return builtins.print(*args, **kwargs)
+	try:
+		return builtins.print(*args, **kwargs)
+	except UnicodeEncodeError:
+		encoding = getattr(kwargs.get('file') or sys.stdout, 'encoding', None) or 'ascii'
+		args = [_as_utf8(arg).encode(encoding, 'backslashreplace').decode(encoding) for arg in args]
+		return builtins.print(*args, **kwargs)
 
 class bcolors:
 		warning = '\033[93m'
@@ -577,7 +583,8 @@ def load_patterns(pattern_files):
 			print(f"Pattern file not found: {pattern_file}")
 			continue
 		try:
-			with open(pattern_file, 'r') as f:
+			# UTF-8 whatever the locale, as the log lines are read.
+			with open(pattern_file, 'r', encoding='utf-8', errors='replace') as f:
 				# Lines starting with # are comments.
 				patterns = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
 		except Exception as e:
@@ -767,7 +774,9 @@ def _read_config_file(path):
 		raw = parser.get(section, key)
 		label = '%s.%s' % (section, key)
 		if kind == 'patterns':
-			values[dest] = _split_patterns(raw)
+			values[dest] = [_fs_path(path) for path in _split_patterns(raw)]
+		elif kind == 'path':
+			values[dest] = _fs_path(str(raw).strip())
 		elif kind == 'int':
 			values[dest] = _coerce_int(raw, label)
 		elif kind == 'float':
@@ -778,11 +787,11 @@ def _read_config_file(path):
 			values[dest] = str(raw).strip()
 
 	take('watch', 'patterns', 'pattern_file', 'patterns')
-	take('watch', 'log_file', 'log_file', 'str')
+	take('watch', 'log_file', 'log_file', 'path')
 	take('watch', 'capture_time', 'capture_time', 'int')
 	take('watch', 'capture_time_max', 'capture_time_max', 'int')
-	take('watch', 'output_folder', 'output_folder', 'str')
-	take('watch', 'fallback_folder', 'fallback_folder', 'str')
+	take('watch', 'output_folder', 'output_folder', 'path')
+	take('watch', 'fallback_folder', 'fallback_folder', 'path')
 	take('watch', 'tail_lines', 'tail_lines', 'str')
 	take('watch', 'filter_only', 'filter_only', 'bool')
 	take('watch', 'compress_after_months', 'compress_after_months', 'int')
@@ -791,7 +800,7 @@ def _read_config_file(path):
 	take('watch', 'buffer_max_mb', 'buffer_max_mb', 'int')
 	take('watch', 'min_free_percent', 'min_free_percent', 'float')
 	take('watch', 'purge_interval', 'purge_interval', 'int')
-	take('watch', 'position_file', 'position_file', 'str')
+	take('watch', 'position_file', 'position_file', 'path')
 	take('watch', 'resume_max', 'resume_max', 'int')
 	take('llm', 'enabled', 'llm_enabled', 'bool')
 	take('llm', 'base_url', 'llm_base_url', 'str')
@@ -1170,18 +1179,32 @@ def render_config_text(settings):
 
 
 def _strict_utf8(text):
-	"""text, if it can go into a config or unit file as UTF-8. Python decodes argv, paths and the environment
-	with surrogateescape, so a byte the locale could not decode (every non-ASCII byte on Python 3.6 under a C
-	locale) arrives as a lone surrogate. Such a value is refused, not restored or replaced: the service, started
-	under the same locale, could not encode a restored path either (UnicodeEncodeError at start or at the first
-	capture). The message shows no secret: values include the API key, the ntfy token and the private topic URL."""
+	"""text for a config or unit file, each path and value in it as the UTF-8 text of its bytes. Python decodes argv,
+	paths and the environment with the locale and surrogateescape: on Python 3.6 under a C locale every non-ASCII byte
+	arrives escaped, and is restored here (the service reads it back with _fs_path). Bytes that are not UTF-8 are
+	refused, not replaced, which would point the service at another path. The message shows no secret: values include
+	the API key, the ntfy token and the private topic URL."""
 	try:
-		text.encode('utf-8')
-	except UnicodeEncodeError:
-		raise ConfigError('a path or value is not valid UTF-8 text, so it cannot go into a config or unit file. '
-						  'On Python 3.6 a C locale reads every non-ASCII byte that way: run under a UTF-8 locale '
-						  '(one that `locale -a` lists, such as en_US.UTF-8 or C.UTF-8)')
-	return text
+		return os.fsencode(text).decode('utf-8')
+	except UnicodeError:
+		raise ConfigError('a path or value is not UTF-8, so it cannot go into a config or unit file')
+
+
+def _fs_path(text):
+	"""A path from the config file, which is UTF-8 text, as the str Python's file calls take for its bytes: the same
+	text under a UTF-8 locale; on Python 3.6 under a C locale, where they take only ASCII and escaped bytes, its UTF-8
+	bytes escaped."""
+	return os.fsdecode(text.encode('utf-8'))
+
+
+def _as_utf8(text):
+	"""text that can be logged or sent as UTF-8: escaped bytes (in a path on Python 3.6 under a C locale, or in one that
+	is not UTF-8) become the text they spell, or U+FFFD where they are not UTF-8."""
+	text = str(text)
+	try:
+		return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
+	except UnicodeEncodeError:  # a lone surrogate that is no escaped byte, such as one a JSON reply spelled out
+		return text.encode('utf-8', 'replace').decode('utf-8')
 
 
 def write_config_file(path, text):
@@ -1228,7 +1251,7 @@ def _prepare_unit_settings(args, raw=None):
 
 def _journal(priority, message, status=None):
 	"""Write one syslog line and a shorter stdout line. Both carry the self marker."""
-	syslog_line = _flatten('%s %s' % (SELF_MARKER, message))
+	syslog_line = _as_utf8(_flatten('%s %s' % (SELF_MARKER, message)))
 	if len(syslog_line) > JOURNAL_LINE_MAX:
 		syslog_line = syslog_line[:JOURNAL_LINE_MAX]
 	try:
@@ -1254,12 +1277,12 @@ def _http_header(text, limit):
 
 
 def _notify_body(text, path):
-	suffix = '\n' + str(path)
+	suffix = '\n' + _as_utf8(path)
 	suffix_b = suffix.encode('utf-8')
 	if len(suffix_b) >= NTFY_BODY_MAX:
 		return suffix_b[:NTFY_BODY_MAX].decode('utf-8', 'ignore')
 	budget = NTFY_BODY_MAX - len(suffix_b)
-	body = _flatten(text).encode('utf-8')[:budget]
+	body = _as_utf8(_flatten(text)).encode('utf-8')[:budget]
 	return body.decode('utf-8', 'ignore') + suffix
 
 
@@ -1472,6 +1495,8 @@ def call_llm(settings, incident):
 		% (incident.get('hostname', ''), 'Operator notes about this host: %s\n' % notes if notes else '', marker, marker,
 		   marker, incident.get('pattern', ''), incident.get('matched_line', ''), incident.get('path', ''), excerpt, marker)
 	)
+	# A JSON parser may refuse escaped bytes from a path as lone surrogates.
+	user = _as_utf8(user)
 	url = settings.llm_base_url.rstrip('/') + '/chat/completions'
 	payload = {
 		'model': settings.llm_model,
@@ -1683,7 +1708,7 @@ class IncidentDispatcher(object):
 			'push': bool(should_push),
 			'always_notify': bool(incident.get('always_notify')),
 			'excerpt': _event_excerpt(incident),
-			'path': incident.get('path') or None,
+			'path': _as_utf8(incident['path']) if incident.get('path') else None,
 			'time': datetime.datetime.now().astimezone().isoformat(),
 		}
 		try:
@@ -1906,7 +1931,8 @@ class CaptureFile(object):
 				directory = os.path.dirname(path)
 				if directory:
 					os.makedirs(directory, exist_ok=True)
-				handle = open(path, 'a', encoding='utf-8')
+				# A path written into the capture (where it moved from, where earlier lines are) keeps its own bytes.
+				handle = open(path, 'a', encoding='utf-8', errors='surrogateescape')
 				if error is not None:
 					why = error if isinstance(error, str) else 'after a write error: %s' % error
 					handle.write(f"{SELF_MARKER} capture moved here from {failed} {why}\n")
@@ -2060,7 +2086,7 @@ def _open_capture(output_folder, fallback_folder, read_time, matched_pattern, he
 		# also record a journal of all logs captured in {folder}/journal.log, next to the month folders
 		journal_file_name = os.path.join(os.path.dirname(os.path.dirname(capture.path)), 'journal.log')
 		try:
-			with open(journal_file_name, "a", encoding='utf-8') as journal_file:
+			with open(journal_file_name, "a", encoding='utf-8', errors='surrogateescape') as journal_file:
 				journal_file.write(f"{stamp.isoformat()} Captured logs for {matched_pattern} to {capture.path}\n")
 		except OSError as exc:
 			_journal(syslog.LOG_ERR, 'cannot write %s: %s' % (journal_file_name, exc))

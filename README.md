@@ -238,16 +238,27 @@ Captures are posted whatever `push` says, so the service sees them all. Any 2xx 
 Lines firewatcher writes back to the journal are a single physical line containing `firewatcher-self`, so a summary that quotes `panic` or `I/O error` does not start another capture. In journalctl and syslog output, firewatcher recognizes its own lines by the identifier field after the timestamp and host (`firewatcher[PID]:`), not by text elsewhere in the line, so a process or user name chosen to look like firewatcher cannot hide a kernel or daemon message. Lines in other formats are checked for `firewatcher-self` or `firewatcher[PID]:` anywhere. The capture files themselves stay in the log stream's original format.
 
 
+## Upgrading to 1.69 from 1.68
+
+Nothing to change. What is different:
+
+- After deleting old months to keep the free-space floor, firewatcher syncs only that filesystem, so a hard-mounted NFS share that is not answering no longer stalls log reading. 1.68 synced every filesystem.
+- When writing the unit, `daemon-reload` or `enable --now` fails, `--install-service` removes the config and the unit it created, so the same command can run again. 1.68 left them, and the rerun put the command-line flags, the ntfy URL among them, on the unit's `ExecStart`.
+- At a restart, firewatcher first finds the saved line in the journal as it is now. When the journal lost the start of that second, the lines after the saved one are still matched; when it lost the line itself, every line from `--capture-time` before it is matched. 1.68 replayed them as context only, and with the clock set back, every line stamped before the saved second.
+- `--tail-lines ''` means the default, as an empty `tail_lines` in the config does. 1.68 passed it on, and `tail` or `journalctl` exited at once.
+- Pattern files are read as UTF-8 in every locale, as log lines are.
+- On Python 3.6 under a C locale, non-ASCII paths (from the config, the command line or the unit) and matched log lines no longer stop firewatcher with `UnicodeEncodeError`, and `--install-service` writes a non-ASCII path or note given there as UTF-8, where 1.68 refused it. On any Python, a path that is not UTF-8 no longer stops it at the first capture.
+
 ## Upgrading to 1.68 from 1.67
 
 Nothing to change. What is different:
 
 - `--install-service` refuses a unit name systemd cannot load, and a path or value that is not UTF-8, before it writes anything (exit 2). 1.67 could write the config first and then stop with a traceback, or install a unit under a name systemd skips. A blank `--unit-name` now means `firewatcher`, as an empty one did.
 - `systemctl enable --now` and `disable --now` get `--` before the unit name, so a name starting with `-` works.
-- On Python 3.6 under a C locale, a non-ASCII path or note given on the command line reads as undecodable bytes, and a service started under that locale could not encode it, so `--install-service` refuses it (exit 2, nothing written) and says to run under a UTF-8 locale (one that `locale -a` lists, such as `en_US.UTF-8`; CentOS 7 has no `C.UTF-8`). 1.67 stopped there with a `UnicodeEncodeError`. Under a UTF-8 locale, and on Python 3.7 and later, such a path installs as before.
+- On Python 3.6 under a C locale, `--install-service` refuses a non-ASCII path or note given on the command line (exit 2, nothing written) and says to run under a UTF-8 locale; 1.67 stopped there with `UnicodeEncodeError`. 1.69 installs it.
 - The package declares its license as the SPDX expression `GPL-3.0-or-later` when built with setuptools 77 or later.
 - `--uninstall-service --unit-name` with a path (`a/b`) now prints a message and exits 2; 1.67 stopped with a traceback. It still takes any other name an older firewatcher may have installed.
-- Dead code and duplicated rules are gone (`firewatcher.py` went from 3,227 to 3,084 lines before the install checks were added); nothing else an operator sees changed.
+- Dead code and duplicated rules are gone; nothing else an operator sees changed.
 
 ## Development
 

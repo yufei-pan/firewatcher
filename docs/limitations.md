@@ -38,14 +38,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   use. Credentials in a URL are never sent anyway (README: use `events_token`, `token` or `api_key`).
 - Revisit when: a way to tell such a URL from a real host and path appears, or someone hits it.
 - Approved: 2026-11-01, the user ticked "fw: digits shown as port". The no-warning sentence added 2026-11-04, the user: "Add it to the wording".
-
-### On Python 3.6 under a C locale, a service given a non-ASCII path dies when it writes there
-- Kind: deferred
-- What the operator sees: firewatcher run by hand, or from a hand-written config, on Python 3.6 under a C locale with a
-  non-ASCII output folder, log file or note stops with `UnicodeEncodeError` at the first capture or at start. An install
-  no longer writes such a path from a C locale (1.68 refuses it, exit 2), but one installed under a UTF-8 locale still
-  stops when systemd starts the service under a C locale. Python 3.7 and later are not affected. 1.67 does the same.
-- Why: Python 3.6 reads non-ASCII bytes under a C locale as undecodable text, which its file calls then cannot encode.
-  Found by the 1.68 final review (2026-11-15, F2).
-- Revisit when: 1.69. Plan: give such values to the file calls as their bytes, as the local branch `superseded-local-1.61`
-  did with `_as_utf8` (kept as the tag `archive/superseded-local-1.61`), or stop and say to run under a UTF-8 locale.
