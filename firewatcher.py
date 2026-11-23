@@ -1216,9 +1216,10 @@ _NOT_AN_ESCAPED_BYTE_RE = re.compile('[\ud800-\udc7f\udd00-\udfff]')
 
 
 def _as_utf8(text):
-	"""text that can be logged or sent as UTF-8: escaped bytes (in a path on Python 3.6 under a C locale, or in one that
-	is not UTF-8) become the text they spell, or U+FFFD where they are not UTF-8; so does any other lone surrogate,
-	such as one a JSON reply spelled out."""
+	"""text that can be logged or sent as UTF-8: escaped bytes (U+DC80 to U+DCFF, in a path on Python 3.6 under a C
+	locale, or in one that is not UTF-8) become the text they spell, or U+FFFD where they are not UTF-8; any other
+	lone surrogate becomes U+FFFD. A JSON reply that spells U+DC80 to U+DCFF is taken for escaped bytes too:
+	U+DCC3 U+DCA9 comes out as the letter e with an acute accent, the UTF-8 bytes C3 A9 spell."""
 	text = _NOT_AN_ESCAPED_BYTE_RE.sub('\ufffd', str(text))
 	return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
 
