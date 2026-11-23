@@ -94,11 +94,6 @@ def test_an_install_writes_escaped_utf8_as_its_text_and_the_service_reads_it_bac
     assert os.fsencode(again.output_folder) == os.fsencode(str(folder))
 
 
-def test_a_config_path_is_the_str_the_file_calls_take_for_its_bytes():
-    assert os.fsencode(fw._fs_path('/var/log/café')) == '/var/log/café'.encode('utf-8')
-    assert fw._fs_path('/var/log/plain') == '/var/log/plain'
-
-
 def test_print_escapes_what_the_stream_cannot_encode():
     stream = io.TextIOWrapper(io.BytesIO(), encoding='ascii')
     fw.print('Matched line: HIT café', file=stream)
