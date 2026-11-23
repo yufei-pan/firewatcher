@@ -2664,7 +2664,8 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		return 2
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
-	# The files this run creates, removed again if a later step fails.
+	# The config and unit this run creates, removed again if a later step fails. The output folder and the example
+	# patterns stay: they hold nothing that changes what the next install does.
 	created = []
 	if config_text is not None:
 		try:

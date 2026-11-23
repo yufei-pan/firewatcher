@@ -257,9 +257,12 @@ def test_a_journal_that_runs_on_far_from_the_saved_second_is_read_no_further(tmp
         folder.mkdir()
         journal = jline(0, 'c') + jline(far, 'b') + jline(0, 'b')
         assert not located(folder, 1, 'b', fake_journalctl(folder, journal)).replaying
-    near = tmp_path / 'near'
-    near.mkdir()
-    assert located(near, 1, 'b', fake_journalctl(near, jline(0, 'c') + jline(skew, 'x') + jline(0, 'b'))).replaying
+    # and one at that distance or less is read past: 16 s is the largest gap between sending and storing seen
+    # outside a stall of the host (15.7 s on the host it was measured on)
+    for near_by in (16, skew):
+        near = tmp_path / ('near%d' % near_by)
+        near.mkdir()
+        assert located(near, 1, 'b', fake_journalctl(near, jline(0, 'c') + jline(near_by, 'x') + jline(0, 'b'))).replaying
 
 
 def test_when_journalctl_cannot_tell_the_replay_goes_by_the_saved_number(tmp_path, monkeypatch):
