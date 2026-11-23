@@ -31,7 +31,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.68'
+version = '1.69'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -66,6 +66,17 @@ DEFAULT_RESUME_MAX = 3600
 POSITION_SAVE_INTERVAL = 1.0
 # A journal line read this many seconds after its timestamp was logged while firewatcher was stopped.
 BACKLOG_LAG = 2
+# Longest a journalctl run at start may take (the probe, and reading the saved second) before it counts as hung:
+# reading one second of a 4 GB journal took 0.08 s on a test host.
+JOURNAL_PROBE_TIMEOUT = 30
+# journalctl seeks and orders by the time journald stored a line, but shows the time it was sent: a line shown as the
+# second before the saved one can come first, and one shown as the saved second can come after one shown as the next.
+# The saved second's lines are collected until a line shown this many seconds after it; lines shown before it, however
+# far, are passed over: a stall of journald stores the lines that waited for it among the lines of the second (on the
+# host measured, runs of lines shown as the second with lines shown 277 to 458 s earlier between them). 30: in 34.7
+# days of its journal (4.5 million entries with a sent time) the largest gap between sending and storing was 15.7 s,
+# apart from two stalls of the host (370 s and 458 s), so 30 covers it about twice.
+JOURNAL_STAMP_SKEW = 30
 # journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
 _ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
 DEFAULT_UNIT_NAME = 'firewatcher'
@@ -146,6 +157,22 @@ def _fsync_path(path):
 		_fsync_fd(fd)
 	finally:
 		os.close(fd)
+
+def _syncfs(path):
+	"""Write the filesystem path is on, and no other: syncfs(2), through ctypes (Python has no os.syncfs). os.sync
+	writes every filesystem on the host, and waits for a hung NFS share. Without libc, without syncfs in it (macOS),
+	or on an error, nothing is synced. macOS needs none: on APFS the space freed by deleting 200 MB (100 files, or one)
+	showed in statvfs at once, with and without a sync (macOS 26.6, 2026-11-23: 10 deletions, 6 without a sync)."""
+	try:
+		import ctypes
+		libc = ctypes.CDLL(None, use_errno=True)
+		fd = os.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0))
+		try:
+			libc.syncfs(fd)
+		finally:
+			os.close(fd)
+	except (OSError, AttributeError, ImportError):
+		pass
 
 # What firewatcher itself creates in an output folder: YYYY-MM month folders, their YYYY-MM[.N].tar.xz
 # archives, and YYYY-MM[.N].tar.xz.PID.partial while tar writes one. Anything else is never touched.
@@ -473,9 +500,9 @@ class DiskGuard(object):
 		if headroom is None or headroom - need >= MIN_HEADROOM:
 			return headroom
 		if self._purge(folder, path, MIN_HEADROOM + need - headroom):
-			# Only statvfs says what may be written. sync lets filesystems that free space at their next
+			# Only statvfs says what may be written. A sync of that filesystem lets one that frees space at its next
 			# commit (btrfs, ZFS) show it now; one that still lags costs a move, never the floor.
-			os.sync()
+			_syncfs(folder)
 			headroom = self._measure(folder, path)
 			if headroom is None:
 				return None
@@ -528,9 +555,19 @@ class DiskGuard(object):
 
 
 def print(*args, **kwargs):
-	'''Print with flush=True by default.'''
+	'''Print with flush=True by default. Text the stream cannot encode, such as a non-ASCII log line on Python 3.6
+	under a C locale (stdout is ASCII there), is printed with backslash escapes instead of stopping firewatcher.'''
 	kwargs.setdefault('flush', True)
-	return builtins.print(*args, **kwargs)
+	if len(args) > 1:
+		# One text, so one that cannot be encoded does not leave the earlier arguments written twice.
+		sep = kwargs.pop('sep', None)
+		args = ((' ' if sep is None else sep).join(map(str, args)),)
+	try:
+		return builtins.print(*args, **kwargs)
+	except UnicodeEncodeError:
+		encoding = getattr(kwargs.get('file') or sys.stdout, 'encoding', None) or 'ascii'
+		args = [_as_utf8(arg).encode(encoding, 'backslashreplace').decode(encoding) for arg in args]
+		return builtins.print(*args, **kwargs)
 
 class bcolors:
 		warning = '\033[93m'
@@ -559,7 +596,8 @@ def load_patterns(pattern_files):
 			print(f"Pattern file not found: {pattern_file}")
 			continue
 		try:
-			with open(pattern_file, 'r') as f:
+			# UTF-8 whatever the locale, as the log lines are read. Bytes that are not UTF-8 refuse the file.
+			with open(pattern_file, 'r', encoding='utf-8') as f:
 				# Lines starting with # are comments.
 				patterns = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
 		except Exception as e:
@@ -749,7 +787,9 @@ def _read_config_file(path):
 		raw = parser.get(section, key)
 		label = '%s.%s' % (section, key)
 		if kind == 'patterns':
-			values[dest] = _split_patterns(raw)
+			values[dest] = [_fs_path(path) for path in _split_patterns(raw)]
+		elif kind == 'path':
+			values[dest] = _fs_path(str(raw).strip())
 		elif kind == 'int':
 			values[dest] = _coerce_int(raw, label)
 		elif kind == 'float':
@@ -760,11 +800,11 @@ def _read_config_file(path):
 			values[dest] = str(raw).strip()
 
 	take('watch', 'patterns', 'pattern_file', 'patterns')
-	take('watch', 'log_file', 'log_file', 'str')
+	take('watch', 'log_file', 'log_file', 'path')
 	take('watch', 'capture_time', 'capture_time', 'int')
 	take('watch', 'capture_time_max', 'capture_time_max', 'int')
-	take('watch', 'output_folder', 'output_folder', 'str')
-	take('watch', 'fallback_folder', 'fallback_folder', 'str')
+	take('watch', 'output_folder', 'output_folder', 'path')
+	take('watch', 'fallback_folder', 'fallback_folder', 'path')
 	take('watch', 'tail_lines', 'tail_lines', 'str')
 	take('watch', 'filter_only', 'filter_only', 'bool')
 	take('watch', 'compress_after_months', 'compress_after_months', 'int')
@@ -773,7 +813,7 @@ def _read_config_file(path):
 	take('watch', 'buffer_max_mb', 'buffer_max_mb', 'int')
 	take('watch', 'min_free_percent', 'min_free_percent', 'float')
 	take('watch', 'purge_interval', 'purge_interval', 'int')
-	take('watch', 'position_file', 'position_file', 'str')
+	take('watch', 'position_file', 'position_file', 'path')
 	take('watch', 'resume_max', 'resume_max', 'int')
 	take('llm', 'enabled', 'llm_enabled', 'bool')
 	take('llm', 'base_url', 'llm_base_url', 'str')
@@ -806,8 +846,8 @@ def _config_error_summary(exc):
 
 
 # The flags that set a setting, as (argparse dest, flag), in the order a unit's ExecStart repeats them. A boolean
-# False is --no-<flag>. An empty --log-file or -o means the default; any other empty value, such as --llm-notes '',
-# overrides the config.
+# False is --no-<flag>. An empty --log-file, -o or --tail-lines is not passed, as an empty value in the config is not
+# set; any other empty value, such as --llm-notes '', overrides the config.
 _SETTING_FLAGS = (
 	('log_file', '--log-file'), ('capture_time', '-t'), ('capture_time_max', '--capture-time-max'),
 	('output_folder', '-o'), ('fallback_folder', '--fallback-folder'), ('tail_lines', '--tail_lines'),
@@ -819,13 +859,15 @@ _SETTING_FLAGS = (
 	('llm_max_bytes', '--llm-max-bytes'), ('llm_notes', '--llm-notes'), ('notify', '--notify'),
 	('ntfy_url', '--ntfy-url'), ('ntfy_priority', '--ntfy-priority'), ('ntfy_timeout', '--ntfy-timeout'),
 )
+# Settings whose empty value means the default, in the config file and on the command line alike.
+_EMPTY_MEANS_DEFAULT = ('log_file', 'output_folder', 'tail_lines')
 
 
 def _setting_flags(args):
 	"""(Settings attribute, flag, value) for each setting flag in args that was passed."""
 	for dest, flag in _SETTING_FLAGS:
 		value = getattr(args, dest, None)
-		if value is not None and (value != '' or dest not in ('log_file', 'output_folder')):
+		if value is not None and (value != '' or dest not in _EMPTY_MEANS_DEFAULT):
 			yield {'llm': 'llm_enabled', 'notify': 'notify_enabled'}.get(dest, dest), flag, value
 
 
@@ -854,7 +896,7 @@ def resolve_settings(args, environ=None):
 	for key, value in file_values.items():
 		# An empty log_file, output_folder or tail_lines means the default. Any other empty value is kept: an
 		# empty fallback_folder means no fallback, and an empty position_file no resuming.
-		if value or key not in ('log_file', 'output_folder', 'tail_lines'):
+		if value or key not in _EMPTY_MEANS_DEFAULT:
 			setattr(settings, key, value)
 	if getattr(args, 'pattern_file', None):
 		settings.pattern_file = list(args.pattern_file)
@@ -904,10 +946,13 @@ def _mount_paths(paths):
 			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
 							  'which systemd cannot read back from a unit file: %r' % os.fsdecode(raw))
 		try:
-			result.append(raw.decode('utf-8'))
+			raw.decode('utf-8')
 		except UnicodeError:
 			raise ConfigError('--requires-mounts-for cannot take a path that is not UTF-8, which systemd '
 							  'rejects: %r' % os.fsdecode(raw))
+		# As the text Python holds every other path in (escaped bytes under a C locale): _strict_utf8 turns the
+		# unit's text into UTF-8 as a whole, and refuses a mix of that text and real characters.
+		result.append(os.fsdecode(raw))
 	return result
 
 
@@ -1150,18 +1195,35 @@ def render_config_text(settings):
 
 
 def _strict_utf8(text):
-	"""text, if it can go into a config or unit file as UTF-8. Python decodes argv, paths and the environment
-	with surrogateescape, so a byte the locale could not decode (every non-ASCII byte on Python 3.6 under a C
-	locale) arrives as a lone surrogate. Such a value is refused, not restored or replaced: the service, started
-	under the same locale, could not encode a restored path either (UnicodeEncodeError at start or at the first
-	capture). The message shows no secret: values include the API key, the ntfy token and the private topic URL."""
+	"""text for a config or unit file, each path and value in it as the UTF-8 text of its bytes. Python decodes argv,
+	paths and the environment with the locale and surrogateescape: on Python 3.6 under a C locale every non-ASCII byte
+	arrives escaped, and is restored here (the service reads it back with _fs_path). Bytes that are not UTF-8 are
+	refused, not replaced, which would point the service at another path. The message shows no secret: values include
+	the API key, the ntfy token and the private topic URL."""
 	try:
-		text.encode('utf-8')
-	except UnicodeEncodeError:
-		raise ConfigError('a path or value is not valid UTF-8 text, so it cannot go into a config or unit file. '
-						  'On Python 3.6 a C locale reads every non-ASCII byte that way: run under a UTF-8 locale '
-						  '(one that `locale -a` lists, such as en_US.UTF-8 or C.UTF-8)')
-	return text
+		return os.fsencode(text).decode('utf-8')
+	except UnicodeError:
+		raise ConfigError('a path or value is not UTF-8, so it cannot go into a config or unit file')
+
+
+def _fs_path(text):
+	"""A path from the config file, which is UTF-8 text, as the str Python's file calls take for its bytes: the same
+	text under a UTF-8 locale; on Python 3.6 under a C locale, where they take only ASCII and escaped bytes, its UTF-8
+	bytes escaped."""
+	return os.fsdecode(text.encode('utf-8'))
+
+
+# The surrogates surrogateescape does not use: it maps only U+DC80 to U+DCFF, the bytes 0x80 to 0xFF.
+_NOT_AN_ESCAPED_BYTE_RE = re.compile('[\ud800-\udc7f\udd00-\udfff]')
+
+
+def _as_utf8(text):
+	"""text that can be logged or sent as UTF-8: escaped bytes (U+DC80 to U+DCFF, in a path on Python 3.6 under a C
+	locale, or in one that is not UTF-8) become the text they spell, or U+FFFD where they are not UTF-8; any other
+	lone surrogate becomes U+FFFD. A JSON reply that spells U+DC80 to U+DCFF is taken for escaped bytes too:
+	U+DCC3 U+DCA9 comes out as the letter e with an acute accent, the UTF-8 bytes C3 A9 spell."""
+	text = _NOT_AN_ESCAPED_BYTE_RE.sub('\ufffd', str(text))
+	return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
 
 
 def write_config_file(path, text):
@@ -1172,9 +1234,15 @@ def write_config_file(path, text):
 	payload = text.encode('utf-8')
 	fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 	try:
-		os.write(fd, payload)
-	finally:
-		os.close(fd)
+		with os.fdopen(fd, 'wb') as fh:
+			fh.write(payload)
+	except BaseException:
+		# A partial config would be taken for the operator's own by the next install.
+		try:
+			os.remove(path)
+		except OSError:
+			pass
+		raise
 
 
 def _explicit_cli_args(raw):
@@ -1208,7 +1276,7 @@ def _prepare_unit_settings(args, raw=None):
 
 def _journal(priority, message, status=None):
 	"""Write one syslog line and a shorter stdout line. Both carry the self marker."""
-	syslog_line = _flatten('%s %s' % (SELF_MARKER, message))
+	syslog_line = _as_utf8(_flatten('%s %s' % (SELF_MARKER, message)))
 	if len(syslog_line) > JOURNAL_LINE_MAX:
 		syslog_line = syslog_line[:JOURNAL_LINE_MAX]
 	try:
@@ -1234,12 +1302,12 @@ def _http_header(text, limit):
 
 
 def _notify_body(text, path):
-	suffix = '\n' + str(path)
+	suffix = '\n' + _as_utf8(path)
 	suffix_b = suffix.encode('utf-8')
 	if len(suffix_b) >= NTFY_BODY_MAX:
 		return suffix_b[:NTFY_BODY_MAX].decode('utf-8', 'ignore')
 	budget = NTFY_BODY_MAX - len(suffix_b)
-	body = _flatten(text).encode('utf-8')[:budget]
+	body = _as_utf8(_flatten(text)).encode('utf-8')[:budget]
 	return body.decode('utf-8', 'ignore') + suffix
 
 
@@ -1452,6 +1520,8 @@ def call_llm(settings, incident):
 		% (incident.get('hostname', ''), 'Operator notes about this host: %s\n' % notes if notes else '', marker, marker,
 		   marker, incident.get('pattern', ''), incident.get('matched_line', ''), incident.get('path', ''), excerpt, marker)
 	)
+	# A JSON parser may refuse escaped bytes from a path as lone surrogates.
+	user = _as_utf8(user)
 	url = settings.llm_base_url.rstrip('/') + '/chat/completions'
 	payload = {
 		'model': settings.llm_model,
@@ -1510,7 +1580,7 @@ def post_event(url, token, payload, timeout):
 
 
 def _append_note(path, text):
-	rows = str(text).splitlines() or ['']
+	rows = _as_utf8(text).splitlines() or ['']
 	with open(path, 'a', encoding='utf-8') as handle:
 		handle.write('\n')
 		for row in rows:
@@ -1663,7 +1733,7 @@ class IncidentDispatcher(object):
 			'push': bool(should_push),
 			'always_notify': bool(incident.get('always_notify')),
 			'excerpt': _event_excerpt(incident),
-			'path': incident.get('path') or None,
+			'path': _as_utf8(incident['path']) if incident.get('path') else None,
 			'time': datetime.datetime.now().astimezone().isoformat(),
 		}
 		try:
@@ -1886,7 +1956,8 @@ class CaptureFile(object):
 				directory = os.path.dirname(path)
 				if directory:
 					os.makedirs(directory, exist_ok=True)
-				handle = open(path, 'a', encoding='utf-8')
+				# A path written into the capture (where it moved from, where earlier lines are) keeps its own bytes.
+				handle = open(path, 'a', encoding='utf-8', errors='surrogateescape')
 				if error is not None:
 					why = error if isinstance(error, str) else 'after a write error: %s' % error
 					handle.write(f"{SELF_MARKER} capture moved here from {failed} {why}\n")
@@ -2040,7 +2111,7 @@ def _open_capture(output_folder, fallback_folder, read_time, matched_pattern, he
 		# also record a journal of all logs captured in {folder}/journal.log, next to the month folders
 		journal_file_name = os.path.join(os.path.dirname(os.path.dirname(capture.path)), 'journal.log')
 		try:
-			with open(journal_file_name, "a", encoding='utf-8') as journal_file:
+			with open(journal_file_name, "a", encoding='utf-8', errors='surrogateescape') as journal_file:
 				journal_file.write(f"{stamp.isoformat()} Captured logs for {matched_pattern} to {capture.path}\n")
 		except OSError as exc:
 			_journal(syslog.LOG_ERR, 'cannot write %s: %s' % (journal_file_name, exc))
@@ -2535,9 +2606,14 @@ def _warn_no_systemd(action):
 
 
 def _run_systemctl(systemctl, *cmd):
-	if systemctl is None:
-		return subprocess.run(['systemctl', *cmd])
-	return systemctl(*cmd)
+	"""Run systemctl. One that cannot be run (not installed, not executable) is a message and exit status 1, as one that fails."""
+	try:
+		if systemctl is None:
+			return subprocess.run(['systemctl', *cmd])
+		return systemctl(*cmd)
+	except OSError as exc:
+		print('cannot run systemctl: %s' % exc, file=sys.stderr)
+		return subprocess.CompletedProcess(['systemctl', *cmd], 1)
 
 
 def _looks_like_pattern_dir(path):
@@ -2592,31 +2668,83 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		return 2
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
+	# The config and unit this run creates, removed again if a later step fails. The output folder and the example
+	# patterns stay: they hold nothing that changes what the next install does.
+	created = []
 	if config_text is not None:
 		try:
 			write_config_file(resolved.config_path, config_text)
 		except OSError as exc:
 			print('cannot write config %s: %s' % (resolved.config_path, exc), file=sys.stderr)
 			return 1
+		created.append(resolved.config_path)
 	if config_existed and getattr(raw, 'ntfy_url', None):
 		print(f"Warning: with an existing config, --ntfy-url goes on the unit's ExecStart, where any user can read it "
 			  f"(systemctl cat, ps). Set notify.ntfy_url in {resolved.config_path} instead.", file=sys.stderr)
-	os.makedirs(unit_dir, exist_ok=True)
+
 	unit_path = os.path.join(unit_dir, unit_name)
-	with open(unit_path, 'w', encoding='utf-8') as fh:
-		fh.write(unit_text)
+	# What a failed step puts back or takes away: the unit this run replaced (its text), whether that unit was enabled
+	# before this run enabled it, and whether systemd has loaded the new text.
+	old_unit = None
+	was_enabled = False
+	loaded = False
+
+	def failed(message, returncode, enabled=False):
+		print(message, file=sys.stderr)
+		# So the same command, run again, installs from scratch: a config left here would make it put the
+		# command-line flags, the ntfy URL among them, on the unit's ExecStart, which any user can read. What was
+		# there before this run stays as it was.
+		if enabled and not was_enabled:
+			# enable --now can fail at the start after it enabled the unit. Before the files go: systemd 219 refuses
+			# to disable a unit whose file is gone.
+			disable = _run_systemctl(systemctl, 'disable', '--', unit_name)
+			if getattr(disable, 'returncode', 0):
+				print(f"systemctl disable failed (exit {disable.returncode})", file=sys.stderr)
+		for path in created:
+			try:
+				os.remove(path)
+			except OSError as exc:
+				print(f"cannot remove {path}: {exc}", file=sys.stderr)
+			else:
+				print(f"Removed {path}, which this install created", file=sys.stderr)
+		if old_unit is not None:
+			try:
+				with open(unit_path, 'wb') as fh:
+					fh.write(old_unit)
+			except OSError as exc:
+				print(f"cannot put back {unit_path}: {exc}", file=sys.stderr)
+			else:
+				print(f"Put back {unit_path} as it was", file=sys.stderr)
+		if loaded:
+			# else a restart would start the new text systemd loaded, which names a config that is gone
+			_run_systemctl(systemctl, 'daemon-reload')
+		return returncode
+
+	try:
+		os.makedirs(unit_dir, exist_ok=True)
+		existed = os.path.lexists(unit_path)
+		if os.path.isfile(unit_path):
+			with open(unit_path, 'rb') as fh:
+				old_unit = fh.read()
+		with open(unit_path, 'w', encoding='utf-8') as fh:
+			if not existed:
+				created.append(unit_path)
+			fh.write(unit_text)
+	except OSError as exc:
+		return failed('cannot write unit %s: %s' % (unit_path, exc), 1)
 	print(f"Wrote {unit_path}")
 	reload = _run_systemctl(systemctl, 'daemon-reload')
 	if getattr(reload, 'returncode', 0):
-		print(f"systemctl daemon-reload failed (exit {reload.returncode})", file=sys.stderr)
-		return reload.returncode
+		return failed(f"systemctl daemon-reload failed (exit {reload.returncode})", reload.returncode)
+	loaded = True
 	if resolved.no_enable:
 		return 0
+	if existed:
+		was_enabled = getattr(_run_systemctl(systemctl, 'is-enabled', '--quiet', '--', unit_name), 'returncode', 0) == 0
 	# '--': a name starting with '-' is a name, not an option.
 	enable = _run_systemctl(systemctl, 'enable', '--now', '--', unit_name)
 	if getattr(enable, 'returncode', 0):
-		print(f"systemctl enable --now failed (exit {enable.returncode})", file=sys.stderr)
-		return enable.returncode
+		return failed(f"systemctl enable --now failed (exit {enable.returncode})", enable.returncode, enabled=True)
 	print(f"Enabled and started {unit_name}")
 	return 0
 
@@ -2741,7 +2869,8 @@ class JournalPosition(object):
 	The file holds the second of the last line read (from journalctl -o short-iso), which line of
 	that second it was, and a digest of it. At start, journalctl reads from capture_time before
 	that line, at most resume_max seconds back: the lines up to the saved one only refill the
-	context kept before a match, and the lines after it are matched as usual.
+	context kept before a match, and the lines after it are matched as usual. locate() first finds
+	the saved line in the journal as it is now, which may have lost it.
 	"""
 
 	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None):
@@ -2806,8 +2935,33 @@ class JournalPosition(object):
 			command = ['--since=@%d' % self.since if part.startswith('--lines=') else part for part in command]
 		return command
 
+	def locate(self, command):
+		"""Before replaying, find the saved line in the journal as it is now, by reading its second once with
+		command (the resumed journalctl command). The journal may have lost the start of that second, or the line
+		itself, while firewatcher was stopped (a journal file rotated away, a crash before journald wrote it), and
+		then the line's number no longer finds it. While a line with its digest is at its number or after it, nothing
+		changes: the replay ends there, as in 1.68. Otherwise it ends at the first line of that second with its
+		digest, and with no such line nothing is replayed: every line from the start of the replay is matched. Those
+		read lines again rather than skip them. When journalctl cannot tell, nothing changes."""
+		if not self.replaying:
+			return
+		saved_time, ordinal, digest = self.saved
+		digests = _journal_second(command, saved_time)
+		# A line with its digest at or after its number: the replay ends there, as in 1.68.
+		if digests is None or digest in digests[ordinal - 1:]:
+			return
+		if digest in digests:
+			self.saved = (saved_time, digests.index(digest) + 1, digest)
+			return
+		self.replaying = False
+		self.note = 'The journal no longer holds the last line read before the stop (%s); matching every line from %s.' % (
+			datetime.datetime.fromtimestamp(saved_time).isoformat(), datetime.datetime.fromtimestamp(self.since).isoformat())
+
 	def replay_time(self, line):
-		"""While replaying: the time of a line from before the saved position, for the context. None from the first line after it."""
+		"""While replaying: the time of a line from before the saved position, for the context. None from the first line
+		after the saved one, or from the first line shown as a later second than it: journalctl orders lines by the time
+		journald stored them, so that line can come before the saved one, and the lines read before the stop then match
+		again (a second capture, never a skip)."""
 		stamp = _iso_stamp(line)
 		if stamp is None:
 			# A continuation of the line before, or a journalctl note such as "-- Boot ... --".
@@ -2910,10 +3064,48 @@ def _journal_can_resume(journalctl):
 	try:
 		probe = subprocess.run(
 			[journalctl, '--quiet', '--no-pager', '--output=short-iso', '--since=@%d' % int(time.time()), '--lines=0'],
-			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=JOURNAL_PROBE_TIMEOUT)
 	except (OSError, subprocess.SubprocessError):
 		return False
 	return probe.returncode == 0
+
+
+def _journal_second(command, second):
+	"""The digests of the journal lines stamped in that second, in their order, read with command (journalctl
+	-o short-iso) without --follow, from that second on; None when journalctl fails or takes longer than
+	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line shown more than JOURNAL_STAMP_SKEW seconds after it. A line
+	shown before it, however far, is passed over: a stall of journald stores the lines that waited for it among the
+	lines of the second."""
+	command = [part for part in command if part != '--follow' and not part.startswith('--since=')]
+	try:
+		proc = subprocess.Popen(command + ['--since=@%d' % second], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+								stderr=subprocess.DEVNULL)
+	except OSError:
+		return None
+	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
+	timer.start()
+	digests = []
+	second_ended = True
+	try:
+		# Read as the capture loop reads, so each line has the digest it had there.
+		stream = io.TextIOWrapper(proc.stdout, encoding='utf-8', errors='replace', newline='\n')
+		for line in iter(lambda: stream.readline(MAX_LINE_CHARS), ''):
+			stamp = _iso_stamp(line)
+			if stamp is None:
+				continue
+			if stamp[0] == second:
+				digests.append(_line_digest(line, stamp[1]))
+			elif stamp[0] - second > JOURNAL_STAMP_SKEW:
+				break
+		else:
+			second_ended = False
+	finally:
+		timer.cancel()
+		proc.kill()
+		returncode = proc.wait()
+		proc.stdout.close()
+	# Output that ended inside the second is whole only if journalctl finished by itself, not killed by the timer.
+	return digests if second_ended or returncode == 0 else None
 
 
 def _journald_present():
@@ -3001,7 +3193,20 @@ def main(argv=None):
 	for row in userinfo_warnings(resolved):
 		print(row, file=sys.stderr)
 	if args.print_unit:
-		print(render_unit_file(resolved, raw=args), end='')
+		# The text --install-service would write, as the UTF-8 bytes it would write whatever the locale: a unit piped
+		# into a file is read as UTF-8, and stdout may not be.
+		try:
+			unit = _strict_utf8(render_unit_file(resolved, raw=args))
+		except ConfigError as exc:
+			print(str(exc), file=sys.stderr)
+			return 2
+		stream = getattr(sys.stdout, 'buffer', None)
+		if stream is None:  # a stdout that takes text only, such as a StringIO
+			print(unit, end='')
+			return 0
+		sys.stdout.flush()
+		stream.write(unit.encode('utf-8'))
+		stream.flush()
 		return 0
 	if args.install_service:
 		return install_service(resolved, raw=args)
@@ -3042,6 +3247,7 @@ def _watch(resolved):
 		elif _journal_can_resume(command_to_run[0]):
 			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines)
 			command_to_run = journal_position.journal_command(command_to_run)
+			journal_position.locate(command_to_run)
 			print(journal_position.note)
 		else:
 			print(f"This journalctl cannot resume from a saved position (that needs -o short-iso and --since=@); reading the last {resolved.tail_lines} lines.")

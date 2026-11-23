@@ -77,3 +77,19 @@ def test_journald_is_present_with_its_socket_or_journal_files(tmp_path, monkeypa
     assert not fw._journald_present()
     (tmp_path / 'journald.socket').write_text('')
     assert fw._journald_present()
+
+
+def test_an_empty_tail_lines_flag_is_not_passed_as_in_the_config(tmp_path, monkeypatch):
+    # 1.68 started `tail -n ''` and `journalctl --lines=''`, which exit at once; the config's empty value was ignored
+    monkeypatch.setattr(fw.shutil, 'which', lambda name: None)
+    for flag in ('--tail-lines', '--tail_lines'):
+        cmd = fw.log_source_command(parse_cli(['--log-file', '/tmp/x.log', flag, '', 'p.txt']))
+        assert cmd == ['tail', '-n', '20', '-F', '/tmp/x.log']
+    use_journal(monkeypatch)
+    assert '--lines=20' in fw.log_source_command(parse_cli(['--tail-lines', '', 'p.txt']))
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('[watch]\ntail_lines = 7\n')
+    settings = fw.resolve_settings(parse_cli(['--config', str(conf), '--tail-lines', '', 'p.txt']), environ={})
+    assert settings.tail_lines == '7'
+    # nor does a unit installed with it carry it
+    assert fw._explicit_cli_args(parse_cli(['--tail-lines', '', 'p.txt'])) == ['p.txt']

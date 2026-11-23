@@ -31,7 +31,7 @@ A directory argument loads every non-hidden pattern file inside it. Files ending
 
 `firewatcher` exits with an error when no pattern loads, for example when a pattern path is mistyped or every regex is invalid, instead of running while matching nothing.
 
-`--install-service` seeds `/etc/firewatcher/patterns.d` with example patterns when that directory is empty. The `examples/` directory in the source tree is not installed onto `PATH` by `pip install`; copy the pattern files from a clone, or let `--install-service` write them.
+`--install-service` seeds `/etc/firewatcher/patterns.d` with example patterns when it holds no pattern file. The `examples/` directory in the source tree is not installed onto `PATH` by `pip install`; copy the pattern files from a clone, or let `--install-service` write them.
 
 On a match, `firewatcher` writes:
 
@@ -62,7 +62,7 @@ When firewatcher follows the journal (not a log file), it saves how far it has r
 
 To tell where it stopped, firewatcher reads the journal with `journalctl -o short-iso`, so journal lines in captures carry the year and time zone: `2026-10-23T17:52:41+00:00 host sshd[812]: …` instead of `Oct 23 17:52:41 host sshd[812]: …`. Lines logged while firewatcher was stopped arrive all at once. A capture opened by one of them takes its context from the `--capture-time` before that line by the time each line was logged, and holds the lines after it as they are read, up to `--capture-line-count-max`.
 
-The position is the second of the last line read, its place in that second, and a digest of it. When unsure, firewatcher reads a line again rather than skip it, so identical lines logged in one second can be captured again after a restart. A failed save is logged once, and a restart then reads again from the last position saved. If the clock is set back after a save (a boot with a wrong hardware clock), the lines after the saved line are still matched, even when they are stamped before the saved second; a position more than a minute in the future is ignored.
+The position is the second of the last line read, its place in that second, and a digest of it. When unsure, firewatcher reads a line again rather than skip it: identical lines logged in one second, and lines that journald stored in another order than the one they show, can be captured again after a restart, and when the journal no longer holds the saved line (its file was rotated away while firewatcher was stopped, or a crash or reboot lost it), every line from `--capture-time` before it is matched, and no further back than `--resume-max`. One case can skip lines: if the journal lost the saved line, or lines before it in its second, and holds a later one of that second with the same text, the replay can end there and the lines between are not matched ([limitations](https://github.com/yufei-pan/firewatcher/blob/master/docs/limitations.md#a-restart-after-the-journal-lost-the-saved-line-can-skip-lines-that-follow-it)). A failed save is logged once, and a restart then reads again from the last position saved. If the clock is set back after a save by up to a minute (a boot with a wrong hardware clock) and the journal still holds the saved line, the lines after it are still matched, even when they are stamped before the saved second. A position more than a minute ahead of the clock is ignored, and the last `--tail-lines` lines are read.
 
 Only one firewatcher uses a position file at a time: another one started with the same file, such as a test run in a terminal with the default settings, reads the last `--tail-lines` lines and saves nothing. An empty `--position-file` turns resuming off, and so does a journalctl that does not accept `-o short-iso` and `--since=@`, which firewatcher checks at start.
 
@@ -77,7 +77,7 @@ Near the floor, firewatcher may delete its own oldest months in that folder, so 
 - **How much:** only as many months as it takes, counted by their size on disk, and nothing at all if deleting every one of them still could not make room. That happens when something else filled the disk, and then the history is kept.
 - **How often:** at most once per `--purge-interval` per folder (default an hour), so a disk that something else keeps filling drains firewatcher's history slowly. A purge that could not help is not tried again for five minutes (or the interval, if shorter). Each deletion is logged.
 
-After deleting, firewatcher syncs and reads the free space again. A filesystem that shows freed space late costs a move to the fallback folder, never the floor. If there is still no room, the capture moves to the fallback folder with a note, or, with no folder left, stops being written, which is logged; the incident is still pushed. Compression keeps to the floor too: a month whose archive could cross it is left uncompressed for now. Purging and compression never wait for each other, so log reading never waits for `tar`. `--delete-after-months 0` means nothing is deleted by age; the floor can still delete the oldest months. Set `--min-free-percent 0` to turn all of this off.
+After deleting, firewatcher syncs that filesystem alone (syncfs; none on macOS, where APFS shows freed space at once) and reads the free space again. A filesystem that shows freed space late costs a move to the fallback folder, never the floor. If there is still no room, the capture moves to the fallback folder with a note, or, with no folder left, stops being written, which is logged; the incident is still pushed. Compression keeps to the floor too: a month whose archive could cross it is left uncompressed for now. Purging and compression never wait for each other, so log reading never waits for `tar`. `--delete-after-months 0` means nothing is deleted by age; the floor can still delete the oldest months. Set `--min-free-percent 0` to turn all of this off.
 
 Memory is bounded too. The `--capture-time` seconds before a match are kept compressed (zlib, about 3 times smaller for a busy host's varied lines) within `--buffer-max-mb` (default 16 MiB); past it the oldest lines are dropped, and the capture says so. The newest lines, up to 256 KiB before they are compressed, are always kept, so the buffer can go over the limit by about that much. A line longer than 1 MiB is read and matched in pieces, so a pattern split across a 1 MiB boundary is missed.
 
@@ -91,7 +91,7 @@ sudo firewatcher --print-unit
 sudo firewatcher --uninstall-service
 ```
 
-`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if that directory is empty**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`. It checks first, and writes nothing (exit 2) for a unit name systemd cannot load (letters, digits and `: _ . @ - \`, at most 255 characters with the `.service` suffix, any `@` between a name and an instance) or a path or value that is not UTF-8.
+`--install-service` writes `/etc/systemd/system/firewatcher.service`, creates the output directory, seeds `/etc/firewatcher/patterns.d/` with example patterns **only if it holds no pattern file**, writes `/etc/firewatcher/firewatcher.conf` **only if that file is missing**, then `systemctl daemon-reload && systemctl enable --now firewatcher`. It checks first, and writes nothing (exit 2) for a unit name systemd cannot load or a path or value that is not UTF-8. If writing the unit or a `systemctl` step fails (or `systemctl` cannot be run), it removes the config and the unit it created, puts back a unit it replaced as it was, and disables a unit it enabled, so the same command can run again. The output folder and the example patterns stay.
 
 `systemctl reload firewatcher` reloads the pattern files without a restart; see SIGHUP above.
 
@@ -238,16 +238,27 @@ Captures are posted whatever `push` says, so the service sees them all. Any 2xx 
 Lines firewatcher writes back to the journal are a single physical line containing `firewatcher-self`, so a summary that quotes `panic` or `I/O error` does not start another capture. In journalctl and syslog output, firewatcher recognizes its own lines by the identifier field after the timestamp and host (`firewatcher[PID]:`), not by text elsewhere in the line, so a process or user name chosen to look like firewatcher cannot hide a kernel or daemon message. Lines in other formats are checked for `firewatcher-self` or `firewatcher[PID]:` anywhere. The capture files themselves stay in the log stream's original format.
 
 
+## Upgrading to 1.69 from 1.68
+
+Nothing to change under a UTF-8 or C locale. What is different:
+
+- After deleting old months to keep the free-space floor, firewatcher syncs only that filesystem (none on macOS), so a hard-mounted NFS share that is not answering, other than the one the captures are on, no longer stalls log reading. 1.68 synced every filesystem.
+- When writing the unit, `daemon-reload` or `enable --now` fails, `--install-service` removes the config and the unit it created, puts back a unit it replaced as it was, and disables a unit it enabled, so the same command can run again. 1.68 left them, and the rerun put the command-line flags, the ntfy URL among them, on the unit's `ExecStart`. A config that does not fit on the disk is the same kind of failure; 1.68 wrote part of it and went on.
+- At a restart, firewatcher first finds the saved line in the journal as it is now. When the journal lost the start of that second, the lines after the saved one are still matched; when it lost the line itself, every line from `--capture-time` before it is matched (no further back than `--resume-max`). 1.68 replayed them as context only, and with the clock set back by up to a minute, every line stamped before the saved second.
+- `--tail-lines ''` is as if the flag were not given (the config's `tail_lines`, else 20), as an empty `tail_lines` in the config is. 1.68 passed it on, and `tail` or `journalctl` exited at once.
+- Under a locale that is neither UTF-8 nor C (such as `en_US.ISO-8859-1`), a non-ASCII path in the config now names the file by its UTF-8 bytes, and a pattern file is read as UTF-8, where 1.68 used the locale's encoding for both: rename such a folder or file to its UTF-8 name, and save a pattern file as UTF-8 (one that is not is skipped, with a message). `--install-service` refuses a path or note typed there in the locale's own encoding (exit 2); 1.68 wrote it.
+- On Python 3.6 under a C locale, non-ASCII paths (from the config, the command line or the unit), matched log lines and pattern files no longer stop firewatcher with `UnicodeEncodeError` or go unread, and `--install-service` writes a non-ASCII path or note given there as UTF-8, where 1.68 refused it. `--print-unit` writes the unit as UTF-8 in every locale (1.68 stopped on a non-ASCII `--requires-mounts-for` path) and refuses a value that is not UTF-8 (exit 2), which 1.68 printed or stopped on. On any Python, a path that is not UTF-8 no longer stops it at the first capture.
+
 ## Upgrading to 1.68 from 1.67
 
 Nothing to change. What is different:
 
 - `--install-service` refuses a unit name systemd cannot load, and a path or value that is not UTF-8, before it writes anything (exit 2). 1.67 could write the config first and then stop with a traceback, or install a unit under a name systemd skips. A blank `--unit-name` now means `firewatcher`, as an empty one did.
 - `systemctl enable --now` and `disable --now` get `--` before the unit name, so a name starting with `-` works.
-- On Python 3.6 under a C locale, a non-ASCII path or note given on the command line reads as undecodable bytes, and a service started under that locale could not encode it, so `--install-service` refuses it (exit 2, nothing written) and says to run under a UTF-8 locale (one that `locale -a` lists, such as `en_US.UTF-8`; CentOS 7 has no `C.UTF-8`). 1.67 stopped there with a `UnicodeEncodeError`. Under a UTF-8 locale, and on Python 3.7 and later, such a path installs as before.
+- On Python 3.6 under a C locale, `--install-service` refuses a non-ASCII path or note given on the command line (exit 2, nothing written) and says to run under a UTF-8 locale; 1.67 stopped there with `UnicodeEncodeError`. 1.69 installs it.
 - The package declares its license as the SPDX expression `GPL-3.0-or-later` when built with setuptools 77 or later.
 - `--uninstall-service --unit-name` with a path (`a/b`) now prints a message and exits 2; 1.67 stopped with a traceback. It still takes any other name an older firewatcher may have installed.
-- Dead code and duplicated rules are gone (`firewatcher.py` went from 3,227 to 3,084 lines before the install checks were added); nothing else an operator sees changed.
+- Dead code and duplicated rules are gone; nothing else an operator sees changed.
 
 ## Development
 

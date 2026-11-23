@@ -1,3 +1,4 @@
+import io
 import os
 import signal
 import subprocess
@@ -18,6 +19,13 @@ def test_print_unit_via_main(capsys):
     out = capsys.readouterr().out
     assert '[Service]' in out
     assert 'nebula' not in out.lower()
+
+
+def test_print_unit_into_a_stdout_that_takes_text_only(monkeypatch):
+    out = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', out)
+    assert fw.main(['--print-unit', '/etc/firewatcher/patterns.d']) == 0
+    assert '[Service]' in out.getvalue()
 
 
 def test_print_unit_defaults_pattern_dir(capsys):
@@ -104,7 +112,7 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
     src = open(fw.__file__, encoding='utf-8').read().lower()
     assert 'nebula' not in src
-    assert fw.version == '1.68'
+    assert fw.version == '1.69'
     assert fw.__version__ == fw.version
 
 

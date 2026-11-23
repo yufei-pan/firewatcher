@@ -725,6 +725,49 @@ def test_purge_deletes_only_the_oldest_months_it_needs(tmp_path, monkeypatch):
         'firewatcher-self deleting 2020-01 from %s to keep 10%% of the disk free' % out]
 
 
+def test_a_purge_syncs_only_the_filesystem_it_purged(tmp_path, monkeypatch):
+    # 1.68 ran sync(2), which writes every filesystem on the host and waits for a hung NFS share
+    journal_records(monkeypatch)
+
+    def every_filesystem():
+        raise AssertionError('synced every filesystem')
+
+    synced = []
+    monkeypatch.setattr(fw.os, 'sync', every_filesystem)
+    monkeypatch.setattr(fw, '_syncfs', synced.append)
+    out = tmp_path / 'out'
+    months(out, **{'2020-01': 200_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-100_000, 0.10)
+    assert guard_for(out).headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert synced == [str(out)]
+
+
+def test_syncfs_syncs_the_filesystem_of_the_path_and_never_raises(tmp_path, monkeypatch):
+    import ctypes
+
+    def every_filesystem():
+        raise AssertionError('synced every filesystem')
+
+    monkeypatch.setattr(fw.os, 'sync', every_filesystem)
+    fw._syncfs(str(tmp_path))  # the real call, where libc has syncfs
+    synced = []
+
+    class Libc(object):
+        def syncfs(self, fd):
+            synced.append(os.fstat(fd).st_ino)
+            return 0
+
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name, use_errno=False: Libc())
+    fw._syncfs(str(tmp_path))
+    assert synced == [os.stat(str(tmp_path)).st_ino]
+    fw._syncfs(str(tmp_path / 'gone'))
+    # a libc without syncfs, such as macOS's: nothing is synced
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name, use_errno=False: object())
+    fw._syncfs(str(tmp_path))
+    assert synced == [os.stat(str(tmp_path)).st_ino]
+
+
 def test_purge_keeps_history_when_it_cannot_make_room(tmp_path, monkeypatch):
     records = journal_records(monkeypatch)
     out = tmp_path / 'out'
@@ -760,7 +803,7 @@ def test_purge_runs_at_most_once_an_hour_per_folder(tmp_path, monkeypatch):
 def test_lagging_statvfs_costs_a_move_never_the_floor(tmp_path, monkeypatch):
     journal_records(monkeypatch)
     synced = []
-    monkeypatch.setattr(fw.os, 'sync', lambda: synced.append(1))
+    monkeypatch.setattr(fw, '_syncfs', synced.append)
     out = tmp_path / 'out'
     months(out, **{'2020-01': 300_000, '2020-02': 300_000, '2020-03': 300_000})
     disk = FakeDisk(monkeypatch, out, 10_000_000, lag=True)  # never shows the deletion
@@ -769,7 +812,7 @@ def test_lagging_statvfs_costs_a_move_never_the_floor(tmp_path, monkeypatch):
     path = str(out / '2026-10' / 'hit.log')
     # only what statvfs reports authorizes a write, so this capture moves on
     assert guard.headroom(path) < fw.MIN_HEADROOM
-    assert synced == [1]
+    assert synced == [str(out)]
     # and the lag does not cost more history than the room needed
     assert sorted(p.name for p in out.iterdir()) == ['2020-02', '2020-03']
     assert guard.headroom(path) < fw.MIN_HEADROOM
@@ -1102,7 +1145,7 @@ def test_compression_at_startup_already_keeps_to_the_floor(tmp_path, monkeypatch
 
 def test_purge_is_sized_for_what_the_caller_needs(tmp_path, monkeypatch):
     journal_records(monkeypatch)
-    monkeypatch.setattr(fw.os, 'sync', lambda: None)
+    monkeypatch.setattr(fw, '_syncfs', lambda path: None)
     out = tmp_path / 'out'
     months(out, **{'2019-01': 30_000, '2019-02': 2_000_000, '2019-03': 2_000_000})
     disk = FakeDisk(monkeypatch, out, 100_000_000)
@@ -1223,7 +1266,7 @@ def test_a_hard_linked_month_counts_as_freeing_nothing(tmp_path, monkeypatch):
 
 def test_purge_interval_is_a_setting(tmp_path, monkeypatch):
     journal_records(monkeypatch)
-    monkeypatch.setattr(fw.os, 'sync', lambda: None)
+    monkeypatch.setattr(fw, '_syncfs', lambda path: None)
     clock = Clock(time.time())
     monkeypatch.setattr(fw.time, 'time', clock.time)
     out = tmp_path / 'out'

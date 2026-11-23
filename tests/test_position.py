@@ -156,6 +156,224 @@ def test_a_changed_time_zone_still_finds_the_saved_line(tmp_path):
     assert replay(position, lines) == ['old', 'old', 'new']
 
 
+# --- finding the saved line in the journal as it is at the restart ---
+
+def fake_journalctl(tmp_path, journal):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake = bin_dir / 'journalctl'
+    fake.write_text(FAKE_JOURNALCTL % sys.executable)
+    fake.chmod(0o755)
+    (bin_dir / 'journal.txt').write_text(journal)
+    return str(fake)
+
+
+def stored(offset, line):
+    """A line of the fake journalctl's journal that journald stored at T + offset, whatever time the line shows."""
+    return '@%d %s' % (T + offset, line)
+
+
+def script(tmp_path, body, name='journalctl'):
+    path = tmp_path / name
+    path.write_text('#!%s\nimport sys, time\n%s\n' % (sys.executable, body))
+    path.chmod(0o755)
+    return str(path)
+
+
+def located(tmp_path, ordinal, text, journalctl):
+    position = resumed(tmp_path, 0, ordinal, text)
+    position.locate([journalctl, '--output=short-iso', '--all', '--no-pager', '--since=@%d' % position.since, '--follow'])
+    return position
+
+
+def test_locate_keeps_the_saved_line_where_the_journal_still_has_it(tmp_path):
+    lines = [jline(-1, 'x'), jline(0, 'a'), jline(0, 'b'), jline(0, 'c'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 2
+    assert replay(position, lines) == ['old', 'old', 'old', 'new', 'new']
+    # the saved second read once, from that second on, without --follow
+    assert (tmp_path / 'bin' / 'calls.txt').read_text() == '--output=short-iso --all --no-pager --since=@%d\n' % T
+    # a journal that ends inside the saved second
+    other = tmp_path / 'other'
+    other.mkdir()
+    position = located(other, 2, 'b', fake_journalctl(other, jline(0, 'a') + jline(0, 'b')))
+    assert position.replaying and position.saved[1] == 2
+
+
+def test_a_journal_that_lost_the_start_of_the_saved_second_ends_the_replay_at_the_saved_line(tmp_path):
+    # the saved line was the third of its second; the first two went with a rotated journal file
+    position = located(tmp_path, 3, 'c', fake_journalctl(tmp_path, jline(0, 'c') + jline(0, 'HIT') + jline(1, 'd')))
+    assert position.saved[1] == 1
+    assert replay(position, [jline(0, 'c'), jline(0, 'HIT'), jline(1, 'd')]) == ['old', 'new', 'new']
+
+
+def test_with_the_start_of_the_second_lost_identical_lines_are_read_again_never_skipped(tmp_path):
+    # the saved line was the fourth of four identical lines: which one it is now cannot be told, so the first
+    lines = [jline(0, 'same'), jline(0, 'same'), jline(0, 'x'), jline(1, 'y')]
+    position = located(tmp_path, 4, 'same', fake_journalctl(tmp_path, ''.join(lines)))
+    assert replay(position, lines) == ['old', 'new', 'new', 'new']
+
+
+@pytest.mark.parametrize('journal', [
+    jline(0, 'c') + jline(0, 'HIT') + jline(1, 'd'),  # the saved line went, the rest of its second stayed
+    jline(0, 'a'),  # the journal ends inside the saved second, before the saved line
+    jline(5, 'HIT later'),  # its whole second went
+    '',  # nothing at or after it: "-- No entries --"
+    jline(0, 'c') + jline(-100, 'b'),  # a line shown far before the second is not the saved line, which is not in the second
+])
+def test_a_journal_without_the_saved_line_replays_nothing(tmp_path, journal):
+    position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, journal))
+    assert not position.replaying
+    assert 'no longer holds the last line read' in position.note
+    assert replay(position, [jline(-30, 'HIT earlier'), jline(0, 'HIT')]) == ['new', 'new']
+
+
+def test_a_line_shown_as_the_second_before_can_come_first_without_the_saved_line_being_lost(tmp_path):
+    # journalctl seeks by the time journald stored a line and shows the time it was sent: x was sent just before the
+    # second turned and stored just after, so --since=@T starts with it. 1.69 as built stopped at x, found nothing
+    # of the saved second, and matched the whole --capture-time again after an ordinary restart.
+    lines = [stored(0, jline(-1, 'x')), jline(0, 'a'), jline(0, 'b'), jline(0, 'c'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 2
+    assert 'no longer holds' not in position.note
+    assert replay(position, [line.partition(' ')[2] if line.startswith('@') else line for line in lines]) == \
+        ['old', 'old', 'old', 'new', 'new']
+
+
+def test_a_line_shown_as_the_saved_second_can_come_after_one_shown_as_the_next(tmp_path):
+    # d was sent in the saved second and stored after c, which was sent in the next one
+    lines = [jline(0, 'a'), stored(1, jline(1, 'c')), stored(1, jline(0, 'd'))]
+    position = located(tmp_path, 1, 'd', fake_journalctl(tmp_path, ''.join(lines)))
+    # the saved d was the first line of its run as the capture loop numbered it (c came before); it is there at that
+    # number or after it, so the saved number stays
+    assert position.replaying and position.saved[1] == 1
+    assert 'no longer holds' not in position.note
+
+
+def test_a_line_shown_as_the_second_before_inside_the_saved_second_does_not_end_the_replay_early(tmp_path):
+    # journald stored h (sent in the second before) between lines of the saved second, as in a stall. The capture
+    # loop counted the saved A as the 2nd of its run (h ended the run, B began a new one), and the journal holds an
+    # earlier A: e379c34 took that one as the saved line and read h, B and A again; the replay ends as 1.68's did
+    lines = [jline(0, 'A'), stored(0, jline(-1, 'h')), jline(0, 'B'), jline(0, 'A'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 2
+    shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'old', 'new']
+
+
+def test_a_journal_that_lost_lines_before_the_saved_one_skips_no_line_1_68_matched(tmp_path):
+    # the capture loop read [B, A] and saved A as the 2nd of its run; B went with a rotated file, and while firewatcher
+    # was stopped C, A, h (sent in the second before, stored inside it: a stall), D, A and E came. With A's text at
+    # its number or after it, the replay ends where 1.68's did; a later line with A's text and number skipped C to A
+    lines = [jline(0, 'A'), jline(0, 'C'), jline(0, 'A'), stored(0, jline(-1, 'h')), jline(0, 'D'), jline(0, 'A'), jline(1, 'E')]
+    position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
+    shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'new', 'new', 'new', 'new']
+
+
+def test_a_saved_number_that_is_right_among_all_lines_of_the_second_is_kept(tmp_path):
+    # after a resume the saved number counts all lines of the second (replay_time), whatever ends the capture loop's
+    # runs: the first X is the 2nd line of its second and the 1st of its run (h ended Y's): the replay ends there,
+    # and the next X is read as new, not skipped.
+    lines = [jline(0, 'Y'), stored(0, jline(-1, 'h')), jline(0, 'X'), jline(0, 'X'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'X', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.saved[1] == 2
+    shown = [line.partition(' ')[2] if line.startswith('@') else line for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'new', 'new']
+
+
+def test_a_burst_of_identical_lines_in_the_saved_second_is_found_at_the_saved_one(tmp_path):
+    # the saved A was the 2nd of two identical lines, with x and d after it: the journal is as it was, so the replay
+    # ends at the 2nd A, as 1.68's did, and the first A is not taken for it (a lower number would read the 2nd again)
+    lines = [jline(0, 'A'), jline(0, 'A'), jline(0, 'x'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'A', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.saved[1] == 2
+    assert replay(position, lines) == ['old', 'old', 'new', 'new']
+
+
+def test_one_line_lost_before_the_saved_one_is_not_made_up_for_by_a_line_after_it(tmp_path):
+    # the saved b was the 2nd line of its second and the 1st went with a rotated file: the saved line is now the 1st,
+    # and HIT after it is new (a number two lower would count HIT as context, a skip)
+    lines = [jline(0, 'b'), jline(0, 'HIT'), jline(1, 'd')]
+    position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, ''.join(lines)))
+    assert replay(position, lines) == ['old', 'new', 'new']
+
+
+def test_a_stall_that_stores_the_far_earlier_line_first_still_finds_the_saved_line(tmp_path):
+    # journald stalled and stored a line sent 100 s before the saved second first, then the lines of that second (all
+    # at T + 5): --since=@T starts with the far line. Reading stopped there in 1.69 as built, which then said the
+    # journal no longer holds the saved line and matched the whole window again; 1.68 replayed up to the saved line
+    lines = [stored(5, jline(-100, 'Q')), stored(5, jline(0, 'A')), stored(5, jline(0, 'T')), stored(5, jline(1, 'U'))]
+    position = located(tmp_path, 2, 'T', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 2
+    shown = [line.partition(' ')[2] for line in lines]
+    assert replay(position, shown) == ['old', 'old', 'old', 'new']
+
+
+def test_a_stalled_head_of_far_earlier_lines_does_not_hide_a_lost_saved_second(tmp_path):
+    skew = fw.JOURNAL_STAMP_SKEW
+    # far earlier lines and then a line far later: the read ends there, and nothing of the saved second is in it
+    journal = stored(5, jline(-100, 'Q')) + stored(5, jline(-99, 'R')) + jline(skew + 1, 'S') + jline(0, 'b')
+    position = located(tmp_path, 1, 'b', fake_journalctl(tmp_path, journal))
+    assert not position.replaying and 'no longer holds' in position.note
+    # far earlier lines to the end of the journal
+    other = tmp_path / 'other'
+    other.mkdir()
+    position = located(other, 1, 'b', fake_journalctl(other, stored(5, jline(-100, 'Q')) + stored(5, jline(-99, 'R'))))
+    assert not position.replaying and 'no longer holds' in position.note
+
+
+def test_a_stalled_head_that_never_ends_is_bounded_by_the_probe_timeout(tmp_path, monkeypatch):
+    # journalctl keeps writing far earlier lines: the bound is the probe's, and where it cannot tell, locate leaves the position as saved
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 1)
+    head = ''.join(jline(-100, 'Q%d' % n) for n in range(3))
+    journalctl = script(tmp_path, 'sys.stdout.write(%r)\nsys.stdout.flush()\ntime.sleep(600)' % head, 'endless')
+    start = time.time()
+    position = located(tmp_path, 3, 'c', journalctl)
+    assert time.time() - start < 15
+    assert position.replaying and position.saved[1] == 3
+
+
+def test_a_journal_that_runs_on_far_after_the_saved_second_is_read_no_further(tmp_path):
+    # a line shown more than JOURNAL_STAMP_SKEW after the saved second: the second is over (journald stored it after
+    # lines it showed as the saved second only within the gap between sending and storing), so what follows is not read
+    skew = fw.JOURNAL_STAMP_SKEW
+    far = tmp_path / 'far'
+    far.mkdir()
+    assert not located(far, 1, 'b', fake_journalctl(far, jline(0, 'c') + jline(skew + 1, 'x') + jline(0, 'b'))).replaying
+    # and one at that distance or less is read past: 16 s is the largest gap between sending and storing seen
+    # outside a stall of the host (15.7 s on the host it was measured on)
+    for near_by in (16, skew):
+        near = tmp_path / ('near%d' % near_by)
+        near.mkdir()
+        assert located(near, 1, 'b', fake_journalctl(near, jline(0, 'c') + jline(near_by, 'x') + jline(0, 'b'))).replaying
+
+
+def test_lines_shown_far_before_the_saved_second_are_read_past_wherever_a_stall_stored_them(tmp_path):
+    # the stalls of a real journal (370 and 458 s): runs of lines shown as the second, with lines shown 277 to 458 s
+    # earlier stored between the runs. The saved c came after the first far line; the replay ends at it, as 1.68's did.
+    # A read that stopped at a far earlier line after a line of the second matched the whole window again for 312 of
+    # the 7,597 lines of the seconds of those stalls, where 1.68 was exact
+    lines = [stored(5, jline(0, 'a')), stored(5, jline(-442, 'Q')), stored(5, jline(0, 'b')), stored(5, jline(-441, 'R')),
+             stored(5, jline(0, 'c')), stored(5, jline(1, 'd'))]
+    position = located(tmp_path, 1, 'c', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 1 and 'no longer holds' not in position.note
+    assert replay(position, [line.partition(' ')[2] for line in lines]) == ['old', 'old', 'old', 'old', 'old', 'new']
+
+
+def test_when_journalctl_cannot_tell_the_replay_goes_by_the_saved_number(tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 1)
+    second = jline(0, 'c') + jline(0, 'HIT')
+    # each in its own file: a script that is written over by the next never runs
+    for journalctl in (str(tmp_path / 'missing'),
+                       script(tmp_path, 'sys.stdout.write(%r)\nsys.exit(1)' % second, 'exits-1'),
+                       script(tmp_path, 'sys.stdout.write(%r)\nsys.stdout.flush()\ntime.sleep(600)' % second, 'hangs')):
+        start = time.time()
+        position = located(tmp_path, 3, 'c', journalctl)
+        assert time.time() - start < 15, journalctl
+        assert position.replaying and position.saved[1] == 3, journalctl
+
+
 def test_saw_saves_once_per_interval_and_round_trips(tmp_path):
     path = tmp_path / 'state' / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
@@ -359,55 +577,75 @@ def test_journal_can_resume_probes_journalctl(tmp_path):
 
 
 FAKE_JOURNALCTL = r'''#!%s
-"""Prints journal.txt like journalctl -o short-iso, from --since=@N or the last --lines=N, then waits."""
+"""Prints journal.txt like journalctl -o short-iso: from the first line at or after --since=@N (later lines too, whatever
+their time, as journalctl seeks and then reads on), or the last --lines=N; then, with --follow, waits. As journalctl
+seeks by the time journald STORED a line and shows the time it was SENT, a line of journal.txt may start with '@N ',
+the time it was stored: that is not shown, and is what --since compares."""
 import calendar, os, sys, time
-lines = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'journal.txt')).read().splitlines(True)
+entries = []
+for line in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'journal.txt')).read().splitlines(True):
+    stored = None
+    if line.startswith('@'):
+        number, _, line = line[1:].partition(' ')
+        stored = int(number)
+    if stored is None:
+        try:
+            stored = calendar.timegm(time.strptime(line[:19], '%%Y-%%m-%%dT%%H:%%M:%%S'))
+        except ValueError:
+            pass
+    entries.append((stored, line))
 args = sys.argv[1:]
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calls.txt'), 'a') as f:
     f.write(' '.join(args) + '\n')
 if '--lines=0' in args:
     sys.exit(0)
+
 for arg in args:
     if arg.startswith('--since=@'):
         since = int(arg[len('--since=@'):])
-        lines = [l for l in lines if calendar.timegm(time.strptime(l[:19], '%%Y-%%m-%%dT%%H:%%M:%%S')) >= since]
+        first = next((n for n, e in enumerate(entries) if e[0] is not None and e[0] >= since), len(entries))
+        entries = entries[first:] or [(None, '-- No entries --\n')]
     if arg.startswith('--lines='):
-        lines = lines[-int(arg[len('--lines='):]):]
-sys.stdout.write(''.join(lines))
+        entries = entries[-int(arg[len('--lines='):]):]
+sys.stdout.write(''.join(line for _, line in entries))
 sys.stdout.flush()
-time.sleep(600)
+if '--follow' in args:
+    time.sleep(600)
 '''
 
 
-def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir()
-    fake = bin_dir / 'journalctl'
-    fake.write_text(FAKE_JOURNALCTL % sys.executable)
-    fake.chmod(0o755)
-    now = int(time.time())
+class Daemon(object):
+    """firewatcher as a daemon on a journald host, reading a fake journalctl (FAKE_JOURNALCTL, its journal.txt beside
+    it) and saving its position, until done() or 20 seconds, then stopped with SIGTERM."""
 
-    def line(offset, text):
-        return '%s host app[1]: %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime(now + offset)), text)
+    def __init__(self, tmp_path):
+        self.bin_dir = tmp_path / 'bin'
+        self.bin_dir.mkdir()
+        fake = self.bin_dir / 'journalctl'
+        fake.write_text(FAKE_JOURNALCTL % sys.executable)
+        fake.chmod(0o755)
+        self.journal = self.bin_dir / 'journal.txt'
+        self.now = int(time.time())
+        self.pat = tmp_path / 'p.txt'
+        self.pat.write_text('HIT\n')
+        self.conf = tmp_path / 'empty.conf'
+        self.conf.write_text('')
+        self.out = tmp_path / 'out'
+        self.position_file = tmp_path / 'journal.position'
+        self.env = dict(os.environ, PATH='%s%s%s' % (self.bin_dir, os.pathsep, os.environ.get('PATH', '')))
 
-    journal = bin_dir / 'journal.txt'
-    journal.write_text(line(-40, 'quiet') + line(-30, 'HIT first') + line(-20, 'after the first'))
-    pat = tmp_path / 'p.txt'
-    pat.write_text('HIT\n')
-    conf = tmp_path / 'empty.conf'
-    conf.write_text('')
-    out = tmp_path / 'out'
-    position_file = tmp_path / 'journal.position'
-    env = dict(os.environ, PATH='%s%s%s' % (bin_dir, os.pathsep, os.environ.get('PATH', '')))
+    def line(self, offset, text):
+        return '%s host app[1]: %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S+0000', time.gmtime(self.now + offset)), text)
 
-    def run_until(done):
+    def run_until(self, done):
         proc = subprocess.Popen(
             # as on a journald host, whatever runs on the machine running the tests
             [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import firewatcher as fw; '
              'fw._journald_present = lambda: True; sys.exit(fw.main(sys.argv[2:]))', str(ROOT),
-             '--config', str(conf), '-o', str(out), '-t', '60',
-             '--fallback-folder', '', '--position-file', str(position_file), str(pat)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=env,
+             '--config', str(self.conf), '-o', str(self.out), '-t', '60',
+             '--fallback-folder', '', '--position-file', str(self.position_file), str(self.pat)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+            env=self.env,
         )
         try:
             deadline = time.time() + 20
@@ -422,32 +660,71 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
         assert proc.returncode == 0, output
         return output
 
-    def captured(count, text, saved):
-        # The capture shows a line before the loop marks it handled, so the saved position is waited for too.
-        logs = incident_logs(out)
-        if not (len(logs) == count and text in logs[-1].read_text()):
-            return False
+    def saved(self):
         try:
-            return json.loads(position_file.read_text())['time'] == saved
-        except (OSError, ValueError, KeyError, TypeError):
-            return False
+            return json.loads(self.position_file.read_text())
+        except (OSError, ValueError):
+            return {}
 
-    first = run_until(lambda: captured(1, 'after the first', now - 20))
+    def captured(self, count, text, saved):
+        # The capture shows a line before the loop marks it handled, so the saved position is waited for too.
+        logs = incident_logs(self.out)
+        return len(logs) == count and text in logs[-1].read_text() and self.saved().get('time') == saved
+
+
+def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    daemon.journal.write_text(line(-40, 'quiet') + line(-30, 'HIT first') + line(-20, 'after the first'))
+    first = daemon.run_until(lambda: daemon.captured(1, 'after the first', now - 20))
     assert 'No journal position saved' in first
-    assert json.loads(position_file.read_text())['time'] == now - 20
-    journal.write_text(journal.read_text() + line(-10, 'logged while stopped') + line(-5, 'HIT second'))
-    second = run_until(lambda: captured(2, 'HIT second', now - 5))
+    assert daemon.saved()['time'] == now - 20
+    daemon.journal.write_text(daemon.journal.read_text() + line(-10, 'logged while stopped') + line(-5, 'HIT second'))
+    second = daemon.run_until(lambda: daemon.captured(2, 'HIT second', now - 5))
     assert 'Resuming the journal after' in second
-    logs = incident_logs(out)
+    logs = incident_logs(daemon.out)
     assert len(logs) == 2
     text = logs[1].read_text()
     assert 'Matched line:    %s' % line(-5, 'HIT second').strip() in text
     # read again as context only, so 'HIT first' did not open a capture of its own
     assert 'logged while stopped' in text and 'after the first' in text and 'HIT first' in text
-    assert json.loads(position_file.read_text())['time'] == now - 5
-    calls = (bin_dir / 'calls.txt').read_text().splitlines()
+    assert daemon.saved()['time'] == now - 5
+    calls = (daemon.bin_dir / 'calls.txt').read_text().splitlines()
     assert any('--lines=20' in call for call in calls)
     assert any('--since=@%d' % (now - 20 - 60) in call for call in calls)
+    # the saved second, read once before resuming, without --follow
+    assert any(call.endswith('--since=@%d' % (now - 20)) and '--follow' not in call for call in calls)
+
+
+def test_a_restart_after_the_journal_lost_the_start_of_the_saved_second_matches_what_followed(tmp_path):
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    daemon.journal.write_text(line(-40, 'HIT first') + line(-20, 'a') + line(-20, 'b') + line(-20, 'c'))
+    daemon.run_until(lambda: daemon.captured(1, 'app[1]: c\n', now - 20))
+    assert daemon.saved()['line'] == 3
+    # While stopped, the journal file that held the start of that second was rotated away, and a match was logged
+    # in that second. 1.68 counted 'c' as the second's first line, never found the saved third one, and replayed
+    # the rest of the second as context only.
+    daemon.journal.write_text(line(-20, 'c') + line(-20, 'HIT logged while stopped') + line(-5, 'later'))
+    daemon.run_until(lambda: daemon.captured(2, 'later', now - 5))
+    logs = incident_logs(daemon.out)
+    assert len(logs) == 2
+    assert 'Matched line:    %s' % line(-20, 'HIT logged while stopped').strip() in logs[1].read_text()
+
+
+def test_a_restart_on_a_journal_without_the_saved_line_and_a_clock_set_back_matches_every_line(tmp_path):
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    daemon.journal.write_text(line(-40, 'HIT first') + line(-20, 'last line read'))
+    daemon.run_until(lambda: daemon.captured(1, 'last line read', now - 20))
+    # A reboot with a volatile journal (CentOS 7's default) lost the saved line, and the clock came back behind it.
+    # 1.68 replayed every line stamped before the saved second as context, until the clock passed it.
+    daemon.journal.write_text(line(-50, 'booted with the clock behind') + line(-49, 'HIT after the reboot'))
+    second = daemon.run_until(lambda: len(incident_logs(daemon.out)) == 2 and daemon.saved().get('time') == now - 49)
+    assert 'no longer holds the last line read' in second
+    logs = incident_logs(daemon.out)
+    assert len(logs) == 2
+    assert 'Matched line:    %s' % line(-49, 'HIT after the reboot').strip() in logs[1].read_text()
 
 
 def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monkeypatch):
