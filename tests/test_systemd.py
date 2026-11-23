@@ -260,7 +260,7 @@ def test_a_failed_systemctl_step_keeps_a_config_and_unit_that_were_there(tmp_pat
     assert 'Removed' not in capsys.readouterr().err
 
 
-def test_a_unit_that_cannot_be_written_removes_the_new_config(tmp_path, capsys):
+def test_a_unit_that_cannot_be_written_removes_the_new_config(tmp_path, capsys, monkeypatch):
     blocker = tmp_path / 'system'
     blocker.write_text('')  # a file where the unit folder should be
     rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
@@ -268,6 +268,21 @@ def test_a_unit_that_cannot_be_written_removes_the_new_config(tmp_path, capsys):
     assert rc == 1 and not os.path.exists(fw.DEFAULT_CONFIG_PATH)
     err = capsys.readouterr().err
     assert 'cannot write unit' in err and 'Traceback' not in err
+    # a unit folder that refuses the file: there is no unit to remove, only the config
+    unit_dir = tmp_path / 'units'
+    unit_dir.mkdir()
+
+    def refusing_open(path, *args, **kwargs):
+        if str(path).startswith(str(unit_dir)):
+            raise PermissionError(13, 'Permission denied', str(path))
+        return open(path, *args, **kwargs)
+
+    monkeypatch.setattr(fw, 'open', refusing_open, raising=False)
+    rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
+                            unit_dir=str(unit_dir), systemctl=ok_systemctl, executable='/bin/fw')
+    assert rc == 1 and not os.path.exists(fw.DEFAULT_CONFIG_PATH) and os.listdir(str(unit_dir)) == []
+    err = capsys.readouterr().err
+    assert 'Removed %s' % fw.DEFAULT_CONFIG_PATH in err and 'Traceback' not in err
 
 
 def test_seed_skips_missing_pattern_file(tmp_path):
