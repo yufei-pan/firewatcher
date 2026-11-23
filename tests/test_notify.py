@@ -399,6 +399,35 @@ def test_llm_without_notify_writes_report_only(tmp_path, monkeypatch):
     assert 'stored only' in path.read_text()
 
 
+def test_a_model_reply_with_a_lone_surrogate_is_still_written_and_judged(tmp_path, monkeypatch):
+    # JSON can spell a surrogate that is no character ("\\ud800"). The strict UTF-8 write of the note raised, so the
+    # capture got "LLM analysis failed" instead, and the push went out with the generated title, not the verdict.
+    pushes = []
+    silence_syslog(monkeypatch)
+    payload = json.dumps({'title': 'Noted', 'summary': 'bad \ud800 reply', 'notify': True})
+
+    def urlopen(req, timeout=None):
+        if req.full_url.endswith('/chat/completions'):
+            return chat(payload)
+        pushes.append(req)
+        return Body(b'ok')
+
+    monkeypatch.setattr(fw, '_open_url', urlopen)
+    resolved = settings_from(
+        tmp_path,
+        '[llm]\nenabled = true\nbase_url = http://llm.example/v1\nmodel = m\n'
+        '[notify]\nenabled = true\nntfy_url = https://ntfy.example/alerts\n',
+    )
+    path = tmp_path / 'cap.log'
+    path.write_text('HIT\n')
+    dispatcher = fw.IncidentDispatcher(resolved, start_thread=True)
+    dispatcher.submit(incident(path))
+    dispatcher.close()
+    text = path.read_text(encoding='utf-8')
+    assert 'bad \ufffd reply' in text and 'LLM analysis failed' not in text
+    assert len(pushes) == 1 and pushes[0].get_header('Title') == 'Noted'
+
+
 def test_always_notify_overrides_the_models_no(tmp_path, monkeypatch):
     calls = []
     records = silence_syslog(monkeypatch)

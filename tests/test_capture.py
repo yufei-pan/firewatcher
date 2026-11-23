@@ -1140,7 +1140,7 @@ def test_compression_at_startup_already_keeps_to_the_floor(tmp_path, monkeypatch
 
 def test_purge_is_sized_for_what_the_caller_needs(tmp_path, monkeypatch):
     journal_records(monkeypatch)
-    monkeypatch.setattr(fw.os, 'sync', lambda: None)
+    monkeypatch.setattr(fw, '_syncfs', lambda path: None)
     out = tmp_path / 'out'
     months(out, **{'2019-01': 30_000, '2019-02': 2_000_000, '2019-03': 2_000_000})
     disk = FakeDisk(monkeypatch, out, 100_000_000)
@@ -1261,7 +1261,7 @@ def test_a_hard_linked_month_counts_as_freeing_nothing(tmp_path, monkeypatch):
 
 def test_purge_interval_is_a_setting(tmp_path, monkeypatch):
     journal_records(monkeypatch)
-    monkeypatch.setattr(fw.os, 'sync', lambda: None)
+    monkeypatch.setattr(fw, '_syncfs', lambda path: None)
     clock = Clock(time.time())
     monkeypatch.setattr(fw.time, 'time', clock.time)
     out = tmp_path / 'out'

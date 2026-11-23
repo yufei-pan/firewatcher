@@ -126,6 +126,17 @@ def test_load_patterns_unreadable_file(tmp_path, capsys):
         assert 'Error reading pattern file' in capsys.readouterr().out
 
 
+def test_a_pattern_file_that_is_not_utf8_is_skipped_with_a_message(tmp_path, capsys):
+    # 1.69 as built loaded it with U+FFFD for the bad byte, a pattern that matches nothing, and said nothing
+    bad = tmp_path / 'bad.txt'
+    bad.write_bytes(b'panic\ncaf\xe9\n')
+    good = tmp_path / 'good.txt'
+    good.write_text('oops\n', encoding='utf-8')
+    assert fw.load_patterns([str(bad), str(good)]) == {'fnmatch': {'*oops*'}}
+    out = capsys.readouterr().out
+    assert 'Error reading pattern file: %s' % bad in out and 'utf-8' in out
+
+
 def test_expand_pattern_sources_empty_list():
     assert fw.expand_pattern_sources([]) == []
 

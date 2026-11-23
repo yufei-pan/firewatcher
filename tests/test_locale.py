@@ -139,4 +139,47 @@ def test_text_firewatcher_logs_or_sends_spells_escaped_bytes_as_utf8(tmp_path, m
     fw.call_llm(settings, incident)
     assert 'Capture path: %s\n' % (tmp_path / 'café.log') in json.loads(requests[0])['messages'][1]['content']
     # a lone surrogate that is no escaped byte, as a JSON reply can spell one
-    assert fw._as_utf8('a\ud800b').encode('utf-8')
+    assert fw._as_utf8('a\ud800b') == 'a\ufffdb'
+
+
+def test_a_lone_surrogate_that_is_no_escaped_byte_does_not_turn_the_escaped_bytes_next_to_it_into_question_marks():
+    # surrogateescape maps only U+DC80 to U+DCFF: other surrogates become U+FFFD first, so the bytes that
+    # are escaped UTF-8 still spell their text ('?? caf? ?' before)
+    assert fw._as_utf8('\udcc3\udca9 caf\udce9 \ud800') == '\u00e9 caf\ufffd \ufffd'
+    assert fw._as_utf8('\udc7f \udd00 \udfff') == '\ufffd \ufffd \ufffd'
+    assert fw._as_utf8('caf\u00e9 \U0001f600') == 'caf\u00e9 \U0001f600'
+
+
+def test_print_with_several_arguments_writes_them_once_when_a_later_one_cannot_be_encoded():
+    # the earlier arguments had been written when the later one raised, and were written again by the fallback
+    stream = io.TextIOWrapper(io.BytesIO(), encoding='ascii')
+    fw.print('Matched line:', 'HIT café', 3, file=stream)
+    fw.print('a', 'b', 'café', sep='-', end='!\n', file=stream)
+    fw.print('plain', 'text', file=stream)
+    stream.seek(0)
+    assert stream.read() == 'Matched line: HIT caf\\xe9 3\na-b-caf\\xe9!\nplain text\n'
+
+
+def test_an_appended_note_holds_what_the_model_wrote_however_it_spelled_it(tmp_path):
+    capture = tmp_path / 'cap.log'
+    capture.write_text('HIT\n')
+    fw._append_note(str(capture), 'LLM analysis\nsummary:\nbad \ud800 reply, caf\udcc3\udca9')
+    assert capture.read_text(encoding='utf-8') == 'HIT\n\nfirewatcher-self LLM analysis\nfirewatcher-self summary:\nfirewatcher-self bad \ufffd reply, café\n'
+
+
+def test_print_unit_writes_utf8_bytes_whatever_the_locale(tmp_path):
+    # piped into a unit file it held backslash escapes in place of the path (1.69 as built); 1.68 stopped
+    folder = tmp_path / 'café'
+    rc, output = run_in_ascii_locale('--print-unit', '--requires-mounts-for', folder, tmp_path / 'p.txt')
+    assert rc == 0 and 'Traceback' not in output
+    assert 'RequiresMountsFor=%s\n' % folder in output
+
+
+def test_print_unit_refuses_what_an_install_would_refuse(tmp_path, capsys):
+    # a folder that is not UTF-8, in the ExecStart of a unit for an existing config: the install exits 2 with this
+    # message; --print-unit printed the unit with escapes before
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('')
+    assert fw.main(['--print-unit', '--config', str(conf), '-o', os.fsdecode(b'/tmp/caf\xe9'), 'p.txt']) == 2
+    captured = capsys.readouterr()
+    assert captured.out == '' and 'not UTF-8' in captured.err

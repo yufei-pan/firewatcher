@@ -69,6 +69,11 @@ BACKLOG_LAG = 2
 # Longest a journalctl run at start may take (the probe, and reading the saved second) before it counts as hung:
 # reading one second of a 4 GB journal took 0.08 s on a test host.
 JOURNAL_PROBE_TIMEOUT = 30
+# journalctl seeks and orders by the time journald stored a line, but shows the time it was sent: a line shown as the
+# second before the saved one can come first, and one shown as the saved second can come after one shown as the next.
+# The saved second's lines are collected until one this many seconds away. 30: the largest gap seen between sending and
+# storing was 15.7 s (one journald stall in 14 days of a 1.7 million entry journal), so 30 covers it about twice.
+JOURNAL_STAMP_SKEW = 30
 # journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
 _ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
 DEFAULT_UNIT_NAME = 'firewatcher'
@@ -549,6 +554,10 @@ def print(*args, **kwargs):
 	'''Print with flush=True by default. Text the stream cannot encode, such as a non-ASCII log line on Python 3.6
 	under a C locale (stdout is ASCII there), is printed with backslash escapes instead of stopping firewatcher.'''
 	kwargs.setdefault('flush', True)
+	if len(args) > 1:
+		# One text, so one that cannot be encoded does not leave the earlier arguments written twice.
+		sep = kwargs.pop('sep', None)
+		args = ((' ' if sep is None else sep).join(map(str, args)),)
 	try:
 		return builtins.print(*args, **kwargs)
 	except UnicodeEncodeError:
@@ -583,8 +592,8 @@ def load_patterns(pattern_files):
 			print(f"Pattern file not found: {pattern_file}")
 			continue
 		try:
-			# UTF-8 whatever the locale, as the log lines are read.
-			with open(pattern_file, 'r', encoding='utf-8', errors='replace') as f:
+			# UTF-8 whatever the locale, as the log lines are read. Bytes that are not UTF-8 refuse the file.
+			with open(pattern_file, 'r', encoding='utf-8') as f:
 				# Lines starting with # are comments.
 				patterns = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
 		except Exception as e:
@@ -933,10 +942,13 @@ def _mount_paths(paths):
 			raise ConfigError('--requires-mounts-for cannot take a path with a newline or carriage return, '
 							  'which systemd cannot read back from a unit file: %r' % os.fsdecode(raw))
 		try:
-			result.append(raw.decode('utf-8'))
+			raw.decode('utf-8')
 		except UnicodeError:
 			raise ConfigError('--requires-mounts-for cannot take a path that is not UTF-8, which systemd '
 							  'rejects: %r' % os.fsdecode(raw))
+		# As the text Python holds every other path in (escaped bytes under a C locale): _strict_utf8 turns the
+		# unit's text into UTF-8 as a whole, and refuses a mix of that text and real characters.
+		result.append(os.fsdecode(raw))
 	return result
 
 
@@ -1197,14 +1209,16 @@ def _fs_path(text):
 	return os.fsdecode(text.encode('utf-8'))
 
 
+# The surrogates surrogateescape does not use: it maps only U+DC80 to U+DCFF, the bytes 0x80 to 0xFF.
+_NOT_AN_ESCAPED_BYTE_RE = re.compile('[\ud800-\udc7f\udd00-\udfff]')
+
+
 def _as_utf8(text):
 	"""text that can be logged or sent as UTF-8: escaped bytes (in a path on Python 3.6 under a C locale, or in one that
-	is not UTF-8) become the text they spell, or U+FFFD where they are not UTF-8."""
-	text = str(text)
-	try:
-		return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
-	except UnicodeEncodeError:  # a lone surrogate that is no escaped byte, such as one a JSON reply spelled out
-		return text.encode('utf-8', 'replace').decode('utf-8')
+	is not UTF-8) become the text they spell, or U+FFFD where they are not UTF-8; so does any other lone surrogate,
+	such as one a JSON reply spelled out."""
+	text = _NOT_AN_ESCAPED_BYTE_RE.sub('\ufffd', str(text))
+	return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
 
 
 def write_config_file(path, text):
@@ -1215,9 +1229,15 @@ def write_config_file(path, text):
 	payload = text.encode('utf-8')
 	fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 	try:
-		os.write(fd, payload)
-	finally:
-		os.close(fd)
+		with os.fdopen(fd, 'wb') as fh:
+			fh.write(payload)
+	except BaseException:
+		# A partial config would be taken for the operator's own by the next install.
+		try:
+			os.remove(path)
+		except OSError:
+			pass
+		raise
 
 
 def _explicit_cli_args(raw):
@@ -1555,7 +1575,7 @@ def post_event(url, token, payload, timeout):
 
 
 def _append_note(path, text):
-	rows = str(text).splitlines() or ['']
+	rows = _as_utf8(text).splitlines() or ['']
 	with open(path, 'a', encoding='utf-8') as handle:
 		handle.write('\n')
 		for row in rows:
@@ -2581,9 +2601,14 @@ def _warn_no_systemd(action):
 
 
 def _run_systemctl(systemctl, *cmd):
-	if systemctl is None:
-		return subprocess.run(['systemctl', *cmd])
-	return systemctl(*cmd)
+	"""Run systemctl. One that cannot be run (not installed, not executable) is a message and exit status 1, as one that fails."""
+	try:
+		if systemctl is None:
+			return subprocess.run(['systemctl', *cmd])
+		return systemctl(*cmd)
+	except OSError as exc:
+		print('cannot run systemctl: %s' % exc, file=sys.stderr)
+		return subprocess.CompletedProcess(['systemctl', *cmd], 1)
 
 
 def _looks_like_pattern_dir(path):
@@ -2651,23 +2676,50 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		print(f"Warning: with an existing config, --ntfy-url goes on the unit's ExecStart, where any user can read it "
 			  f"(systemctl cat, ps). Set notify.ntfy_url in {resolved.config_path} instead.", file=sys.stderr)
 
+	unit_path = os.path.join(unit_dir, unit_name)
+	# What a failed step puts back or takes away: the unit this run replaced (its text), whether that unit was enabled
+	# before this run enabled it, and whether systemd has loaded the new text.
+	old_unit = None
+	was_enabled = False
+	loaded = False
+
 	def failed(message, returncode, enabled=False):
 		print(message, file=sys.stderr)
 		# So the same command, run again, installs from scratch: a config left here would make it put the
-		# command-line flags, the ntfy URL among them, on the unit's ExecStart, which any user can read.
-		# A config or unit that was there before this run stays.
+		# command-line flags, the ntfy URL among them, on the unit's ExecStart, which any user can read. What was
+		# there before this run stays as it was.
+		if enabled and not was_enabled:
+			# enable --now can fail at the start after it enabled the unit. Before the files go: systemd 219 refuses
+			# to disable a unit whose file is gone.
+			disable = _run_systemctl(systemctl, 'disable', '--', unit_name)
+			if getattr(disable, 'returncode', 0):
+				print(f"systemctl disable failed (exit {disable.returncode})", file=sys.stderr)
 		for path in created:
-			os.remove(path)
-			print(f"Removed {path}, which this install created", file=sys.stderr)
-		if enabled and unit_path in created:
-			# enable --now can fail at the start after it enabled the unit; disable works without the unit file.
-			_run_systemctl(systemctl, 'disable', '--', unit_name)
+			try:
+				os.remove(path)
+			except OSError as exc:
+				print(f"cannot remove {path}: {exc}", file=sys.stderr)
+			else:
+				print(f"Removed {path}, which this install created", file=sys.stderr)
+		if old_unit is not None:
+			try:
+				with open(unit_path, 'wb') as fh:
+					fh.write(old_unit)
+			except OSError as exc:
+				print(f"cannot put back {unit_path}: {exc}", file=sys.stderr)
+			else:
+				print(f"Put back {unit_path} as it was", file=sys.stderr)
+		if loaded:
+			# else a restart would start the new text systemd loaded, which names a config that is gone
+			_run_systemctl(systemctl, 'daemon-reload')
 		return returncode
 
-	unit_path = os.path.join(unit_dir, unit_name)
 	try:
 		os.makedirs(unit_dir, exist_ok=True)
 		existed = os.path.lexists(unit_path)
+		if os.path.isfile(unit_path):
+			with open(unit_path, 'rb') as fh:
+				old_unit = fh.read()
 		with open(unit_path, 'w', encoding='utf-8') as fh:
 			if not existed:
 				created.append(unit_path)
@@ -2678,8 +2730,11 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	reload = _run_systemctl(systemctl, 'daemon-reload')
 	if getattr(reload, 'returncode', 0):
 		return failed(f"systemctl daemon-reload failed (exit {reload.returncode})", reload.returncode)
+	loaded = True
 	if resolved.no_enable:
 		return 0
+	if existed:
+		was_enabled = getattr(_run_systemctl(systemctl, 'is-enabled', '--quiet', '--', unit_name), 'returncode', 0) == 0
 	# '--': a name starting with '-' is a name, not an option.
 	enable = _run_systemctl(systemctl, 'enable', '--now', '--', unit_name)
 	if getattr(enable, 'returncode', 0):
@@ -3007,7 +3062,7 @@ def _journal_can_resume(journalctl):
 def _journal_second(command, second):
 	"""The digests of the journal lines stamped in that second, in their order, read with command (journalctl
 	-o short-iso) without --follow, from that second on; None when journalctl fails or takes longer than
-	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line of another second."""
+	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line more than JOURNAL_STAMP_SKEW seconds from it."""
 	command = [part for part in command if part != '--follow' and not part.startswith('--since=')]
 	try:
 		proc = subprocess.Popen(command + ['--since=@%d' % second], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -3025,9 +3080,10 @@ def _journal_second(command, second):
 			stamp = _iso_stamp(line)
 			if stamp is None:
 				continue
-			if stamp[0] != second:
+			if stamp[0] == second:
+				digests.append(_line_digest(line, stamp[1]))
+			elif abs(stamp[0] - second) > JOURNAL_STAMP_SKEW:
 				break
-			digests.append(_line_digest(line, stamp[1]))
 		else:
 			second_ended = False
 	finally:
@@ -3124,7 +3180,16 @@ def main(argv=None):
 	for row in userinfo_warnings(resolved):
 		print(row, file=sys.stderr)
 	if args.print_unit:
-		print(render_unit_file(resolved, raw=args), end='')
+		# The text --install-service would write, as the UTF-8 bytes it would write whatever the locale: a unit piped
+		# into a file is read as UTF-8, and stdout may not be.
+		try:
+			unit = _strict_utf8(render_unit_file(resolved, raw=args))
+		except ConfigError as exc:
+			print(str(exc), file=sys.stderr)
+			return 2
+		sys.stdout.flush()
+		sys.stdout.buffer.write(unit.encode('utf-8'))
+		sys.stdout.buffer.flush()
 		return 0
 	if args.install_service:
 		return install_service(resolved, raw=args)

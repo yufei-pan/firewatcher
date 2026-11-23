@@ -1,3 +1,4 @@
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -50,6 +51,19 @@ def systemctl_recorder(calls, returncode=0):
         R.returncode = returncode if not callable(returncode) else returncode(cmd)
         return R()
     return fake
+
+
+@contextlib.contextmanager
+def file_size_limit(size):
+    """A disk that fills: a file that grows past size bytes gets its first size bytes, then OSError EFBIG (Python
+    ignores the SIGXFSZ the kernel sends). Keep the block short: whatever the process writes meanwhile is limited too."""
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (size, hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
 
 
 def use_journal(monkeypatch):

@@ -5,7 +5,7 @@ import shlex
 import pytest
 
 import firewatcher as fw
-from conftest import parse_cli, ok_systemctl, systemctl_recorder
+from conftest import file_size_limit, parse_cli, ok_systemctl, systemctl_recorder
 
 # --- systemd unit rendering ---
 
@@ -217,22 +217,52 @@ def test_install_service_no_enable_skips_enable(tmp_path):
     assert not any('enable' in cmd for cmd in calls)
 
 
+class Systemctl(object):
+    """A systemctl that records each call with whether the unit file and the config exist at that moment, and fails
+    the calls fails(cmd) names: with an exit status, or with the OSError a systemctl that cannot be run raises."""
+
+    def __init__(self, unit_path, fails=lambda cmd: 0):
+        self.unit_path, self.fails, self.calls = unit_path, fails, []
+
+    def __call__(self, *cmd):
+        self.calls.append((cmd, os.path.exists(self.unit_path), os.path.exists(fw.DEFAULT_CONFIG_PATH)))
+        outcome = self.fails(cmd)
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+        class Result:
+            returncode = outcome
+        return Result()
+
+    def verbs(self):
+        return [cmd[0] for cmd, _, _ in self.calls]
+
+
+def enabling(cmd):
+    return 'enable' in cmd
+
+
 @pytest.mark.parametrize('failing', ['daemon-reload', 'enable'])
-def test_a_failed_systemctl_step_removes_what_the_install_created(tmp_path, capsys, failing):
+def test_a_failed_systemctl_step_removes_the_config_and_unit_the_install_created(tmp_path, capsys, failing):
     # 1.68 left them, so the same command run again found the config and put the flags, the ntfy URL among them,
-    # on the unit's ExecStart, which any user can read
+    # on the unit's ExecStart, which any user can read. (The output folder and example patterns stay.)
     unit_dir = tmp_path / 'system'
     argv = ['--install-service', '--ntfy-url', 'https://ntfy.sh/private-topic', '-t', '120', str(tmp_path / 'p.d')]
-    calls = []
-    rc = fw.install_service(parse_cli(argv), systemd_available=True, unit_dir=str(unit_dir),
-                            systemctl=systemctl_recorder(calls, returncode=lambda cmd: 7 if failing in cmd else 0),
+    systemctl = Systemctl(str(unit_dir / 'firewatcher.service'), lambda cmd: 7 if failing in cmd else 0)
+    rc = fw.install_service(parse_cli(argv), systemd_available=True, unit_dir=str(unit_dir), systemctl=systemctl,
                             executable='/bin/fw')
     assert rc == 7
     assert not os.path.exists(fw.DEFAULT_CONFIG_PATH) and os.listdir(str(unit_dir)) == []
     err = capsys.readouterr().err
     assert 'failed (exit 7)' in err and 'Removed %s' % fw.DEFAULT_CONFIG_PATH in err
-    # enable --now may have enabled the unit before its start failed
-    assert (calls[-1] == ('disable', '--', 'firewatcher.service')) == (failing == 'enable')
+    if failing == 'daemon-reload':
+        assert systemctl.verbs() == ['daemon-reload']
+    else:
+        # enable --now may have enabled the unit before its start failed. disable comes while the unit file is
+        # still there (systemd 219 refuses once it is gone); the last reload drops the unit from systemd's memory.
+        assert systemctl.calls[-2:] == [(('disable', '--', 'firewatcher.service'), True, True),
+                                        (('daemon-reload',), False, False)]
+        assert systemctl.verbs() == ['daemon-reload', 'enable', 'disable', 'daemon-reload']
     # run again, it is a fresh install: the flags go into the new config, not on ExecStart
     assert fw.install_service(parse_cli(argv), systemd_available=True, unit_dir=str(unit_dir),
                               systemctl=ok_systemctl, executable='/bin/fw') == 0
@@ -242,22 +272,135 @@ def test_a_failed_systemctl_step_removes_what_the_install_created(tmp_path, caps
         assert 'private-topic' in config.read()
 
 
+OLD_UNIT = '[Service]\nExecStart=/bin/fw -t 60 --ntfy-url https://ntfy.sh/old /etc/old.d\n'
+
+
+@pytest.mark.parametrize('enabled_before', [False, True])
+def test_a_failed_enable_puts_back_the_unit_it_replaced_and_disables_only_what_it_enabled(tmp_path, capsys, enabled_before):
+    # A unit from before there was a config (1.55 to 1.57 wrote ExecStart with the flags). 1.69 as built removed
+    # the config it wrote and left the rewritten unit, which names it: `config file not found` at every start, and
+    # 1.68 had left the pair, which runs.
+    unit_dir = tmp_path / 'system'
+    unit_dir.mkdir()
+    unit_path = unit_dir / 'firewatcher.service'
+    unit_path.write_text(OLD_UNIT)
+    systemctl = Systemctl(str(unit_path), lambda cmd: 3 if enabling(cmd) else (0 if enabled_before else 1) if 'is-enabled' in cmd else 0)
+    rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
+                            unit_dir=str(unit_dir), executable='/bin/fw', systemctl=systemctl)
+    assert rc == 3
+    assert unit_path.read_text() == OLD_UNIT and not os.path.exists(fw.DEFAULT_CONFIG_PATH)
+    err = capsys.readouterr().err
+    assert 'Removed %s' % fw.DEFAULT_CONFIG_PATH in err and 'Put back %s' % unit_path in err
+    # a unit that was enabled before stays enabled; one this run enabled is disabled again
+    expected = ['daemon-reload', 'is-enabled', 'enable'] + ([] if enabled_before else ['disable']) + ['daemon-reload']
+    assert systemctl.verbs() == expected
+    assert systemctl.calls[1][0] == ('is-enabled', '--quiet', '--', 'firewatcher.service')
+
+
 def test_a_failed_systemctl_step_keeps_a_config_and_unit_that_were_there(tmp_path, capsys):
     unit_dir = tmp_path / 'system'
     unit_dir.mkdir()
     (unit_dir / 'firewatcher.service').write_text('[Service]\n')
     with open(fw.DEFAULT_CONFIG_PATH, 'w') as config:
         config.write('[watch]\n')
-    calls = []
+    systemctl = Systemctl(str(unit_dir / 'firewatcher.service'), lambda cmd: 3 if enabling(cmd) else 0)
     rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
-                            unit_dir=str(unit_dir), executable='/bin/fw',
-                            systemctl=systemctl_recorder(calls, returncode=lambda cmd: 3 if 'enable' in cmd else 0))
+                            unit_dir=str(unit_dir), executable='/bin/fw', systemctl=systemctl)
     assert rc == 3
-    assert not any('disable' in cmd for cmd in calls)
+    assert 'disable' not in systemctl.verbs()
     with open(fw.DEFAULT_CONFIG_PATH) as config:
         assert config.read() == '[watch]\n'
-    assert (unit_dir / 'firewatcher.service').is_file()
+    assert (unit_dir / 'firewatcher.service').read_text() == '[Service]\n'
     assert 'Removed' not in capsys.readouterr().err
+
+
+def test_a_failed_disable_is_said_and_the_clean_up_goes_on(tmp_path, capsys):
+    unit_dir = tmp_path / 'system'
+    systemctl = Systemctl(str(unit_dir / 'firewatcher.service'), lambda cmd: 3 if enabling(cmd) else 5 if 'disable' in cmd else 0)
+    rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
+                            unit_dir=str(unit_dir), executable='/bin/fw', systemctl=systemctl)
+    assert rc == 3
+    assert not os.path.exists(fw.DEFAULT_CONFIG_PATH) and os.listdir(str(unit_dir)) == []
+    assert 'systemctl disable failed (exit 5)' in capsys.readouterr().err
+
+
+def test_a_file_that_cannot_be_removed_does_not_stop_the_clean_up(tmp_path, capsys, monkeypatch):
+    unit_dir = tmp_path / 'system'
+    real_remove = os.remove
+
+    def remove(path, *args, **kwargs):
+        if path == fw.DEFAULT_CONFIG_PATH:
+            raise PermissionError(errno.EPERM, 'Operation not permitted', path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(fw.os, 'remove', remove)
+    systemctl = Systemctl(str(unit_dir / 'firewatcher.service'), lambda cmd: 3 if enabling(cmd) else 0)
+    rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
+                            unit_dir=str(unit_dir), executable='/bin/fw', systemctl=systemctl)
+    assert rc == 3 and os.listdir(str(unit_dir)) == []
+    err = capsys.readouterr().err
+    assert 'cannot remove %s' % fw.DEFAULT_CONFIG_PATH in err and 'Traceback' not in err
+    assert systemctl.verbs()[-1] == 'daemon-reload'
+
+
+@pytest.mark.parametrize('cannot_run', ['daemon-reload', 'enable'])
+def test_a_systemctl_that_cannot_be_run_ends_the_install_like_one_that_fails(tmp_path, capsys, cannot_run):
+    # 1.69 as built: a traceback, with the config and unit left
+    unit_dir = tmp_path / 'system'
+    gone = FileNotFoundError(errno.ENOENT, 'No such file or directory', 'systemctl')
+    systemctl = Systemctl(str(unit_dir / 'firewatcher.service'), lambda cmd: gone if cannot_run in cmd or 'disable' in cmd else 0)
+    rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
+                            unit_dir=str(unit_dir), executable='/bin/fw', systemctl=systemctl)
+    assert rc == 1
+    assert not os.path.exists(fw.DEFAULT_CONFIG_PATH) and os.listdir(str(unit_dir)) == []
+    err = capsys.readouterr().err
+    assert 'cannot run systemctl' in err and 'Removed %s' % fw.DEFAULT_CONFIG_PATH in err and 'Traceback' not in err
+
+
+def test_a_systemctl_that_is_not_installed_is_an_exit_status_not_a_traceback(monkeypatch, capsys):
+    def missing(cmd, **kwargs):
+        raise FileNotFoundError(errno.ENOENT, 'No such file or directory', 'systemctl')
+
+    monkeypatch.setattr(fw.subprocess, 'run', missing)
+    assert fw._run_systemctl(None, 'daemon-reload').returncode == 1
+    assert 'cannot run systemctl' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_a_unit_that_fills_the_disk_leaves_no_half_written_unit(tmp_path, capsys, existing):
+    # a real partial write: the first bytes land, then EFBIG
+    unit_dir = tmp_path / 'system'
+    unit_dir.mkdir()
+    unit_path = unit_dir / 'firewatcher.service'
+    if existing:
+        unit_path.write_text(OLD_UNIT)
+    with open(fw.DEFAULT_CONFIG_PATH, 'w') as config:
+        config.write('[watch]\n')
+    patterns = tmp_path / 'p.txt'
+    patterns.write_text('HIT\n')
+    with file_size_limit(len(OLD_UNIT) + 10):
+        rc = fw.install_service(parse_cli(['--install-service', '--no-enable', str(patterns)]), systemd_available=True,
+                                unit_dir=str(unit_dir), executable='/bin/fw', systemctl=ok_systemctl)
+    assert rc == 1
+    assert (unit_path.read_text() == OLD_UNIT) if existing else os.listdir(str(unit_dir)) == []
+    assert 'cannot write unit' in capsys.readouterr().err
+
+
+def test_a_config_that_fills_the_disk_leaves_no_partial_config(tmp_path, capsys):
+    # 1.69 as built: one os.write, whose short count went unnoticed, and a partial file kept when it failed
+    path = tmp_path / 'etc' / 'firewatcher.conf'
+    with file_size_limit(100):
+        with pytest.raises(OSError) as raised:
+            fw.write_config_file(str(path), '[watch]\n' + 'x = %s\n' % ('y' * 500))
+    assert raised.value.errno == errno.EFBIG
+    assert not path.exists()
+    patterns = tmp_path / 'p.txt'
+    patterns.write_text('HIT\n')
+    with file_size_limit(100):
+        rc = fw.install_service(parse_cli(['--install-service', str(patterns)]), systemd_available=True,
+                                unit_dir=str(tmp_path / 'system'), executable='/bin/fw', systemctl=ok_systemctl)
+    assert rc == 1 and not os.path.exists(fw.DEFAULT_CONFIG_PATH)
+    assert 'cannot write config' in capsys.readouterr().err
 
 
 def test_a_unit_that_cannot_be_written_removes_the_new_config(tmp_path, capsys, monkeypatch):
