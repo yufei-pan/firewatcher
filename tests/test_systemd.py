@@ -1,3 +1,4 @@
+import errno
 import os
 import shlex
 
@@ -709,7 +710,12 @@ def test_requires_mounts_for_relative_path_with_the_current_directory_gone(monke
 def test_requires_mounts_for_relative_path_in_a_non_utf8_directory_is_refused(tmp_path, monkeypatch):
     # The current directory's bytes count too: the resolved path must be UTF-8 as a whole.
     odd = os.path.join(os.fsencode(str(tmp_path)), b'caf\xe9')
-    os.mkdir(odd)
+    try:
+        os.mkdir(odd)
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        pytest.skip('this filesystem refuses a name that is not UTF-8 (APFS on macOS)')
     monkeypatch.chdir(odd)
     with pytest.raises(fw.ConfigError) as err:
         fw.resolve_settings(parse_cli(['--print-unit', '--requires-mounts-for', 'logs', 'p.d']), environ={})
