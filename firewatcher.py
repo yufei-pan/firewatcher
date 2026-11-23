@@ -806,8 +806,8 @@ def _config_error_summary(exc):
 
 
 # The flags that set a setting, as (argparse dest, flag), in the order a unit's ExecStart repeats them. A boolean
-# False is --no-<flag>. An empty --log-file or -o means the default; any other empty value, such as --llm-notes '',
-# overrides the config.
+# False is --no-<flag>. An empty --log-file, -o or --tail-lines is not passed, as an empty value in the config is not
+# set; any other empty value, such as --llm-notes '', overrides the config.
 _SETTING_FLAGS = (
 	('log_file', '--log-file'), ('capture_time', '-t'), ('capture_time_max', '--capture-time-max'),
 	('output_folder', '-o'), ('fallback_folder', '--fallback-folder'), ('tail_lines', '--tail_lines'),
@@ -819,13 +819,15 @@ _SETTING_FLAGS = (
 	('llm_max_bytes', '--llm-max-bytes'), ('llm_notes', '--llm-notes'), ('notify', '--notify'),
 	('ntfy_url', '--ntfy-url'), ('ntfy_priority', '--ntfy-priority'), ('ntfy_timeout', '--ntfy-timeout'),
 )
+# Settings whose empty value means the default, in the config file and on the command line alike.
+_EMPTY_MEANS_DEFAULT = ('log_file', 'output_folder', 'tail_lines')
 
 
 def _setting_flags(args):
 	"""(Settings attribute, flag, value) for each setting flag in args that was passed."""
 	for dest, flag in _SETTING_FLAGS:
 		value = getattr(args, dest, None)
-		if value is not None and (value != '' or dest not in ('log_file', 'output_folder')):
+		if value is not None and (value != '' or dest not in _EMPTY_MEANS_DEFAULT):
 			yield {'llm': 'llm_enabled', 'notify': 'notify_enabled'}.get(dest, dest), flag, value
 
 
@@ -854,7 +856,7 @@ def resolve_settings(args, environ=None):
 	for key, value in file_values.items():
 		# An empty log_file, output_folder or tail_lines means the default. Any other empty value is kept: an
 		# empty fallback_folder means no fallback, and an empty position_file no resuming.
-		if value or key not in ('log_file', 'output_folder', 'tail_lines'):
+		if value or key not in _EMPTY_MEANS_DEFAULT:
 			setattr(settings, key, value)
 	if getattr(args, 'pattern_file', None):
 		settings.pattern_file = list(args.pattern_file)
