@@ -1,3 +1,4 @@
+import io
 import os
 import signal
 import subprocess
@@ -18,6 +19,13 @@ def test_print_unit_via_main(capsys):
     out = capsys.readouterr().out
     assert '[Service]' in out
     assert 'nebula' not in out.lower()
+
+
+def test_print_unit_into_a_stdout_that_takes_text_only(monkeypatch):
+    out = io.StringIO()
+    monkeypatch.setattr(sys, 'stdout', out)
+    assert fw.main(['--print-unit', '/etc/firewatcher/patterns.d']) == 0
+    assert '[Service]' in out.getvalue()
 
 
 def test_print_unit_defaults_pattern_dir(capsys):

@@ -3190,9 +3190,13 @@ def main(argv=None):
 		except ConfigError as exc:
 			print(str(exc), file=sys.stderr)
 			return 2
+		stream = getattr(sys.stdout, 'buffer', None)
+		if stream is None:  # a stdout that takes text only, such as a StringIO
+			print(unit, end='')
+			return 0
 		sys.stdout.flush()
-		sys.stdout.buffer.write(unit.encode('utf-8'))
-		sys.stdout.buffer.flush()
+		stream.write(unit.encode('utf-8'))
+		stream.flush()
 		return 0
 	if args.install_service:
 		return install_service(resolved, raw=args)
