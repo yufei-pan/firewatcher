@@ -219,7 +219,7 @@ def test_with_the_start_of_the_second_lost_identical_lines_are_read_again_never_
     jline(0, 'a'),  # the journal ends inside the saved second, before the saved line
     jline(5, 'HIT later'),  # its whole second went
     '',  # nothing at or after it: "-- No entries --"
-    jline(0, 'c') + jline(-100, 'b'),  # the clock set back after it: reading stops at the first line more than JOURNAL_STAMP_SKEW away
+    jline(0, 'c') + jline(-100, 'b'),  # a line shown far before the second is not the saved line, which is not in the second
 ])
 def test_a_journal_without_the_saved_line_replays_nothing(tmp_path, journal):
     position = located(tmp_path, 2, 'b', fake_journalctl(tmp_path, journal))
@@ -334,20 +334,31 @@ def test_a_stalled_head_that_never_ends_is_bounded_by_the_probe_timeout(tmp_path
     assert position.replaying and position.saved[1] == 3
 
 
-def test_a_journal_that_runs_on_far_from_the_saved_second_is_read_no_further(tmp_path):
-    # the clock set back after it: a second more than JOURNAL_STAMP_SKEW away is another stretch of the journal
+def test_a_journal_that_runs_on_far_after_the_saved_second_is_read_no_further(tmp_path):
+    # a line shown more than JOURNAL_STAMP_SKEW after the saved second: the second is over (journald stored it after
+    # lines it showed as the saved second only within the gap between sending and storing), so what follows is not read
     skew = fw.JOURNAL_STAMP_SKEW
-    for far in (skew + 1, -skew - 1):
-        folder = tmp_path / ('far%d' % far)
-        folder.mkdir()
-        journal = jline(0, 'c') + jline(far, 'b') + jline(0, 'b')
-        assert not located(folder, 1, 'b', fake_journalctl(folder, journal)).replaying
+    far = tmp_path / 'far'
+    far.mkdir()
+    assert not located(far, 1, 'b', fake_journalctl(far, jline(0, 'c') + jline(skew + 1, 'x') + jline(0, 'b'))).replaying
     # and one at that distance or less is read past: 16 s is the largest gap between sending and storing seen
     # outside a stall of the host (15.7 s on the host it was measured on)
     for near_by in (16, skew):
         near = tmp_path / ('near%d' % near_by)
         near.mkdir()
         assert located(near, 1, 'b', fake_journalctl(near, jline(0, 'c') + jline(near_by, 'x') + jline(0, 'b'))).replaying
+
+
+def test_lines_shown_far_before_the_saved_second_are_read_past_wherever_a_stall_stored_them(tmp_path):
+    # the stalls of a real journal (370 and 458 s): runs of lines shown as the second, with lines shown 277 to 458 s
+    # earlier stored between the runs. The saved c came after the first far line; the replay ends at it, as 1.68's did.
+    # A read that stopped at a far earlier line after a line of the second matched the whole window again for 312 of
+    # the 7,597 lines of the seconds of those stalls, where 1.68 was exact
+    lines = [stored(5, jline(0, 'a')), stored(5, jline(-442, 'Q')), stored(5, jline(0, 'b')), stored(5, jline(-441, 'R')),
+             stored(5, jline(0, 'c')), stored(5, jline(1, 'd'))]
+    position = located(tmp_path, 1, 'c', fake_journalctl(tmp_path, ''.join(lines)))
+    assert position.replaying and position.saved[1] == 1 and 'no longer holds' not in position.note
+    assert replay(position, [line.partition(' ')[2] for line in lines]) == ['old', 'old', 'old', 'old', 'old', 'new']
 
 
 def test_when_journalctl_cannot_tell_the_replay_goes_by_the_saved_number(tmp_path, monkeypatch):
