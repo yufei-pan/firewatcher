@@ -159,7 +159,8 @@ def _fsync_path(path):
 def _syncfs(path):
 	"""Write the filesystem path is on, and no other: syncfs(2), through ctypes (Python has no os.syncfs). os.sync
 	writes every filesystem on the host, and waits for a hung NFS share. Without libc, without syncfs in it (macOS),
-	or on an error, nothing is synced."""
+	or on an error, nothing is synced. macOS needs none: on APFS the space freed by deleting 200 MB (100 files, or one)
+	showed in statvfs at once, with and without a sync (macOS 26.6, 2026-11-23: 10 deletions, 6 without a sync)."""
 	try:
 		import ctypes
 		libc = ctypes.CDLL(None, use_errno=True)
