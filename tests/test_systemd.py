@@ -223,13 +223,16 @@ def test_a_failed_systemctl_step_removes_what_the_install_created(tmp_path, caps
     # on the unit's ExecStart, which any user can read
     unit_dir = tmp_path / 'system'
     argv = ['--install-service', '--ntfy-url', 'https://ntfy.sh/private-topic', '-t', '120', str(tmp_path / 'p.d')]
+    calls = []
     rc = fw.install_service(parse_cli(argv), systemd_available=True, unit_dir=str(unit_dir),
-                            systemctl=systemctl_recorder([], returncode=lambda cmd: 7 if failing in cmd else 0),
+                            systemctl=systemctl_recorder(calls, returncode=lambda cmd: 7 if failing in cmd else 0),
                             executable='/bin/fw')
     assert rc == 7
     assert not os.path.exists(fw.DEFAULT_CONFIG_PATH) and os.listdir(str(unit_dir)) == []
     err = capsys.readouterr().err
     assert 'failed (exit 7)' in err and 'Removed %s' % fw.DEFAULT_CONFIG_PATH in err
+    # enable --now may have enabled the unit before its start failed
+    assert (calls[-1] == ('disable', '--', 'firewatcher.service')) == (failing == 'enable')
     # run again, it is a fresh install: the flags go into the new config, not on ExecStart
     assert fw.install_service(parse_cli(argv), systemd_available=True, unit_dir=str(unit_dir),
                               systemctl=ok_systemctl, executable='/bin/fw') == 0
@@ -245,9 +248,12 @@ def test_a_failed_systemctl_step_keeps_a_config_and_unit_that_were_there(tmp_pat
     (unit_dir / 'firewatcher.service').write_text('[Service]\n')
     with open(fw.DEFAULT_CONFIG_PATH, 'w') as config:
         config.write('[watch]\n')
+    calls = []
     rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
-                            unit_dir=str(unit_dir), systemctl=systemctl_recorder([], returncode=3), executable='/bin/fw')
+                            unit_dir=str(unit_dir), executable='/bin/fw',
+                            systemctl=systemctl_recorder(calls, returncode=lambda cmd: 3 if 'enable' in cmd else 0))
     assert rc == 3
+    assert not any('disable' in cmd for cmd in calls)
     with open(fw.DEFAULT_CONFIG_PATH) as config:
         assert config.read() == '[watch]\n'
     assert (unit_dir / 'firewatcher.service').is_file()

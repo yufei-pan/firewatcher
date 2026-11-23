@@ -2651,7 +2651,7 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		print(f"Warning: with an existing config, --ntfy-url goes on the unit's ExecStart, where any user can read it "
 			  f"(systemctl cat, ps). Set notify.ntfy_url in {resolved.config_path} instead.", file=sys.stderr)
 
-	def failed(message, returncode):
+	def failed(message, returncode, enabled=False):
 		print(message, file=sys.stderr)
 		# So the same command, run again, installs from scratch: a config left here would make it put the
 		# command-line flags, the ntfy URL among them, on the unit's ExecStart, which any user can read.
@@ -2659,6 +2659,9 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 		for path in created:
 			os.remove(path)
 			print(f"Removed {path}, which this install created", file=sys.stderr)
+		if enabled and unit_path in created:
+			# enable --now can fail at the start after it enabled the unit; disable works without the unit file.
+			_run_systemctl(systemctl, 'disable', '--', unit_name)
 		return returncode
 
 	unit_path = os.path.join(unit_dir, unit_name)
@@ -2680,7 +2683,7 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	# '--': a name starting with '-' is a name, not an option.
 	enable = _run_systemctl(systemctl, 'enable', '--now', '--', unit_name)
 	if getattr(enable, 'returncode', 0):
-		return failed(f"systemctl enable --now failed (exit {enable.returncode})", enable.returncode)
+		return failed(f"systemctl enable --now failed (exit {enable.returncode})", enable.returncode, enabled=True)
 	print(f"Enabled and started {unit_name}")
 	return 0
 
