@@ -51,7 +51,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A restart that read past a long stall says the journal no longer holds the last line
 - Kind: deferred
-- What the operator sees: when journald stored a line shown more than 30 seconds (JOURNAL_STAMP_SKEW) away before the saved line (a stall of the host longer than any gap seen outside two stalls of 370 and 458 s), `locate` stops reading there, does not reach the saved line, and the note says "The journal no longer holds the last line read", though it does. Every line from `--capture-time` before the saved second is matched again, a second capture and push of the last incident, never a skip.
+- What the operator sees: when journald stored a line shown more than 30 seconds (JOURNAL_STAMP_SKEW) away before the saved line (a stall of journald or the host longer than 30 s: the journal this was measured on had two, of 370 and 458 s, in 34.7 days), `locate` stops reading there, does not reach the saved line, and the note says "The journal no longer holds the last line read", though it does. Every line from `--capture-time` before the saved second is matched again, a second capture and push of the last incident, never a skip.
 - Why: `_journal_second` returns only the lines it collected, so `locate` cannot tell a stop at a far line from the end of the journal.
 - Plan (1.70): `_journal_second` says that it stopped at a far line, and `locate` writes a note of its own ("stopped reading at a line N seconds from the saved second; matching every line from ...").
 - Revisit when: 1.70.

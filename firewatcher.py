@@ -2964,7 +2964,10 @@ class JournalPosition(object):
 			datetime.datetime.fromtimestamp(saved_time).isoformat(), datetime.datetime.fromtimestamp(self.since).isoformat())
 
 	def replay_time(self, line):
-		"""While replaying: the time of a line from before the saved position, for the context. None from the first line after it."""
+		"""While replaying: the time of a line from before the saved position, for the context. None from the first line
+		after the saved one, or from the first line shown as a later second than it: journalctl orders lines by the time
+		journald stored them, so that line can come before the saved one, and the lines read before the stop then match
+		again (a second capture, never a skip)."""
 		stamp = _iso_stamp(line)
 		if stamp is None:
 			# A continuation of the line before, or a journalctl note such as "-- Boot ... --".
