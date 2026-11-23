@@ -218,14 +218,20 @@ def test_install_service_no_enable_skips_enable(tmp_path):
 
 
 class Systemctl(object):
-    """A systemctl that records each call with whether the unit file and the config exist at that moment, and fails
-    the calls fails(cmd) names: with an exit status, or with the OSError a systemctl that cannot be run raises."""
+    """A systemctl that records each call with whether the unit file and the config exist at that moment (and, in
+    texts, the unit file's text then, None when it is not there), and fails the calls fails(cmd) names: with an exit
+    status, or with the OSError a systemctl that cannot be run raises."""
 
     def __init__(self, unit_path, fails=lambda cmd: 0):
-        self.unit_path, self.fails, self.calls = unit_path, fails, []
+        self.unit_path, self.fails, self.calls, self.texts = unit_path, fails, [], []
 
     def __call__(self, *cmd):
         self.calls.append((cmd, os.path.exists(self.unit_path), os.path.exists(fw.DEFAULT_CONFIG_PATH)))
+        try:
+            with open(self.unit_path) as unit:
+                self.texts.append(unit.read())
+        except OSError:
+            self.texts.append(None)
         outcome = self.fails(cmd)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -295,6 +301,24 @@ def test_a_failed_enable_puts_back_the_unit_it_replaced_and_disables_only_what_i
     expected = ['daemon-reload', 'is-enabled', 'enable'] + ([] if enabled_before else ['disable']) + ['daemon-reload']
     assert systemctl.verbs() == expected
     assert systemctl.calls[1][0] == ('is-enabled', '--quiet', '--', 'firewatcher.service')
+    # systemd loaded the new text first; the last reload comes after the old one is back, and loads it again
+    assert systemctl.texts[0] != OLD_UNIT and systemctl.texts[-1] == OLD_UNIT
+
+
+def test_a_failed_daemon_reload_puts_back_the_unit_it_replaced(tmp_path, capsys):
+    # the reload failed, so systemd never loaded the new text: the old one goes back on disk, and nothing is reloaded
+    unit_dir = tmp_path / 'system'
+    unit_dir.mkdir()
+    unit_path = unit_dir / 'firewatcher.service'
+    unit_path.write_text(OLD_UNIT)
+    systemctl = Systemctl(str(unit_path), lambda cmd: 3 if 'daemon-reload' in cmd else 0)
+    rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
+                            unit_dir=str(unit_dir), executable='/bin/fw', systemctl=systemctl)
+    assert rc == 3
+    assert unit_path.read_text() == OLD_UNIT and not os.path.exists(fw.DEFAULT_CONFIG_PATH)
+    assert systemctl.verbs() == ['daemon-reload']
+    err = capsys.readouterr().err
+    assert 'failed (exit 3)' in err and 'Removed %s' % fw.DEFAULT_CONFIG_PATH in err and 'Put back %s' % unit_path in err
 
 
 def test_a_failed_systemctl_step_keeps_a_config_and_unit_that_were_there(tmp_path, capsys):

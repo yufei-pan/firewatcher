@@ -745,6 +745,11 @@ def test_a_purge_syncs_only_the_filesystem_it_purged(tmp_path, monkeypatch):
 
 def test_syncfs_syncs_the_filesystem_of_the_path_and_never_raises(tmp_path, monkeypatch):
     import ctypes
+
+    def every_filesystem():
+        raise AssertionError('synced every filesystem')
+
+    monkeypatch.setattr(fw.os, 'sync', every_filesystem)
     fw._syncfs(str(tmp_path))  # the real call, where libc has syncfs
     synced = []
 

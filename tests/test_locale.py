@@ -170,7 +170,9 @@ def test_an_appended_note_holds_what_the_model_wrote_however_it_spelled_it(tmp_p
 def test_print_unit_writes_utf8_bytes_whatever_the_locale(tmp_path):
     # piped into a unit file it held backslash escapes in place of the path (1.69 as built); 1.68 stopped
     folder = tmp_path / 'café'
-    rc, output = run_in_ascii_locale('--print-unit', '--requires-mounts-for', folder, tmp_path / 'p.txt')
+    conf = tmp_path / 'fw.conf'
+    conf.write_text('')  # the child reads no config of this host
+    rc, output = run_in_ascii_locale('--print-unit', '--config', conf, '--requires-mounts-for', folder, tmp_path / 'p.txt')
     assert rc == 0 and 'Traceback' not in output
     assert 'RequiresMountsFor=%s\n' % folder in output
 
