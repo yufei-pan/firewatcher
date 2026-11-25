@@ -2184,7 +2184,7 @@ def _end_capture(capture, captured_line_counter, capture_line_count_max, inciden
 		try:
 			capture.close()
 		finally:
-			# Even when a shutdown signal lands in the trailer or the closing fsync, the incident is still handed over.
+			# Even when the trailer or the closing fsync raises, the incident is still handed over.
 			if dispatcher is not None and incident is not None:
 				job = dict(incident)
 				job['path'] = capture.path if capture.saved else None
@@ -2353,7 +2353,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					if matched_pattern is not None:
 						opened = capture is None
 						if opened:
-							# Before the capture exists, so an interrupt in between cannot hand over the previous incident.
+							# Before the capture exists, so an exception in between cannot hand over the previous incident.
 							incident = {
 								'pattern': matched_pattern,
 								'matched_line': line.strip(),
