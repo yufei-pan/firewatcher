@@ -45,7 +45,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: when the journal lost the saved line (as a volatile journal does at a reboot), a restart
   reads from `--capture-time` (300 s by default) before the saved line; lines logged while firewatcher was stopped
   and stamped earlier than that are not read. That needs the clock set back by more than `--capture-time` while
-  firewatcher was stopped, and firewatcher started once the clock is within a minute of the saved line again: most
+  firewatcher was stopped, and firewatcher started with the clock no more than a minute behind the saved line: most
   often a boot whose hardware clock was that far behind and was corrected before firewatcher started; a clock set
   back by hand does it too (shown without a reboot on systemd 219 to 257, 2026-11-25). Started while the clock is
   still more than a minute behind the saved line, firewatcher takes the position for one from the future and reads
@@ -65,8 +65,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   when the main thread next wakes: at the next log line, or with a capture open at its next sync or position save, at
   the latest the end of its `--capture-time` window. The kernel hands a process's signal to any of its threads, and
   one taken by another thread (the log reader, the notifier, a compression run) wakes none of the main thread's
-  waits. Seen once in about 1,000 stops in tests (systemd 252 under load, 2026-11-25). `systemctl stop` signals
-  journalctl too, whose end wakes firewatcher. Since 1.58, which added those threads.
+  waits. Seen once in about 1,000 stops in tests (systemd 252 under load, 2026-11-25). The trigger found: on Python
+  3.10 and later, a stop sent to firewatcher alone while a thread starts a process (the follow at the handover after
+  a restart's backlog read, once per restart; a compression run's `tar`). `systemctl stop` signals journalctl too,
+  whose end wakes firewatcher. Since 1.58, which added those threads.
 - Why: blocking the stop signals in those threads, the usual cure, is inherited by the processes they start: the
   thread that reads the log starts journalctl, which could then not be stopped (tried in 1.71's build: a journalctl
   that thread had started ignored the stop, and firewatcher's exit waited for it).
