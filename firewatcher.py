@@ -5,9 +5,7 @@
 import argparse
 import array
 import bisect
-import calendar
 import fnmatch
-import hashlib
 import subprocess
 import re
 import shutil
@@ -66,19 +64,15 @@ DEFAULT_RESUME_MAX = 3600
 POSITION_SAVE_INTERVAL = 1.0
 # A journal line read this many seconds after its timestamp was logged while firewatcher was stopped.
 BACKLOG_LAG = 2
-# Longest a journalctl run at start may take (the probe, and reading the saved second) before it counts as hung:
-# reading one second of a 4 GB journal took 0.08 s on a test host.
+# Longest a journalctl run at start may take (the probe, and reading back from the saved entry) before it counts as
+# hung: reading one second of a 4 GB journal took 0.08 s on a test host.
 JOURNAL_PROBE_TIMEOUT = 30
-# journalctl seeks and orders by the time journald stored a line, but shows the time it was sent: a line shown as the
-# second before the saved one can come first, and one shown as the saved second can come after one shown as the next.
-# The saved second's lines are collected until a line shown this many seconds after it; lines shown before it, however
-# far, are passed over: a stall of journald stores the lines that waited for it among the lines of the second (on the
-# host measured, runs of lines shown as the second with lines shown 277 to 458 s earlier between them). 30: in 34.7
-# days of its journal (4.5 million entries with a sent time) the largest gap between sending and storing was 15.7 s,
-# apart from two stalls of the host (370 s and 458 s), so 30 covers it about twice.
-JOURNAL_STAMP_SKEW = 30
-# journalctl -o short-iso: "2026-10-23T17:52:41+0000 host ident[pid]: message"; newer versions write +00:00.
-_ISO_STAMP_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|([+-])(\d\d):?(\d\d)) ')
+# A journal cursor as journalctl writes it (systemd 219 and 257 alike); a saved cursor must match it before it is used.
+_CURSOR_RE = re.compile(r's=[0-9a-f]{32};i=[0-9a-f]{1,16};b=[0-9a-f]{32};m=[0-9a-f]{1,16};t=[0-9a-f]{1,16};x=[0-9a-f]{1,16}\Z')
+# The name of a field in journalctl -o export output.
+_EXPORT_NAME_RE = re.compile(br'[A-Z0-9_]+\Z')
+# The most bytes of a field kept from journalctl -o export: a line of MAX_LINE_CHARS characters of UTF-8.
+_EXPORT_FIELD_MAX = 4 * MAX_LINE_CHARS
 DEFAULT_UNIT_NAME = 'firewatcher'
 SYSTEMD_RUNTIME_DIR = '/run/systemd/system'
 SYSTEMD_UNIT_DIR = '/etc/systemd/system'
@@ -2208,7 +2202,13 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 			# Lines end only at \n. Splitting at a bare \r as well would let a message start a line that looks
 			# like a journal entry of its own, with a timestamp the message chose.
 			stream = proc.stdout
-			if isinstance(stream, io.BufferedIOBase):
+			if journal_position is not None:
+				# journalctl -o export, written as -o short-iso lines, each with the entry it came from.
+				stream = journal_position.reader(stream)
+				for stored, line in journal_position.context:
+					processed_line_counter += 1
+					context.append(min(stored, time.time()), processed_line_counter, line)
+			elif isinstance(stream, io.BufferedIOBase):
 				stream = io.TextIOWrapper(stream, encoding='utf-8', errors='replace', newline='\n')
 			pending_read = None
 			line_in_flight = False
@@ -2278,15 +2278,9 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 
 					line_time = read_time
 					if journal_position is not None:
-						if journal_position.replaying:
-							replayed_at = journal_position.replay_time(line)
-							if replayed_at is not None:
-								# Read before the last stop: context for a match, never a match itself.
-								context.append(min(replayed_at, read_time), processed_line_counter, line)
-								continue
 						# Before matching, so a line that crashes firewatcher is not read again after the restart.
 						line_in_flight = True
-						journal_position.saw(line, read_time)
+						journal_position.saw(stream.cursor, stream.stored, read_time)
 						# Logged while firewatcher was stopped: its own time, so a match in that backlog has the
 						# capture_time before it as context, not the whole backlog read in the same instant.
 						if journal_position.stamp_time is not None and journal_position.stamp_time < read_time - BACKLOG_LAG:
@@ -2840,176 +2834,257 @@ def build_parser():
 	return parser
 
 
-def _iso_stamp(line):
-	"""(seconds since the epoch, length of the stamp and its space) for a journalctl -o short-iso line, or None."""
-	matched = _ISO_STAMP_RE.match(line)
-	if not matched:
-		return None
-	year, month, day, hour, minute, second = (int(part) for part in matched.group(1, 2, 3, 4, 5, 6))
-	# Log text can look like a stamp: a bare carriage return in a message starts a new line here.
+class _ExportReader(object):
+	"""journalctl -o export read as the lines journalctl -o short-iso prints, one per readline(), with the cursor and the
+	stored second of the entry behind the last line returned. Lines end only at \\n. Only the fields a line needs are
+	kept; other data is read past in blocks. A line that is neither FIELD=value nor the name of a binary field is passed
+	over. skip_cursor: the first entry is dropped when it is the entry at that cursor (already read before a restart)."""
+
+	FIELDS = frozenset((b'__CURSOR', b'__REALTIME_TIMESTAMP', b'_SOURCE_REALTIME_TIMESTAMP', b'MESSAGE',
+						b'SYSLOG_IDENTIFIER', b'_COMM', b'_PID', b'SYSLOG_PID', b'_HOSTNAME'))
+
+	def __init__(self, stream, skip_cursor=None):
+		self.stream = stream
+		self.skip_cursor = skip_cursor
+		self.cursor = None
+		self.stored = None
+		self.lines = deque()
+		self.fields = {}
+		self.shown = (None, '')
+
+	def readline(self, limit=-1):
+		while not self.lines:
+			entry = self.entry()
+			if entry is None:
+				return ''
+			self.cursor, self.stored, lines = entry
+			self.lines.extend(lines)
+		line = self.lines.popleft()
+		if 0 <= limit < len(line):
+			# As TextIOWrapper.readline(limit): the rest comes with the next call.
+			self.lines.appendleft(line[limit:])
+			line = line[:limit]
+		return line
+
+	def entry(self):
+		"""(cursor, stored second, lines) of the next entry, or None at the end of the output. Kept across a read
+		error: the next call goes on with the same entry."""
+		while True:
+			line = self.stream.readline(_EXPORT_FIELD_MAX)
+			if not line:
+				return None
+			if not line.endswith(b'\n'):
+				# A value longer than kept: the rest of it is read past.
+				rest = line
+				while rest and not rest.endswith(b'\n'):
+					rest = self.stream.readline(_EXPORT_FIELD_MAX)
+				line += b'\n'
+			if line == b'\n':
+				fields, self.fields = self.fields, {}
+				skip, self.skip_cursor = self.skip_cursor, None
+				cursor = fields.get(b'__CURSOR')
+				stored = fields.get(b'__REALTIME_TIMESTAMP')
+				if cursor is None or stored is None or not stored.isdigit():
+					continue
+				cursor = cursor.decode('ascii', 'replace')
+				if skip is not None and cursor == skip:
+					continue
+				return cursor, int(stored) // 1000000, self.format(fields)
+			name, equals, value = line[:-1].partition(b'=')
+			if equals:
+				if name in self.FIELDS:
+					self.fields[name] = value
+			elif _EXPORT_NAME_RE.match(name):
+				self.binary_field(name)
+
+	def binary_field(self, name):
+		# NAME, then its size as 8 bytes little-endian, the data and a \n. Never allocated by the size it gives.
+		size = self.stream.read(8)
+		if len(size) < 8:
+			return
+		left = int.from_bytes(size, 'little')
+		keep = name in self.FIELDS
+		kept = []
+		room = _EXPORT_FIELD_MAX
+		while left > 0:
+			block = self.stream.read(min(left, 1 << 16))
+			if not block:
+				return
+			left -= len(block)
+			if keep and room > 0:
+				kept.append(block[:room])
+				room -= len(block)
+		self.stream.read(1)
+		if keep:
+			self.fields[name] = b''.join(kept)
+
+	def format(self, fields):
+		"""The lines journalctl -o short-iso prints for an entry: none without a MESSAGE."""
+		message = fields.get(b'MESSAGE')
+		if message is None:
+			return []
+		usec = fields.get(b'_SOURCE_REALTIME_TIMESTAMP')
+		if not (usec and usec.isdigit()):
+			usec = fields[b'__REALTIME_TIMESTAMP']
+		prefix = self.stamp(int(usec) // 1000000)
+		if prefix is None:
+			prefix = self.stamp(int(fields[b'__REALTIME_TIMESTAMP']) // 1000000) or ''
+		host = fields.get(b'_HOSTNAME')
+		if host:
+			prefix += ' ' + host.decode('utf-8', 'replace')
+		ident = fields.get(b'SYSLOG_IDENTIFIER') or fields.get(b'_COMM') or b'unknown'
+		prefix += ' ' + ident.decode('utf-8', 'replace')
+		pid = fields.get(b'_PID') or fields.get(b'SYSLOG_PID')
+		if pid:
+			prefix += '[' + pid.decode('utf-8', 'replace') + ']'
+		prefix += ': '
+		# Later lines of a message are indented by the width of the prefix, as journalctl does.
+		parts = message.decode('utf-8', 'replace').split('\n')
+		indent = '\n' + ' ' * len(prefix)
+		return [line + '\n' for line in (prefix + indent.join(parts)).split('\n')]
+
+	def stamp(self, second):
+		"""The second in local time, with its offset written +HH:MM; None for a second the platform cannot show."""
+		if self.shown[0] != second:
+			try:
+				local = time.localtime(second)
+			except (OverflowError, OSError, ValueError):
+				return None
+			offset = (local.tm_gmtoff or 0) // 60
+			self.shown = (second, time.strftime('%Y-%m-%dT%H:%M:%S', local) + '%s%02d:%02d' % (
+				'-' if offset < 0 else '+', abs(offset) // 60, abs(offset) % 60))
+		return self.shown[1]
+
+
+def _journal_back(journalctl, cursor, since):
+	"""The journal entries from the one at cursor back to the first stored before since, as (stored second, line)
+	pairs oldest first, read once without --follow; None when the first entry read is not the one at cursor (the
+	journal no longer holds it), or journalctl fails. Reading stops after JOURNAL_PROBE_TIMEOUT."""
 	try:
-		datetime.datetime(year, month, day, hour, minute, min(second, 59))
-	except ValueError:
+		proc = subprocess.Popen([journalctl, '--all', '--no-pager', '--quiet', '--output=export', '--cursor=' + cursor,
+								 '--reverse'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+	except OSError:
 		return None
-	when = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
-	if matched.group(7):
-		offset = int(matched.group(8)) * 3600 + int(matched.group(9)) * 60
-		when += -offset if matched.group(7) == '+' else offset
-	return when, matched.end()
-
-
-def _line_digest(line, stamp_end):
-	# Without the timestamp, so a changed time zone still finds the line.
-	return hashlib.sha1(line[stamp_end:].rstrip('\n').encode('utf-8', 'replace')).hexdigest()
+	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
+	timer.start()
+	entries = []
+	try:
+		reader = _ExportReader(proc.stdout)
+		first = reader.entry()
+		if first is None or first[0] != cursor:
+			return None
+		entries.append(first)
+		while True:
+			entry = reader.entry()
+			if entry is None or entry[1] < since:
+				break
+			entries.append(entry)
+	finally:
+		timer.cancel()
+		proc.kill()
+		proc.wait()
+		proc.stdout.close()
+	return [(stored, line) for _, stored, lines in reversed(entries) for line in lines]
 
 
 class JournalPosition(object):
 	"""How far the journal was read, kept in a small file so a restart resumes after it.
 
-	The file holds the second of the last line read (from journalctl -o short-iso), which line of
-	that second it was, and a digest of it. At start, journalctl reads from capture_time before
-	that line, at most resume_max seconds back: the lines up to the saved one only refill the
-	context kept before a match, and the lines after it are matched as usual. locate() first finds
-	the saved line in the journal as it is now, which may have lost it.
+	The file holds the cursor of the last journal entry read and the second journald stored it. At start, the entries
+	from capture_time before it up to it are read back once, as context, and the journal is followed from the entry
+	after it. When the journal no longer holds that entry, journalctl reads from capture_time before its second, at
+	most resume_max seconds back, and every line is matched: lines are read again, never skipped.
 	"""
 
-	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None):
+	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None,
+				 journalctl='journalctl'):
 		import json
 		self.path = path
 		now = time.time() if now is None else now
 		self.since = None
-		self.replaying = False
-		self.saved = None
-		# The last line read in this run with a timestamp, and which line of its second it was.
-		self.stamp = None
-		self.last_line = None
-		self.last_end = 0
-		self.ordinal = 0
+		self.cursor = None
+		# Read back before the saved entry, as (stored second, line): context for a match, never a match itself.
+		self.context = []
+		# The last entry read in this run, and the second journald stored it.
+		self.last_cursor = None
+		self.stamp_time = None
 		self.changed = False
 		self.next_save = 0
 		# Called before every write of a changed position; capture_messages sets it to sync the open capture first.
 		self.before_save = None
 		self.save_failed = False
-		# The time of self.stamp, for the context: a line read long after it was logged keeps its own time.
-		self.stamp_time = None
 		# What saw() changed for the line being handled, for unsee().
 		self.before = None
-		# While replaying: lines of the saved second read so far, the time of the last one, and whether the saved line was among them.
-		self.seen_in_second = 0
-		self.replay_at = None
-		self.found = False
 		try:
 			with open(path, 'r', encoding='utf-8') as f:
 				record = json.load(f)
-			saved = (int(record['time']), int(record['line']), str(record['sha1']))
+			saved_time = int(record['time'])
+			shown = datetime.datetime.fromtimestamp(saved_time).isoformat()
 		except FileNotFoundError:
 			self.note = 'No journal position saved in %s yet; reading the last %s lines.' % (path, tail_lines)
 			return
 		except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
 			self.note = 'Cannot read the journal position in %s (%s); reading the last %s lines.' % (path, exc, tail_lines)
 			return
-		saved_time = saved[0]
-		try:
-			shown = datetime.datetime.fromtimestamp(saved_time).isoformat()
-		except (OverflowError, OSError, ValueError) as exc:
-			self.note = 'Cannot read the journal position in %s (%s); reading the last %s lines.' % (path, exc, tail_lines)
+		if now - saved_time > resume_max:
+			self.since = int(now - resume_max)
+			self.note = 'The journal position in %s, %s, is %d seconds old; reading the last %d seconds.' % (
+				path, shown, now - saved_time, resume_max)
 			return
+		cursor = record.get('cursor')
+		context = None
+		# Checked by our own rule before it goes on journalctl's command line.
+		if isinstance(cursor, str) and _CURSOR_RE.match(cursor):
+			context = _journal_back(journalctl, cursor, saved_time - max(0, context_time))
+		if context is not None:
+			self.cursor = cursor
+			self.context = context
+			self.note = 'Resuming the journal after %s, %d seconds ago, with %d seconds of context before it.' % (
+				shown, max(0, now - saved_time), max(0, context_time))
+			return
+		# The journal no longer holds the entry (rotated away, a volatile journal after a reboot, a 1.69 file):
+		# by time, as journalctl itself would go.
 		if saved_time > now + 60:
 			self.note = 'The journal position in %s, %s, is in the future; reading the last %s lines.' % (path, shown, tail_lines)
 			return
 		self.since = int(max(saved_time - max(0, context_time), now - resume_max))
-		if self.since > saved_time:
-			self.note = 'The journal position in %s, %s, is %d seconds old; reading the last %d seconds.' % (
-				path, shown, now - saved_time, resume_max)
-			return
-		self.saved = saved
-		self.replaying = True
-		self.replay_at = self.since
-		self.note = 'Resuming the journal after %s, %d seconds ago, with %d seconds of context before it.' % (
-			shown, max(0, now - saved_time), saved_time - self.since)
+		self.note = 'The journal no longer holds the last line read before the stop (%s); matching every line from %s.' % (
+			shown, datetime.datetime.fromtimestamp(self.since).isoformat())
 
 	def journal_command(self, command):
-		"""command with ISO timestamps, and --since instead of --lines when resuming."""
-		command = [command[0], '--output=short-iso'] + command[1:]
-		if self.since is not None:
-			command = ['--since=@%d' % self.since if part.startswith('--lines=') else part for part in command]
-		return command
+		"""command reading -o export, from the saved entry or --since instead of --lines when resuming."""
+		command = [command[0], '--output=export'] + command[1:]
+		if self.cursor is not None:
+			start = '--cursor=' + self.cursor
+		elif self.since is not None:
+			start = '--since=@%d' % self.since
+		else:
+			return command
+		return [start if part.startswith('--lines=') else part for part in command]
 
-	def locate(self, command):
-		"""Before replaying, find the saved line in the journal as it is now, by reading its second once with
-		command (the resumed journalctl command). The journal may have lost the start of that second, or the line
-		itself, while firewatcher was stopped (a journal file rotated away, a crash before journald wrote it), and
-		then the line's number no longer finds it. While a line with its digest is at its number or after it, nothing
-		changes: the replay ends there, as in 1.68. Otherwise it ends at the first line of that second with its
-		digest, and with no such line nothing is replayed: every line from the start of the replay is matched. Those
-		read lines again rather than skip them. When journalctl cannot tell, nothing changes."""
-		if not self.replaying:
-			return
-		saved_time, ordinal, digest = self.saved
-		digests = _journal_second(command, saved_time)
-		# A line with its digest at or after its number: the replay ends there, as in 1.68.
-		if digests is None or digest in digests[ordinal - 1:]:
-			return
-		if digest in digests:
-			self.saved = (saved_time, digests.index(digest) + 1, digest)
-			return
-		self.replaying = False
-		self.note = 'The journal no longer holds the last line read before the stop (%s); matching every line from %s.' % (
-			datetime.datetime.fromtimestamp(saved_time).isoformat(), datetime.datetime.fromtimestamp(self.since).isoformat())
+	def reader(self, stream):
+		"""The capture loop's stream: lines as journalctl -o short-iso prints them, the saved entry dropped."""
+		return _ExportReader(stream, skip_cursor=self.cursor)
 
-	def replay_time(self, line):
-		"""While replaying: the time of a line from before the saved position, for the context. None from the first line
-		after the saved one, or from the first line shown as a later second than it: journalctl orders lines by the time
-		journald stored them, so that line can come before the saved one, and the lines read before the stop then match
-		again (a second capture, never a skip)."""
-		stamp = _iso_stamp(line)
-		if stamp is None:
-			# A continuation of the line before, or a journalctl note such as "-- Boot ... --".
-			return self.replay_at
-		when, stamp_end = stamp
-		saved_time, saved_ordinal, saved_digest = self.saved
-		if self.found or when > saved_time:
-			self.replaying = False
-			return None
-		if when == saved_time:
-			self.seen_in_second += 1
-			# Counting from where this run's view of that second starts: the line number and digest must both agree.
-			# A run that started with --lines in the middle of a second numbers that second's lines from there, so
-			# identical lines before the saved one can end the replay early: lines are read again, never skipped.
-			if self.seen_in_second >= saved_ordinal and _line_digest(line, stamp_end) == saved_digest:
-				self.found = True
-				self.stamp = line[:stamp_end]
-				self.stamp_time = when
-				self.ordinal = self.seen_in_second
-		self.replay_at = when
-		return when
-
-	def saw(self, line, now):
-		"""Record a line as read, before it is handled. The periodic save (at most once per POSITION_SAVE_INTERVAL)
-		runs first, so it never covers a line still being handled; unsee() takes the line back."""
+	def saw(self, cursor, stored, now):
+		"""Record the entry behind a line as read, before the line is handled. The periodic save (at most once per
+		POSITION_SAVE_INTERVAL) runs first, so it never covers a line still being handled; unsee() takes it back."""
 		# Cleared first: a stop that lands inside the save below must not make unsee() take back the line before
 		# this one, which was already handled in full.
 		self.before = None
 		if self.changed and now >= self.next_save:
 			self.save(now)
-		self.before = (self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed)
-		if self.stamp is not None and line.startswith(self.stamp):
-			self.ordinal += 1
-		else:
-			stamp = _iso_stamp(line)
-			if stamp is None:
-				return
-			self.stamp = line[:stamp[1]]
-			self.stamp_time = stamp[0]
-			self.ordinal = 1
-		self.last_line = line
-		self.last_end = len(self.stamp)
+		self.before = (self.last_cursor, self.stamp_time, self.changed)
+		if cursor is None or cursor == self.last_cursor:
+			return
+		self.last_cursor = cursor
+		self.stamp_time = stored
 		self.changed = True
 
 	def unsee(self):
 		"""Take back the line saw() recorded last: a stop came before it was handled, so the next run reads it again."""
 		if self.before is not None:
-			self.stamp, self.stamp_time, self.ordinal, self.last_line, self.last_end, self.changed = self.before
+			self.last_cursor, self.stamp_time, self.changed = self.before
 			self.before = None
 
 	def save(self, now=None):
@@ -3023,11 +3098,7 @@ class JournalPosition(object):
 			self.before_save()
 		self.changed = False
 		import tempfile
-		record = {
-			'time': _iso_stamp(self.last_line)[0],
-			'line': self.ordinal,
-			'sha1': _line_digest(self.last_line, self.last_end),
-		}
+		record = {'cursor': self.last_cursor, 'time': self.stamp_time}
 		folder = os.path.dirname(self.path) or '.'
 		unfinished = None
 		try:
@@ -3060,52 +3131,14 @@ class JournalPosition(object):
 
 
 def _journal_can_resume(journalctl):
-	"""True when journalctl takes the ISO output and --since=@seconds that resuming needs."""
+	"""True when journalctl takes the export output and --since=@seconds that resuming needs."""
 	try:
 		probe = subprocess.run(
-			[journalctl, '--quiet', '--no-pager', '--output=short-iso', '--since=@%d' % int(time.time()), '--lines=0'],
+			[journalctl, '--quiet', '--no-pager', '--output=export', '--since=@%d' % int(time.time()), '--lines=0'],
 			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=JOURNAL_PROBE_TIMEOUT)
 	except (OSError, subprocess.SubprocessError):
 		return False
 	return probe.returncode == 0
-
-
-def _journal_second(command, second):
-	"""The digests of the journal lines stamped in that second, in their order, read with command (journalctl
-	-o short-iso) without --follow, from that second on; None when journalctl fails or takes longer than
-	JOURNAL_PROBE_TIMEOUT. Reading stops at the first line shown more than JOURNAL_STAMP_SKEW seconds after it. A line
-	shown before it, however far, is passed over: a stall of journald stores the lines that waited for it among the
-	lines of the second."""
-	command = [part for part in command if part != '--follow' and not part.startswith('--since=')]
-	try:
-		proc = subprocess.Popen(command + ['--since=@%d' % second], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-								stderr=subprocess.DEVNULL)
-	except OSError:
-		return None
-	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
-	timer.start()
-	digests = []
-	second_ended = True
-	try:
-		# Read as the capture loop reads, so each line has the digest it had there.
-		stream = io.TextIOWrapper(proc.stdout, encoding='utf-8', errors='replace', newline='\n')
-		for line in iter(lambda: stream.readline(MAX_LINE_CHARS), ''):
-			stamp = _iso_stamp(line)
-			if stamp is None:
-				continue
-			if stamp[0] == second:
-				digests.append(_line_digest(line, stamp[1]))
-			elif stamp[0] - second > JOURNAL_STAMP_SKEW:
-				break
-		else:
-			second_ended = False
-	finally:
-		timer.cancel()
-		proc.kill()
-		returncode = proc.wait()
-		proc.stdout.close()
-	# Output that ended inside the second is whole only if journalctl finished by itself, not killed by the timer.
-	return digests if second_ended or returncode == 0 else None
 
 
 def _journald_present():
@@ -3245,12 +3278,12 @@ def _watch(resolved):
 		if position_lock is None:
 			print(f"Another firewatcher is using the journal position in {resolved.position_file}; reading the last {resolved.tail_lines} lines, without saving a position.")
 		elif _journal_can_resume(command_to_run[0]):
-			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines)
+			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines,
+											   journalctl=command_to_run[0])
 			command_to_run = journal_position.journal_command(command_to_run)
-			journal_position.locate(command_to_run)
 			print(journal_position.note)
 		else:
-			print(f"This journalctl cannot resume from a saved position (that needs -o short-iso and --since=@); reading the last {resolved.tail_lines} lines.")
+			print(f"This journalctl cannot resume from a saved position (that needs -o export and --since=@); reading the last {resolved.tail_lines} lines.")
 	print(f"Monitoring {command_to_run} for patterns: {patterns}")
 	print(f"Capturing logs for {resolved.capture_time} seconds, {resolved.capture_time_max or 'no'} seconds at most.")
 	print(f"Output folder: {resolved.output_folder}")
