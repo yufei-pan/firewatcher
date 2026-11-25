@@ -621,6 +621,23 @@ def _stalling_journalctl(tmp_path, entries):
     return str(stub)
 
 
+def test_journal_context_stopped_early_ends_journalctl(tmp_path):
+    # a stop (SIGTERM) while the context is read: the loop is left, and the generator with it
+    export = tmp_path / 'export.bin'
+    export.write_bytes(entry(-50, 'context') + entry(-40, 'more'))
+    stub = tmp_path / 'journalctl'
+    stub.write_text('#!/bin/sh\necho $$ > %s\ncat %s\nexec sleep 30\n' % (tmp_path / 'pid', export))
+    stub.chmod(0o755)
+    context = fw._journal_context(str(stub), cursor(0, 'x'), T - 60, T)
+    assert next(context) == (T - 50, jline(-50, 'context'))
+    pid = int((tmp_path / 'pid').read_text())
+    started = time.time()
+    context.close()
+    assert time.time() - started < 10  # killed, not waited for
+    with pytest.raises(OSError):
+        os.kill(pid, 0)
+
+
 def test_journal_holds_is_bounded_by_the_probe_timeout(tmp_path, monkeypatch):
     stub = _stalling_journalctl(tmp_path, [])
     monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 0.5)
