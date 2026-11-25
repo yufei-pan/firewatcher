@@ -927,6 +927,8 @@ def test_a_slow_journalctl_at_a_restart_is_waited_for_and_noted_once(tmp_path, m
     position = saved_at(tmp_path, 0, 'saved')
     out, journalctl = resume(tmp_path, monkeypatch, position, cursor=([0.6, entry(0, 'saved'), entry(5, 'HIT after')], 0),
                              reverse=([entry(0, 'saved')], 0))
+    # the reads that answered in time give no line, then or later
+    time.sleep(0.5)
     printed = capsys.readouterr().out
     assert printed.count('Still waiting for journalctl after') == 1 and 'Resuming the journal after' in printed
     assert len(incident_logs(out)) == 1 and journalctl.kinds() == ['cursor', 'reverse', 'follow']
@@ -945,6 +947,13 @@ def test_journal_before_reads_back_from_the_saved_entry_to_the_window_start(tmp_
     # an entry the journal no longer holds, and a journalctl that is not there: nothing
     assert list(fw._journal_before(journalctl, daemon.cursor(-25, 'gone'), now - 60, now)) == []
     assert list(fw._journal_before(str(tmp_path / 'missing'), cursor(0, 'x'), 0, T)) == []
+
+
+def test_journal_before_takes_nothing_from_a_read_back_that_starts_elsewhere(monkeypatch):
+    # journalctl 219 to 257 print nothing backwards from an entry they lost; one that landed on another would give a
+    # context that does not end at the saved entry
+    FakeJournalctl(monkeypatch, reverse=([entry(-5, 'another'), entry(-10, 'older')], 0))
+    assert list(fw._journal_before('journalctl', cursor(0, 'saved'), T - 60, T)) == []
 
 
 def test_journal_before_stopped_early_ends_journalctl(tmp_path):
