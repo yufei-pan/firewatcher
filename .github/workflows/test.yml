@@ -13,11 +13,16 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.11", "3.12", "3.14"]
+    env:
+      # the restarts on a real journalctl (tests/test_real_journal.py) run here, never skipped
+      FIREWATCHER_REQUIRE_JOURNALCTL: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
+      # writes the journals those tests read (systemd 255 here)
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends systemd-journal-remote
       - run: python -m pip install "pytest<9"
         if: matrix.python-version != '3.12'
       - run: python -m pytest -q
@@ -27,7 +32,8 @@ jobs:
         if: matrix.python-version == '3.12'
       - run: python -m pytest -q --cov=firewatcher --cov-report=term-missing --cov-fail-under=95
         if: matrix.python-version == '3.12'
-  # setup-python no longer ships 3.6, the oldest Python firewatcher supports: it runs in a container
+  # setup-python no longer ships 3.6, the oldest Python firewatcher supports: it runs in a container, which has no
+  # journalctl, so the real-journalctl tests skip there
   pytest-py36:
     runs-on: ubuntu-24.04
     # by digest: the python:3.6 tag gets no updates, and a digest cannot be moved

@@ -145,6 +145,9 @@ class ScriptedStdout:
             raise ev
         return ev
 
+    def close(self):
+        pass
+
 
 class ScriptedPopen:
     def __init__(self, events, terminate_raises=False, clock=None):
@@ -163,6 +166,12 @@ class ScriptedPopen:
         if self.terminate_raises:
             raise OSError('already gone')
         self.terminated = True
+
+    def kill(self):
+        self.terminated = True
+
+    def wait(self):
+        return 0
 
 
 def patch_popen(monkeypatch, popen):

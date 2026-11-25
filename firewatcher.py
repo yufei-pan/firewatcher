@@ -5,6 +5,7 @@
 import argparse
 import array
 import bisect
+import contextlib
 import fnmatch
 import subprocess
 import re
@@ -29,7 +30,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.70'
+version = '1.71'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -64,11 +65,11 @@ DEFAULT_RESUME_MAX = 3600
 POSITION_SAVE_INTERVAL = 1.0
 # A journal line read this many seconds after its timestamp was logged while firewatcher was stopped.
 BACKLOG_LAG = 2
-# Longest a journalctl run at start may take (the probe, looking for the saved entry, and reading the context before
-# it) before it counts as hung. Measured on a 3.9 GB journal: about 4 us per entry in journalctl -o export and 8 us in
-# firewatcher, so 30 s reads back over two million entries. A look for the saved entry that is cut short counts as not
-# finding it, and the fallback by time takes over; a read of the context cut short leaves the context it got.
-JOURNAL_PROBE_TIMEOUT = 30
+# A journalctl at start (the probe, the read from the saved entry, the read back for the context) that has printed nothing
+# after this many seconds gets one log line. It decides nothing: a late answer is still an answer, and a stop ends the
+# wait. Their first entries came after 2 to 4 ms on journals of up to 3,000,000 entries (2026-11-25); 30 s was 1.70's
+# bound on these reads.
+JOURNAL_WAIT_NOTE = 30
 # A journal cursor as journalctl writes it (systemd 219 and 257 alike); a saved cursor must match it before it is used.
 _CURSOR_RE = re.compile(r's=[0-9a-f]{32};i=[0-9a-f]{1,16};b=[0-9a-f]{32};m=[0-9a-f]{1,16};t=[0-9a-f]{1,16};x=[0-9a-f]{1,16}\Z')
 # The name of a field in journalctl -o export output.
@@ -1773,8 +1774,9 @@ class ContextBuffer(object):
 
 	New lines collect in a block; once a block holds BUFFER_BLOCK_BYTES of text it is compressed with
 	zlib, so a busy host keeps several times more context in the same memory. Over max_bytes, the oldest
-	block goes first; the newest block (or open block) always stays. Each line has a sequence number (lines read so far),
-	so a capture can leave out what an earlier capture already holds.
+	block goes first; the newest block (or open block) always stays. Each line has a sequence number (lines read so far; at a
+	restart, the lines read back that the buffer keeps, numbered from 1), so a capture can leave out what an earlier capture
+	already holds.
 	"""
 
 	def __init__(self, max_age, max_bytes):
@@ -1808,13 +1810,57 @@ class ContextBuffer(object):
 		elif lines[0][0] < read_time - self.max_age and len(lines) > 1:
 			self._trim(read_time)
 
-	def _seal(self):
-		strings = [line for _read_time, line in self.lines]
-		times = array.array('d', [read_time for read_time, _line in self.lines])
+	def refill(self, lines):
+		"""Fill the empty buffer from (read_time, line) pairs given newest first (the journal read back at a restart), a
+		block at a time, until they end or the next block would take the buffer past max_bytes; the newest block always
+		goes in, as in append. Returns how many lines it took, numbered from 1, the oldest. Over the cap, the pairs left
+		are not read on: they would be the oldest, which the buffer drops first."""
+		blocks = []  # newest first
+		memory = 0
+
+		def take(chunk):
+			nonlocal memory
+			chunk.reverse()
+			block = self._pack(chunk)
+			if blocks and memory + block[3] > self.max_bytes:
+				self.dropped_until = block[0][-1]
+				return False
+			blocks.append(block)
+			memory += block[3]
+			return True
+
+		chunk, text_bytes, chunk_memory = [], 0, 0
+		for read_time, line in lines:
+			chunk.append((read_time, line))
+			text_bytes += len(line)
+			chunk_memory += sys.getsizeof(line) + BUFFER_LINE_OVERHEAD
+			if text_bytes >= BUFFER_BLOCK_BYTES or chunk_memory >= BUFFER_OPEN_MEMORY:
+				if not take(chunk):
+					break
+				chunk, text_bytes, chunk_memory = [], 0, 0
+		else:
+			if chunk:
+				take(chunk)
+		count = 0
+		for times, lengths, text, size in reversed(blocks):
+			self.blocks.append((times[0], times[-1], count + 1, len(times), times, lengths, text, size))
+			count += len(times)
+		self.memory += memory
+		return count
+
+	@staticmethod
+	def _pack(lines):
+		"""(read times, lengths, compressed text, memory) of a block of (read_time, line) pairs, oldest first."""
+		strings = [line for _read_time, line in lines]
+		times = array.array('d', [read_time for read_time, _line in lines])
 		# Lengths in characters: the block is decoded whole before it is split again.
 		lengths = array.array('L', map(len, strings))
 		text = zlib.compress(''.join(strings).encode('utf-8', 'replace'), 1)
 		memory = len(text) + times.itemsize * len(times) + lengths.itemsize * len(lengths) + BUFFER_BLOCK_OVERHEAD
+		return times, lengths, text, memory
+
+	def _seal(self):
+		times, lengths, text, memory = self._pack(self.lines)
 		self.blocks.append((times[0], times[-1], self.first_seq, len(times), times, lengths, text, memory))
 		self.memory += memory - self.lines_memory
 		self.lines = []
@@ -2149,8 +2195,9 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 	A capture with a matched line that also matches always_notify_patterns (load_patterns() output)
 	is pushed even when the LLM says not to notify. After a SIGHUP, reload_patterns() supplies new
 	(patterns, always_notify_patterns) at the next line; if it raises, the old ones stay.
-	journal_position (a JournalPosition) records each line read, and the lines it says were read
-	before the last stop only refill the context.
+	With journal_position (a JournalPosition), command_to_run is journalctl's follow command for a first start, the
+	journal is read on from the saved position (_JournalSource), each line read is recorded there, and the lines read
+	back from before the saved entry only refill the context.
 	"""
 	global _reload_requested
 	matcher = _as_matcher(patterns)
@@ -2200,24 +2247,24 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 
 	reached_eof = False
 	try:
-		with subprocess.Popen(command_to_run, stdout=subprocess.PIPE) as proc, ThreadPoolExecutor(max_workers=1) as reader:
+		if journal_position is not None:
+			# journalctl -o export, written as -o short-iso lines, each with the entry it came from; started in the try below.
+			source = _JournalSource(journal_position, command_to_run)
+		else:
+			source = subprocess.Popen(command_to_run, stdout=subprocess.PIPE)
+		with source as proc, ThreadPoolExecutor(max_workers=1) as reader:
 			# Lines end only at \n. Splitting at a bare \r as well would let a message start a line that looks
 			# like a journal entry of its own, with a timestamp the message chose.
-			stream = proc.stdout
-			if journal_position is not None:
-				# journalctl -o export, written as -o short-iso lines, each with the entry it came from.
-				stream = journal_position.reader(stream)
-			elif isinstance(stream, io.BufferedIOBase):
+			stream = proc if journal_position is not None else proc.stdout
+			if isinstance(stream, io.BufferedIOBase):
 				stream = io.TextIOWrapper(stream, encoding='utf-8', errors='replace', newline='\n')
 			pending_read = None
 			line_in_flight = False
 			try:
 				if journal_position is not None:
-					# The entries before the saved one, as context: read inside this try, so a stop (SIGINT, as the unit
-					# sends, or SIGTERM) during the read ends as one in the loop below, with journalctl ended.
-					for stored, line in journal_position.read_context():
-						processed_line_counter += 1
-						context.append(min(stored, time.time()), processed_line_counter, line)
+					# Inside this try, so a stop (SIGINT, as the unit sends, or SIGTERM) while journalctl is waited for
+					# or the context is read back ends as one in the loop below, with journalctl ended.
+					processed_line_counter = proc.open(context)
 				while True:
 					# Set while a line read from the journal is being handled, so a stop then reads it again after the restart.
 					line_in_flight = False
@@ -2977,74 +3024,195 @@ def _journalctl_export(journalctl, *start):
 							stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
-def _journal_holds(journalctl, cursor):
-	"""True when the journal still holds the entry at cursor: the first entry journalctl --cursor --reverse prints is
-	that one (a journal that lost it prints nothing, or lands on another entry). False too when journalctl fails or
-	says nothing within JOURNAL_PROBE_TIMEOUT."""
+@contextlib.contextmanager
+def _noted_wait(what):
+	"""One log line when the wait inside takes JOURNAL_WAIT_NOTE seconds. It decides nothing: the wait goes on, and a
+	stop ends it as it ends any other."""
+	timer = threading.Timer(JOURNAL_WAIT_NOTE, print, ('Still waiting for journalctl after %d seconds (%s).' % (JOURNAL_WAIT_NOTE, what),))
+	timer.daemon = True
+	timer.start()
+	try:
+		yield
+	finally:
+		timer.cancel()
+
+
+def _journal_before(journalctl, cursor, since, now):
+	"""Yields (time, line), newest first, for the journal entry at cursor and the ones before it that were stored at or
+	after since (it stops at the first one stored before, which it does not yield): one journalctl --cursor --reverse,
+	ended when the caller stops taking lines. Nothing when its first entry is not the one at cursor. A line's time is the
+	second journald stored its entry, never later than now or than the time of the line after it, so the times never run
+	backwards (a clock that was ahead and was set back)."""
 	try:
 		proc = _journalctl_export(journalctl, '--cursor=' + cursor, '--reverse')
 	except OSError:
-		return False
-	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
-	timer.start()
-	try:
-		first = _ExportReader(proc.stdout).entry()
-	finally:
-		timer.cancel()
-		proc.kill()
-		proc.wait()
-		proc.stdout.close()
-	return first is not None and first[0] == cursor
-
-
-def _journal_context(journalctl, cursor, since, until):
-	"""Yields (stored second, line) for the journal entries stored from since on, oldest first, as the caller takes
-	them, so none is kept here: through the entry at cursor. Read once, without --follow. The read ends early, with
-	what it has yielded, at the first entry stored after until (a clock that was ahead and was set back, or a saved
-	entry gone since the look), when journalctl fails, and after JOURNAL_PROBE_TIMEOUT."""
-	try:
-		proc = _journalctl_export(journalctl, '--since=@%d' % since)
-	except OSError:
 		return
-	timer = threading.Timer(JOURNAL_PROBE_TIMEOUT, proc.kill)
-	timer.start()
 	try:
 		reader = _ExportReader(proc.stdout)
-		while True:
+		with _noted_wait('the read back from the saved entry'):
 			entry = reader.entry()
-			if entry is None or entry[1] > until:
-				break
-			for line in entry[2]:
-				yield entry[1], line
-			if entry[0] == cursor:
-				break
+		if entry is None or entry[0] != cursor:
+			return
+		newest = now
+		while entry is not None and entry[1] >= since:
+			newest = min(newest, entry[1])
+			for line in reversed(entry[2]):
+				yield newest, line
+			entry = reader.entry()
 	finally:
-		timer.cancel()
 		proc.kill()
 		proc.wait()
 		proc.stdout.close()
+
+
+class _JournalSource(object):
+	"""The journal from the saved position on, as the capture loop's process and stream: open(), readline(), the cursor
+	and stored second of the entry behind the last line, terminate(). From a saved entry or a time, journalctl reads
+	without --follow to the journal's end, which takes in every boot the journal holds (a follow shows only the newest
+	from systemd 252 on), and then follows from the last entry read. command is the follow command of a first start
+	(--lines=N, --follow)."""
+
+	def __init__(self, position, command):
+		self.position = position
+		self.command = command
+		self.proc = None
+		self.reader = None
+		self.following = False
+		# terminate() was called: no journalctl is started after it, and one starting then is ended.
+		self.stopped = False
+		# journalctl failed before its first entry, or at the end of the read without --follow: the next read ends the run.
+		self.ended = False
+		# Where the follow starts: the last entry read without --follow, or with none read, the time that read started at.
+		self.last = None
+		self.since = None
+
+	cursor = property(lambda self: self.reader.cursor)
+	stored = property(lambda self: self.reader.stored)
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		self.terminate()
+		if self.proc is not None:
+			self._close()
+
+	def terminate(self):
+		self.stopped = True
+		proc = self.proc
+		if proc is not None:
+			try:
+				proc.terminate()
+			except OSError:
+				pass  # ended and reaped by the reader thread meanwhile
+
+	def _start(self, start=None, follow=True, skip=None):
+		"""Start journalctl -o export: the follow command as given, or from start (--cursor or --since in place of
+		--lines=N), with --follow only when follow. skip: its first entry is dropped when it is the entry at that cursor."""
+		command = [self.command[0], '--output=export'] + self.command[1:]
+		if start is not None:
+			command = [word for word in command if not word.startswith('--lines=') and word != '--follow'] + start
+			if follow:
+				command.append('--follow')
+		proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+		self.proc = proc
+		if self.stopped:
+			# The stop came while it started.
+			proc.terminate()
+		self.reader = _ExportReader(proc.stdout, skip_cursor=skip)
+		self.following = follow
+
+	def _close(self):
+		"""Wait for the journalctl started last (at the end of its output, or ended); its exit status."""
+		self.proc.stdout.close()
+		return self.proc.wait()
+
+	def open(self, context):
+		"""Start reading, and refill context with the lines before the saved entry; returns how many. The read from the
+		saved entry decides: when its first entry is that one, the journal still holds it, the lines before it are
+		read back into context and the read goes on after it. Another entry first, or none and an exit status of 0: the
+		journal lost it, and the read is by time. None and a failure: the run ends, with the position kept."""
+		position = self.position
+		if position.cursor is not None:
+			self._start(['--cursor=' + position.cursor], follow=False)
+			with _noted_wait('the read from the saved entry'):
+				first = self.reader.entry()
+			if first is not None and first[0] == position.cursor:
+				self.last = first[0]
+				lines = _journal_before(self.command[0], position.cursor, position.context_since, time.time())
+				try:
+					count = context.refill(lines)
+				finally:
+					lines.close()
+				now = time.time()
+				print('Resuming the journal after %s, %d seconds ago, with %d lines of context from up to %d seconds before it.' % (
+					position.shown, max(0, now - position.saved_time), count, max(0, position.saved_time - position.context_since)))
+				return count
+			if first is not None:
+				self.proc.kill()
+			status = self._close()
+			if first is None and status != 0:
+				# No answer is not "gone": the position stays as it is, and the run ends as it does when journalctl dies.
+				print('journalctl ended with status %d before its first entry from the saved position; the position in %s '
+					  'is kept for the next start.' % (status, position.path))
+				self.ended = True
+				return 0
+			position.lost(time.time())
+		if position.note:
+			print(position.note)
+		if position.since is not None:
+			self.since = position.since
+			self._start(['--since=@%d' % position.since], follow=False)
+		else:
+			self._start()
+		return 0
+
+	def readline(self, limit=-1):
+		while not self.ended:
+			line = self.reader.readline(limit)
+			if line or self.following or self.stopped:
+				return line
+			# The end of the read without --follow. A journalctl that ended with a failure (it died part-way, or was
+			# stopped by a signal that did not reach firewatcher) ends the run, as a follow that dies does: the position
+			# is the last line handled, and the restart reads on from it. At the journal's end (status 0), follow on from
+			# the last whole entry read, dropped when it comes first, or by time when that read had none. --no-tail: with
+			# --follow, journalctl 219 and 239 to 252 print only the first 10 entries from --cursor and then wait for the
+			# journal to change. --since is cut so only by 219's --since=@0; it gets the flag too.
+			self.last = self.reader.cursor or self.last
+			status = self._close()
+			if status != 0:
+				print('journalctl ended with status %d before the end of the journal.' % status)
+				self.ended = True
+				return ''
+			if self.last is not None:
+				self._start(['--cursor=' + self.last, '--no-tail'], skip=self.last)
+			else:
+				self._start(['--since=@%d' % self.since, '--no-tail'])
+		return ''
 
 
 class JournalPosition(object):
 	"""How far the journal was read, kept in a small file so a restart resumes after it.
 
-	The file holds the cursor of the last journal entry read and the second journald stored it. At start, the entries
-	from capture_time before it up to it are read back once, as context, and the journal is followed from the entry
-	after it. When the journal no longer holds that entry, journalctl reads from capture_time before its second, at
-	most resume_max seconds back, and every line is matched: lines are read again, never skipped.
+	The file holds the cursor of the last journal entry read and the second journald stored it. At start (see
+	_JournalSource), when the journal still holds that entry, the entries from capture_time before it up to it are
+	read back once, as context, and every entry after it is matched. When the journal no longer holds that entry, the
+	journal is read from capture_time before its second, at most resume_max seconds back, and every line is matched:
+	lines are read again, never skipped. The constructor only reads the file.
 	"""
 
-	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None,
-				 journalctl='journalctl'):
+	def __init__(self, path, resume_max=DEFAULT_RESUME_MAX, context_time=0, tail_lines='20', now=None):
 		import json
 		self.path = path
 		now = time.time() if now is None else now
 		self.since = None
 		self.cursor = None
-		# The entries read back before the saved entry (see read_context): context for a match, never a match itself.
-		self.journalctl = journalctl
+		self.note = None
+		# The entries read back before the saved entry, from this second on: context for a match, never a match itself.
 		self.context_since = None
 		self.saved_time = None
+		self.shown = None
+		self.tail_lines = tail_lines
 		# The last entry read in this run, and the second journald stored it.
 		self.last_cursor = None
 		self.stamp_time = None
@@ -3071,49 +3239,29 @@ class JournalPosition(object):
 			self.note = 'The journal position in %s, %s, is %d seconds old; reading the last %d seconds.' % (
 				path, shown, now - saved_time, resume_max)
 			return
+		self.saved_time = saved_time
+		self.shown = shown
+		# No further back than --resume-max, the context and the fallback by time alike.
+		self.context_since = int(max(saved_time - max(0, context_time), now - resume_max))
 		cursor = record.get('cursor')
 		# Checked by our own rule before it goes on journalctl's command line.
-		if isinstance(cursor, str) and _CURSOR_RE.match(cursor) and _journal_holds(journalctl, cursor):
+		if isinstance(cursor, str) and _CURSOR_RE.match(cursor):
 			self.cursor = cursor
-			self.saved_time = saved_time
-			# No further back than --resume-max, as the fallback below.
-			self.context_since = int(max(saved_time - max(0, context_time), now - resume_max))
-			self.note = 'Resuming the journal after %s, %d seconds ago, with up to %d seconds of context before it.' % (
-				shown, max(0, now - saved_time), max(0, saved_time - self.context_since))
 			return
-		# No entry to resume at (rotated away, a volatile journal after a reboot, a 1.69 file, or journalctl said
-		# nothing in time): by time, as journalctl itself would go.
-		if saved_time > now + 60:
-			self.note = 'The journal position in %s, %s, is in the future; reading the last %s lines.' % (path, shown, tail_lines)
+		# A 1.69 file, or no cursor in it that passes the check.
+		self.lost(now)
+
+	def lost(self, now):
+		"""No entry to resume at (rotated away, a volatile journal after a reboot, a crash that lost it, a 1.69 file): by
+		time, as journalctl itself would go."""
+		self.cursor = None
+		if self.saved_time > now + 60:
+			self.note = 'The journal position in %s, %s, is in the future; reading the last %s lines.' % (
+				self.path, self.shown, self.tail_lines)
 			return
-		self.since = int(max(saved_time - max(0, context_time), now - resume_max))
+		self.since = self.context_since
 		self.note = 'Cannot find the last entry read before the stop (%s) in the journal; matching every line from %s.' % (
-			shown, datetime.datetime.fromtimestamp(self.since).isoformat())
-
-	def journal_command(self, command):
-		"""command reading -o export, from the saved entry or --since instead of --lines when resuming."""
-		command = [command[0], '--output=export'] + command[1:]
-		if self.cursor is not None:
-			start = ['--cursor=' + self.cursor]
-		elif self.since is not None:
-			start = ['--since=@%d' % self.since]
-		else:
-			return command
-		# --no-tail: with --follow, journalctl 219 and 239 to 252 print only the first 10 entries from --cursor and then
-		# wait for the journal to change. --since is cut so only by 219's --since=@0; it gets the flag too, all the
-		# entries being what is wanted. The flag is what undoes --lines, so it comes in its place and never beside it.
-		return [word for part in command for word in (start + ['--no-tail'] if part.startswith('--lines=') else [part])]
-
-	def read_context(self):
-		"""The (stored second, line) pairs from context_since up to the saved entry, oldest first, read as they are
-		taken; none when there is no saved entry."""
-		if self.cursor is None:
-			return iter(())
-		return _journal_context(self.journalctl, self.cursor, self.context_since, self.saved_time)
-
-	def reader(self, stream):
-		"""The capture loop's stream: lines as journalctl -o short-iso prints them, the saved entry dropped."""
-		return _ExportReader(stream, skip_cursor=self.cursor)
+			self.shown, datetime.datetime.fromtimestamp(self.since).isoformat())
 
 	def saw(self, cursor, stored, now):
 		"""Record the entry behind a line as read, before the line is handled. The periodic save (at most once per
@@ -3180,12 +3328,14 @@ class JournalPosition(object):
 
 
 def _journal_can_resume(journalctl):
-	"""True when journalctl takes the export output and --since=@seconds that resuming needs."""
+	"""True when journalctl takes the export output and --since=@seconds that resuming needs. Waited for however long it
+	takes: a refusal is an exit status, and a late answer is still an answer."""
 	try:
-		probe = subprocess.run(
-			[journalctl, '--quiet', '--no-pager', '--output=export', '--since=@%d' % int(time.time()), '--lines=0'],
-			stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=JOURNAL_PROBE_TIMEOUT)
-	except (OSError, subprocess.SubprocessError):
+		with _noted_wait('the start-up check'):
+			probe = subprocess.run(
+				[journalctl, '--quiet', '--no-pager', '--output=export', '--since=@%d' % int(time.time()), '--lines=0'],
+				stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	except OSError:
 		return False
 	return probe.returncode == 0
 
@@ -3326,13 +3476,20 @@ def _watch(resolved):
 		position_lock = _lock_position_file(resolved.position_file)
 		if position_lock is None:
 			print(f"Another firewatcher is using the journal position in {resolved.position_file}; reading the last {resolved.tail_lines} lines, without saving a position.")
-		elif _journal_can_resume(command_to_run[0]):
-			journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines,
-											   journalctl=command_to_run[0])
-			command_to_run = journal_position.journal_command(command_to_run)
-			print(journal_position.note)
 		else:
-			print(f"This journalctl cannot resume from a saved position (that needs -o export and --since=@); reading the last {resolved.tail_lines} lines.")
+			try:
+				can_resume = _journal_can_resume(command_to_run[0])
+			except KeyboardInterrupt:
+				# A stop (SIGINT, as the unit sends) while a slow journalctl is waited for.
+				if position_lock >= 0:
+					os.close(position_lock)
+				print("Exiting.")
+				return 0
+			if can_resume:
+				# Where it resumes is said once the journal has answered, after the lines below.
+				journal_position = JournalPosition(resolved.position_file, resolved.resume_max, resolved.capture_time, resolved.tail_lines)
+			else:
+				print(f"This journalctl cannot resume from a saved position (that needs -o export and --since=@); reading the last {resolved.tail_lines} lines.")
 	print(f"Monitoring {command_to_run} for patterns: {patterns}")
 	print(f"Capturing logs for {resolved.capture_time} seconds, {resolved.capture_time_max or 'no'} seconds at most.")
 	print(f"Output folder: {resolved.output_folder}")
