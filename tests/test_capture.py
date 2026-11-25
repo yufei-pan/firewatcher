@@ -262,26 +262,6 @@ def test_capture_does_not_report_dropped_lines_that_aged_out(tmp_path, monkeypat
     assert 'Older cached in-memory lines were dropped' not in text
 
 
-def test_idle_reads_stay_on_the_calling_thread(tmp_path, monkeypatch):
-    threads = []
-
-    class RecordingPopen(ScriptedPopen):
-        def __init__(self, events):
-            super().__init__(events)
-            readline = self.stdout.readline
-
-            def recording_readline(*args):
-                threads.append(threading.current_thread())
-                return readline(*args)
-
-            self.stdout.readline = recording_readline
-
-    run_scripted(tmp_path, monkeypatch, RecordingPopen(['noise\n', 'HIT now\n', 'after\n']))
-    main = threading.current_thread()
-    assert threads[0] is main and threads[1] is main
-    assert threads[2] is not main
-
-
 def test_capture_opens_the_capture_file_once(tmp_path, monkeypatch):
     opened = []
     real_open = open

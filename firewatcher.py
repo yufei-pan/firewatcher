@@ -9,11 +9,11 @@ import contextlib
 import fnmatch
 import subprocess
 import re
+import select
 import shutil
 import sys
 import builtins
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as ReadTimeout
 import time
 import datetime
 import errno
@@ -30,7 +30,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.71'
+version = '1.72'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -70,6 +70,11 @@ BACKLOG_LAG = 2
 # wait. Their first entries came after 2 to 4 ms on journals of up to 3,000,000 entries (2026-11-25); 30 s was 1.70's
 # bound on these reads.
 JOURNAL_WAIT_NOTE = 30
+# A process's output is read this much at a time: what a Linux pipe holds, so one read can empty it.
+PIPE_READ_SIZE = 1 << 16
+# The last wait of a run that read its input to the end (--filter-only, for the compressor) looks at the stop flag this
+# often; a stop in the loop reaches "Exiting." within about 0.15 s (measured on a busy capture, 2026-11-25).
+STOP_LOOK = 0.1
 # A journal cursor as journalctl writes it (systemd 219 and 257 alike); a saved cursor must match it before it is used.
 _CURSOR_RE = re.compile(r's=[0-9a-f]{32};i=[0-9a-f]{1,16};b=[0-9a-f]{32};m=[0-9a-f]{1,16};t=[0-9a-f]{1,16};x=[0-9a-f]{1,16}\Z')
 # The name of a field in journalctl -o export output.
@@ -242,8 +247,10 @@ class Log_Compressor:
 		self.worker.start()
 
 	def wait(self):
-		if self.worker is not None:
-			self.worker.join()
+		"""Until the background run ends, or a stop: a join is not woken by a signal whose handler only sets a flag, so
+		the flag is looked at every STOP_LOOK seconds."""
+		while self.worker is not None and self.worker.is_alive() and not _stop_requested:
+			self.worker.join(STOP_LOOK)
 
 	def compressLogs(self):
 		# if the compressor had been ran in the last 48 hours, don't run it again
@@ -2245,61 +2252,57 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 		capture_ends_by = None
 		captured_line_counter = 0
 
+	def read_deadline():
+		# When the read stops waiting for the log: the capture's end, its next sync, the position's next save.
+		deadline = capture_until
+		sync_due = capture.sync_due() if capture else None
+		if sync_due is not None and (deadline is None or sync_due < deadline):
+			deadline = sync_due
+		if journal_position is not None and journal_position.changed:
+			# A line the capture synced on commit leaves nothing pending, so without this its position would wait for
+			# the next line, or the end of the capture.
+			if deadline is None or journal_position.next_save < deadline:
+				deadline = journal_position.next_save
+		return deadline
+
+	def read_quiet():
+		# The log is quiet at that deadline; the read waits on afterwards.
+		if journal_position is not None:
+			# The save syncs the capture first (before_save), so a quiet journal leaves no line unsaved for long.
+			journal_position.save()
+		if capture is not None:
+			if time.time() < capture_until:
+				if capture.dirty:
+					capture.sync()
+			else:
+				end_capture(time.time())
+
 	reached_eof = False
 	try:
 		if journal_position is not None:
 			# journalctl -o export, written as -o short-iso lines, each with the entry it came from; started in the try below.
-			source = _JournalSource(journal_position, command_to_run)
+			source = _JournalSource(journal_position, command_to_run, read_deadline, read_quiet)
 		else:
 			source = subprocess.Popen(command_to_run, stdout=subprocess.PIPE)
-		with source as proc, ThreadPoolExecutor(max_workers=1) as reader:
-			# Lines end only at \n. Splitting at a bare \r as well would let a message start a line that looks
-			# like a journal entry of its own, with a timestamp the message chose.
-			stream = proc if journal_position is not None else proc.stdout
-			if isinstance(stream, io.BufferedIOBase):
-				stream = io.TextIOWrapper(stream, encoding='utf-8', errors='replace', newline='\n')
-			pending_read = None
-			line_in_flight = False
+		with source as proc:
+			if journal_position is not None:
+				stream = proc
+			else:
+				# Lines end only at \n. Splitting at a bare \r as well would let a message start a line that looks
+				# like a journal entry of its own, with a timestamp the message chose.
+				stream = io.TextIOWrapper(_stoppable(proc.stdout, read_deadline, read_quiet), encoding='utf-8',
+										  errors='replace', newline='\n')
 			try:
 				if journal_position is not None:
 					# Inside this try, so a stop (SIGINT, as the unit sends, or SIGTERM) while journalctl is waited for
 					# or the context is read back ends as one in the loop below, with journalctl ended.
 					processed_line_counter = proc.open(context)
 				while True:
-					# Set while a line read from the journal is being handled, so a stop then reads it again after the restart.
-					line_in_flight = False
 					try:
-						if pending_read is None and capture_until is None:
-							# Nothing can time out, so read inline instead of waking the reader thread per line.
-							line = stream.readline(MAX_LINE_CHARS)
-						else:
-							if pending_read is None:
-								pending_read = reader.submit(stream.readline, MAX_LINE_CHARS)
-							deadline = capture_until
-							sync_due = capture.sync_due() if capture else None
-							if sync_due is not None and (deadline is None or sync_due < deadline):
-								deadline = sync_due
-							if journal_position is not None and journal_position.changed:
-								# A line the capture synced on commit leaves nothing pending, so without this its
-								# position would wait for the next line, or the end of the capture.
-								if deadline is None or journal_position.next_save < deadline:
-									deadline = journal_position.next_save
-							remaining = None if deadline is None else max(0, deadline - time.time())
-							line = pending_read.result(timeout=remaining)
-							pending_read = None
-					except ReadTimeout:
-						if journal_position is not None:
-							# The save syncs the capture first (before_save), so a quiet journal leaves no line unsaved for long.
-							journal_position.save()
-						# Keep the same pending read while the source is quiet.
-						if capture and capture_until is not None and time.time() < capture_until:
-							if capture.dirty:
-								capture.sync()
-							continue
-						end_capture(time.time())
-						continue
+						# The wait for the log: a stop is raised here, between two lines, and the deadlines above are
+						# kept while it waits.
+						line = stream.readline(MAX_LINE_CHARS)
 					except Exception as e:
-						pending_read = None
 						read_errors += 1
 						print(f"Error reading line: {e}")
 						if read_errors >= MAX_READ_ERRORS:
@@ -2331,7 +2334,6 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					line_time = read_time
 					if journal_position is not None:
 						# Before matching, so a line that crashes firewatcher is not read again after the restart.
-						line_in_flight = True
 						journal_position.saw(stream.cursor, stream.stored, read_time)
 						# Logged while firewatcher was stopped: its own time, so a match in that backlog has the
 						# capture_time before it as context, not the whole backlog read in the same instant.
@@ -2423,7 +2425,6 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 							incident['always_notify'] = True
 							incident['always_notify_line'] = line.strip()
 						capture.commit()
-						line_in_flight = False
 						if opened and journal_position is not None:
 							# Now that the capture holds the match, a crash repeats this capture after the restart rather than losing it.
 							journal_position.save(read_time)
@@ -2437,7 +2438,6 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					elif capture:
 						capture.write(line)
 						capture.commit()
-						line_in_flight = False
 						captured_line_counter += 1
 						if capture.writing:
 							_add_to_ranges(written['ranges'], processed_line_counter)
@@ -2451,17 +2451,15 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 					if processed_line_counter % 10000 == 0:
 						print(f"Processed {processed_line_counter} lines.")
 			except KeyboardInterrupt:
-				if line_in_flight and journal_position is not None:
-					journal_position.unsee()
 				print("Exiting.")
 			finally:
 				if not reached_eof:
-					# Stop the log reader too: leaving the with block waits for its pending read.
+					# Stop the log reader too: leaving the with block waits for it to end.
 					try:
 						proc.terminate()
 					except Exception:
 						pass
-				# Finish the capture now: leaving the with block waits on the reader, which a stuck log reader could hold up.
+				# Finish the capture now: leaving the with block waits for the log reader, which a stuck one could hold up.
 				if capture:
 					end_capture(time.time())
 	finally:
@@ -2476,7 +2474,7 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 				if dispatcher is not None:
 					dispatcher.close()
 	if reached_eof:
-		# A run that read its input to the end (--filter-only) finishes compressing before it exits.
+		# A run that read its input to the end (--filter-only) finishes compressing before it exits; a stop ends that wait.
 		for log_compressor in log_compressors:
 			log_compressor.wait()
 	print("Process ended. Exiting.")
@@ -3018,6 +3016,54 @@ class _ExportReader(object):
 		return self.shown[1]
 
 
+class _DeadlineError(BaseException):
+	"""An exception from a read's on_deadline(): a bug, which ends the run, never a read error the loop reads on after."""
+
+
+class _WaitingPipe(io.RawIOBase):
+	"""A process's output pipe as a raw stream for the main thread. Each read first waits in one select() on the pipe
+	and on the wakeup pipe (_stops_wake_reads), so a stop ends the wait at once, whichever thread took its signal, and
+	is raised there as KeyboardInterrupt. Each time deadline() (a time, or None) passes while it waits, on_deadline()
+	runs and the wait goes on, so the buffered reader above it never sees a read cut short."""
+
+	def __init__(self, pipe, deadline=None, on_deadline=None):
+		io.RawIOBase.__init__(self)
+		self.fd = pipe.fileno()
+		self.deadline = deadline
+		self.on_deadline = on_deadline
+
+	def readable(self):
+		return True
+
+	def readinto(self, buffer):
+		while True:
+			if _stop_requested:
+				raise KeyboardInterrupt
+			when = None if self.deadline is None else self.deadline()
+			waits = [self.fd] if _wakeup_fd is None else [self.fd, _wakeup_fd]
+			ready = select.select(waits, [], [], None if when is None else max(0, when - time.time()))[0]
+			if _wakeup_fd is not None and _wakeup_fd in ready:
+				if _stop_signalled():
+					raise KeyboardInterrupt
+			elif ready:
+				data = os.read(self.fd, len(buffer))
+				# A stop that comes with the process's end wins over that end (a unit's stop signals journalctl too).
+				if not data and _stop_signalled():
+					raise KeyboardInterrupt
+				buffer[:len(data)] = data
+				return len(data)
+			else:
+				try:
+					self.on_deadline()
+				except Exception as exc:
+					raise _DeadlineError(exc) from exc
+
+
+def _stoppable(pipe, deadline=None, on_deadline=None):
+	"""pipe (a process's output) as a buffered stream whose waits a stop ends (_WaitingPipe)."""
+	return io.BufferedReader(_WaitingPipe(pipe, deadline, on_deadline), PIPE_READ_SIZE)
+
+
 def _journalctl_export(journalctl, *start):
 	"""journalctl -o export without --follow, from start, as a process whose output the caller reads (the caller kills it)."""
 	return subprocess.Popen([journalctl, '--all', '--no-pager', '--quiet', '--output=export'] + list(start),
@@ -3025,16 +3071,23 @@ def _journalctl_export(journalctl, *start):
 
 
 @contextlib.contextmanager
-def _noted_wait(what):
-	"""One log line when the wait inside takes JOURNAL_WAIT_NOTE seconds. It decides nothing: the wait goes on, and a
-	stop ends it as it ends any other."""
-	timer = threading.Timer(JOURNAL_WAIT_NOTE, print, ('Still waiting for journalctl after %d seconds (%s).' % (JOURNAL_WAIT_NOTE, what),))
-	timer.daemon = True
-	timer.start()
+def _noted_wait(stream, what):
+	"""One log line when a read inside waits JOURNAL_WAIT_NOTE seconds for stream (from _stoppable), a deadline of that
+	wait. It decides nothing: the wait goes on, and a stop ends it as it ends any other."""
+	pipe = stream.raw
+	note_at = time.time() + JOURNAL_WAIT_NOTE
+
+	def note():
+		nonlocal note_at
+		print('Still waiting for journalctl after %d seconds (%s).' % (JOURNAL_WAIT_NOTE, what))
+		note_at = None
+
+	kept = pipe.deadline, pipe.on_deadline
+	pipe.deadline, pipe.on_deadline = lambda: note_at, note
 	try:
 		yield
 	finally:
-		timer.cancel()
+		pipe.deadline, pipe.on_deadline = kept
 
 
 def _journal_before(journalctl, cursor, since, now):
@@ -3048,8 +3101,8 @@ def _journal_before(journalctl, cursor, since, now):
 	except OSError:
 		return
 	try:
-		reader = _ExportReader(proc.stdout)
-		with _noted_wait('the read back from the saved entry'):
+		reader = _ExportReader(_stoppable(proc.stdout))
+		with _noted_wait(reader.stream, 'the read back from the saved entry'):
 			entry = reader.entry()
 		if entry is None or entry[0] != cursor:
 			return
@@ -3070,16 +3123,16 @@ class _JournalSource(object):
 	and stored second of the entry behind the last line, terminate(). From a saved entry or a time, journalctl reads
 	without --follow to the journal's end, which takes in every boot the journal holds (a follow shows only the newest
 	from systemd 252 on), and then follows from the last entry read. command is the follow command of a first start
-	(--lines=N, --follow)."""
+	(--lines=N, --follow). Each journalctl's output is read with deadline() and on_deadline() (_WaitingPipe)."""
 
-	def __init__(self, position, command):
+	def __init__(self, position, command, deadline=None, on_deadline=None):
 		self.position = position
 		self.command = command
+		self.deadline = deadline
+		self.on_deadline = on_deadline
 		self.proc = None
 		self.reader = None
 		self.following = False
-		# terminate() was called: no journalctl is started after it, and one starting then is ended.
-		self.stopped = False
 		# journalctl failed before its first entry, or at the end of the read without --follow: the next read ends the run.
 		self.ended = False
 		# Where the follow starts: the last entry read without --follow, or with none read, the time that read started at.
@@ -3098,13 +3151,8 @@ class _JournalSource(object):
 			self._close()
 
 	def terminate(self):
-		self.stopped = True
-		proc = self.proc
-		if proc is not None:
-			try:
-				proc.terminate()
-			except OSError:
-				pass  # ended and reaped by the reader thread meanwhile
+		if self.proc is not None:
+			self.proc.terminate()
 
 	def _start(self, start=None, follow=True, skip=None):
 		"""Start journalctl -o export: the follow command as given, or from start (--cursor or --since in place of
@@ -3114,12 +3162,8 @@ class _JournalSource(object):
 			command = [word for word in command if not word.startswith('--lines=') and word != '--follow'] + start
 			if follow:
 				command.append('--follow')
-		proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
-		self.proc = proc
-		if self.stopped:
-			# The stop came while it started.
-			proc.terminate()
-		self.reader = _ExportReader(proc.stdout, skip_cursor=skip)
+		self.proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+		self.reader = _ExportReader(_stoppable(self.proc.stdout, self.deadline, self.on_deadline), skip_cursor=skip)
 		self.following = follow
 
 	def _close(self):
@@ -3135,7 +3179,7 @@ class _JournalSource(object):
 		position = self.position
 		if position.cursor is not None:
 			self._start(['--cursor=' + position.cursor], follow=False)
-			with _noted_wait('the read from the saved entry'):
+			with _noted_wait(self.reader.stream, 'the read from the saved entry'):
 				first = self.reader.entry()
 			if first is not None and first[0] == position.cursor:
 				self.last = first[0]
@@ -3170,7 +3214,7 @@ class _JournalSource(object):
 	def readline(self, limit=-1):
 		while not self.ended:
 			line = self.reader.readline(limit)
-			if line or self.following or self.stopped:
+			if line or self.following:
 				return line
 			# The end of the read without --follow. A journalctl that ended with a failure (it died part-way, or was
 			# stopped by a signal that did not reach firewatcher) ends the run, as a follow that dies does: the position
@@ -3221,8 +3265,6 @@ class JournalPosition(object):
 		# Called before every write of a changed position; capture_messages sets it to sync the open capture first.
 		self.before_save = None
 		self.save_failed = False
-		# What saw() changed for the line being handled, for unsee().
-		self.before = None
 		try:
 			with open(path, 'r', encoding='utf-8') as f:
 				record = json.load(f)
@@ -3265,24 +3307,14 @@ class JournalPosition(object):
 
 	def saw(self, cursor, stored, now):
 		"""Record the entry behind a line as read, before the line is handled. The periodic save (at most once per
-		POSITION_SAVE_INTERVAL) runs first, so it never covers a line still being handled; unsee() takes it back."""
-		# Cleared first: a stop that lands inside the save below must not make unsee() take back the line before
-		# this one, which was already handled in full.
-		self.before = None
+		POSITION_SAVE_INTERVAL) runs first, so it never covers a line still being handled."""
 		if self.changed and now >= self.next_save:
 			self.save(now)
-		self.before = (self.last_cursor, self.stamp_time, self.changed)
 		if cursor == self.last_cursor:
 			return
 		self.last_cursor = cursor
 		self.stamp_time = stored
 		self.changed = True
-
-	def unsee(self):
-		"""Take back the line saw() recorded last: a stop came before it was handled, so the next run reads it again."""
-		if self.before is not None:
-			self.last_cursor, self.stamp_time, self.changed = self.before
-			self.before = None
 
 	def save(self, now=None):
 		"""Write the position atomically; a failure is logged once and retried at the next save."""
@@ -3329,14 +3361,23 @@ class JournalPosition(object):
 
 def _journal_can_resume(journalctl):
 	"""True when journalctl takes the export output and --since=@seconds that resuming needs. Waited for however long it
-	takes: a refusal is an exit status, and a late answer is still an answer."""
+	takes: a refusal is an exit status, and a late answer is still an answer. It prints nothing (--lines=0), so the end
+	of its output is its end."""
 	try:
-		with _noted_wait('the start-up check'):
-			probe = subprocess.run(
-				[journalctl, '--quiet', '--no-pager', '--output=export', '--since=@%d' % int(time.time()), '--lines=0'],
-				stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		probe = subprocess.Popen(
+			[journalctl, '--quiet', '--no-pager', '--output=export', '--since=@%d' % int(time.time()), '--lines=0'],
+			stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 	except OSError:
 		return False
+	with probe:
+		answer = _stoppable(probe.stdout)
+		try:
+			with _noted_wait(answer, 'the start-up check'):
+				answer.read()
+		except KeyboardInterrupt:
+			# A stop: its answer is not waited for.
+			probe.kill()
+			raise
 	return probe.returncode == 0
 
 
@@ -3404,11 +3445,59 @@ def _load_pattern_sets(pattern_sources, always_notify_sources):
 	return patterns, always_notify_patterns
 
 
-def _stop_on_sigterm(signum, frame):
-	"""SIGTERM ends the run like Ctrl-C, so the open capture is finished and handed to the dispatcher."""
-	# A second SIGTERM gets the default action and ends the process at once.
+# The read end of the pipe that Python writes each handled signal's number to (signal.set_wakeup_fd), from whichever
+# thread the kernel hands the signal to; None outside _stops_wake_reads(). Every wait of the main thread for a process's
+# output selects on it too (_WaitingPipe), so a stop ends the wait at once.
+_wakeup_fd = None
+# Set by SIGTERM and SIGINT inside _stops_wake_reads().
+_stop_requested = False
+
+
+def _request_stop(signum, frame):
+	"""SIGTERM or SIGINT: only noted. The main thread's wait for the log raises it as KeyboardInterrupt, between two
+	lines, so the open capture is finished and handed to the dispatcher, and the line being handled is finished first. A
+	second one gets the default action and ends the process at once."""
+	global _stop_requested
+	_stop_requested = True
 	signal.signal(signum, signal.SIG_DFL)
-	raise KeyboardInterrupt
+
+
+def _stop_signalled():
+	"""Whether a stop came: its flag, or its byte on the wakeup pipe, there before its handler has run. Takes what the
+	wakeup pipe holds, a byte per signal (another signal's byte is dropped: its handler runs on its own)."""
+	numbers = b''
+	if _wakeup_fd is not None:
+		try:
+			numbers = os.read(_wakeup_fd, 4096)
+		except BlockingIOError:
+			pass
+	return _stop_requested or signal.SIGTERM in numbers or signal.SIGINT in numbers
+
+
+@contextlib.contextmanager
+def _stops_wake_reads():
+	"""Inside, SIGTERM and SIGINT end the run at the main thread's next wait for the log, whichever thread takes them."""
+	global _wakeup_fd, _stop_requested
+	read_end, write_end = os.pipe()
+	os.set_blocking(read_end, False)
+	os.set_blocking(write_end, False)
+	_stop_requested = False
+	try:
+		kept_fd = signal.set_wakeup_fd(write_end, warn_on_full_buffer=False)
+	except TypeError:  # Python 3.6 has no warn_on_full_buffer
+		kept_fd = signal.set_wakeup_fd(write_end)
+	kept = [(signum, signal.signal(signum, _request_stop)) for signum in (signal.SIGTERM, signal.SIGINT)]
+	_wakeup_fd = read_end
+	try:
+		yield
+	finally:
+		_wakeup_fd = None
+		for signum, handler in kept:
+			if handler is not None:
+				signal.signal(signum, handler)
+		signal.set_wakeup_fd(kept_fd)
+		os.close(read_end)
+		os.close(write_end)
 
 
 def main(argv=None):
@@ -3442,14 +3531,16 @@ def main(argv=None):
 		return 0
 	if args.install_service:
 		return install_service(resolved, raw=args)
-	print(f"Starting firewatcher v{version}")
 	# SIGHUP reloads the pattern files, but not in a terminal, where it means the terminal went away. It is
 	# handled from here on, so a reload right after a start does not end the process while it starts up.
 	previous_sighup = None
 	if not _isatty(sys.stdin):
 		previous_sighup = signal.signal(signal.SIGHUP, _request_reload)
 	try:
-		return _watch(resolved)
+		# A stop from the first line printed on is acted on at the next wait for the log.
+		with _stops_wake_reads():
+			print(f"Starting firewatcher v{version}")
+			return _watch(resolved)
 	finally:
 		if previous_sighup is not None:
 			signal.signal(signal.SIGHUP, previous_sighup)
@@ -3510,7 +3601,6 @@ def _watch(resolved):
 		print(f"Sending captures to {_url_origin(resolved.events_url)}.")
 	if always_notify_patterns:
 		print(f"Always notify for patterns: {always_notify_patterns}")
-	previous_sigterm = signal.signal(signal.SIGTERM, _stop_on_sigterm)
 	try:
 		capture_messages(
 			command_to_run, patterns,
@@ -3530,8 +3620,6 @@ def _watch(resolved):
 			journal_position=journal_position,
 		)
 	finally:
-		if previous_sigterm is not None:
-			signal.signal(signal.SIGTERM, previous_sigterm)
 		if position_lock is not None and position_lock >= 0:
 			os.close(position_lock)
 	return 0

@@ -112,7 +112,7 @@ def test_parser_rejects_conflicting_service_flags():
 def test_module_has_no_nebula_product_name():
     src = open(fw.__file__, encoding='utf-8').read().lower()
     assert 'nebula' not in src
-    assert fw.version == '1.71'
+    assert fw.version == '1.72'
     assert fw.__version__ == fw.version
 
 
@@ -193,15 +193,16 @@ def test_main_keeps_capturing_when_always_notify_loads_nothing(tmp_path, monkeyp
     assert incident_logs(out)
 
 
-def test_main_passes_always_notify_and_restores_sigterm(tmp_path, monkeypatch, capsys):
+def test_main_passes_always_notify_and_restores_the_stop_handlers(tmp_path, monkeypatch, capsys):
     seen = {}
 
     def fake_capture(command, patterns, **kwargs):
         seen.update(kwargs)
-        seen['sigterm'] = signal.getsignal(signal.SIGTERM)
+        seen['handlers'] = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
+        seen['wakeup'] = fw._wakeup_fd
 
     monkeypatch.setattr(fw, 'capture_messages', fake_capture)
-    before = signal.getsignal(signal.SIGTERM)
+    before = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
     pat = tmp_path / 'p.txt'
     pat.write_text('HIT\n')
     always = tmp_path / 'always.txt'
@@ -214,20 +215,10 @@ def test_main_passes_always_notify_and_restores_sigterm(tmp_path, monkeypatch, c
     assert seen['always_notify_patterns'] == {'fnmatch': {'*I/O error*'}}
     assert seen['capture_time_max'] == 90
     assert seen['fallback_folder'] is None
-    assert seen['sigterm'] is fw._stop_on_sigterm
-    assert signal.getsignal(signal.SIGTERM) == before
+    # a stop only sets a flag, and its byte on the wakeup pipe ends the wait for the log (tests/test_stop.py)
+    assert seen['handlers'] == (fw._request_stop, fw._request_stop) and seen['wakeup'] is not None
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == before and fw._wakeup_fd is None
     assert 'Always notify for patterns' in capsys.readouterr().out
-
-
-def test_stop_on_sigterm_interrupts_once_then_takes_the_default():
-    previous = signal.getsignal(signal.SIGTERM)
-    try:
-        signal.signal(signal.SIGTERM, fw._stop_on_sigterm)
-        with pytest.raises(KeyboardInterrupt):
-            fw._stop_on_sigterm(signal.SIGTERM, None)
-        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
-    finally:
-        signal.signal(signal.SIGTERM, previous)
 
 
 def test_sigterm_finishes_the_open_capture(tmp_path):
