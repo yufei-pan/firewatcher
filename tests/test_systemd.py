@@ -1072,3 +1072,28 @@ def test_a_secret_that_is_not_written_is_no_reason_to_refuse(tmp_path, monkeypat
                               systemctl=ok_systemctl, executable='/bin/fw') == 0
     assert (tmp_path / 'units' / 'firewatcher.service').exists()
     assert fw.main(['--print-unit', '--config', str(conf), 'p.txt']) == 0
+
+
+def test_print_unit_refuses_what_the_install_refuses(tmp_path, capsys):
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    conf = tmp_path / 'firewatcher.conf'
+    conf.write_text('')
+    assert fw.main(['--print-unit', '--config', str(conf), '--unit-name', 'a b', str(pat)]) == 2
+    assert 'unit name must be one systemd can load' in capsys.readouterr().err
+    assert fw.main(['--print-unit', '--config', str(conf), '--unit-name', 'good', str(pat)]) == 0
+
+
+def test_a_failed_install_through_a_dangling_link_removes_what_it_wrote_there(tmp_path, capsys):
+    unit_dir = tmp_path / 'system'
+    unit_dir.mkdir()
+    target = tmp_path / 'elsewhere.service'
+    link = unit_dir / 'firewatcher.service'
+    link.symlink_to(target)
+    systemctl = Systemctl(str(link), lambda cmd: 7 if 'daemon-reload' in cmd else 0)
+    rc = fw.install_service(parse_cli(['--install-service', str(tmp_path / 'p.d')]), systemd_available=True,
+                            unit_dir=str(unit_dir), executable='/bin/fw', systemctl=systemctl)
+    assert rc == 7
+    # as before the install: the link, still dangling, and no file at its target naming the config it removed
+    assert os.path.islink(str(link)) and not target.exists() and not os.path.exists(fw.DEFAULT_CONFIG_PATH)
+    assert 'Removed %s' % target in capsys.readouterr().err
