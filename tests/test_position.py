@@ -12,7 +12,8 @@ import zlib
 import pytest
 
 import firewatcher as fw
-from conftest import ROOT, Clock, ScriptedPopen, fake_exists, incident_logs, patch_popen, use_journal
+from conftest import ROOT, Clock, Feed, ScriptedPopen, fake_exists, incident_logs, patch_popen, use_journal
+from test_stop import EXITING, LAUNCH
 
 # --- resuming the journal after a restart ---
 
@@ -104,7 +105,7 @@ def saved(tmp_path):
 
 
 class FakeProc(object):
-    """A journalctl process: its stdout (an ExportStdout) and the exit status wait() gives."""
+    """A journalctl process: its stdout (an ExportStdout, read through a pipe) and the exit status wait() gives."""
 
     def __init__(self, stdout, status):
         self.stdout = stdout
@@ -143,7 +144,7 @@ class FakeJournalctl(object):
         else:
             kind = 'cursor'
         events, status = self.runs.get(kind, ([], 0))
-        proc = FakeProc(ExportStdout(events), status)
+        proc = FakeProc(Feed(ExportStdout(events)), status)
         self.procs.append((kind, proc))
         return proc
 
@@ -330,24 +331,6 @@ def test_a_stop_while_journalctl_is_waited_for_or_the_context_read_back_ends_as_
     assert (tmp_path / 'journal.position').read_text() == before
 
 
-def test_a_stop_before_the_handover_starts_no_follow(tmp_path, monkeypatch):
-    position = saved_at(tmp_path, 0, 'saved')
-    source = fw._JournalSource(position, FOLLOW)
-    journalctl = FakeJournalctl(monkeypatch, cursor=([entry(0, 'saved')], 0))
-    source.open(fw.ContextBuffer(60, 1 << 20))
-    source.terminate()
-    assert source.readline() == '' and journalctl.kinds() == ['cursor', 'reverse']
-
-
-def test_a_follow_that_starts_after_the_stop_is_ended_at_once(tmp_path, monkeypatch):
-    position = saved_at(tmp_path, 0, 'saved')
-    journalctl = FakeJournalctl(monkeypatch, cursor=([entry(0, 'saved')], 0))
-    source = fw._JournalSource(position, FOLLOW)
-    source.stopped = True
-    source._start(['--cursor=' + cursor(0, 'saved'), '--no-tail'], skip=cursor(0, 'saved'))
-    assert journalctl.procs[-1][1].terminated
-
-
 def test_resume_max_zero_reads_nothing_back(tmp_path):
     path = tmp_path / 'journal.position'
     save_position(path, 0, 'x')
@@ -463,26 +446,6 @@ def test_a_failed_save_is_retried_while_the_journal_is_quiet_and_logged_once_per
     position.save(103.0)
     assert capsys.readouterr().out.count('cannot save the journal position') == 1
     assert json.loads(path.read_text())['cursor'] == cursor(0, 'a')
-
-
-def test_a_stop_inside_the_save_of_saw_does_not_take_back_the_line_before(tmp_path):
-    path = tmp_path / 'journal.position'
-    position = fw.JournalPosition(str(path), now=T)
-    position.saw(cursor(0, 'A'), T, 100.0)
-    position.save(100.0)
-    position.saw(cursor(1, 'B'), T + 1, 100.5)  # B is handled in full
-
-    def stop():
-        raise KeyboardInterrupt  # where SIGTERM lands: in the capture or position fsync of this save
-
-    position.before_save = stop
-    with pytest.raises(KeyboardInterrupt):
-        position.saw(cursor(2, 'C'), T + 2, 101.5)  # C is in flight
-    position.unsee()  # what capture_messages does for the line in flight
-    position.before_save = None
-    position.save()
-    # B was handled, so the restart must not read it again
-    assert json.loads(path.read_text())['cursor'] == cursor(1, 'B')
 
 
 def test_save_without_a_new_entry_writes_nothing(tmp_path, monkeypatch):
@@ -607,20 +570,22 @@ def test_journal_can_resume_probes_journalctl(tmp_path):
 
 
 def test_the_start_up_check_has_no_timeout(tmp_path, monkeypatch):
-    # A timeout of any length would turn resuming off for the run when journalctl answers later (1.70 gave it 30 s).
-    seen = []
-    real_run = subprocess.run
+    # A timeout of any length would turn resuming off for the run when journalctl answers later (1.70 gave it 30 s):
+    # the wait's only deadline is the note's, and after it the wait has none.
+    monkeypatch.setattr(fw, 'JOURNAL_WAIT_NOTE', 0.2)
+    timeouts = []
+    real = fw.select.select
 
-    def recording(*args, **kwargs):
-        seen.append(kwargs)
-        return real_run(*args, **kwargs)
+    def recording(rlist, wlist, xlist, timeout=None):
+        timeouts.append(timeout)
+        return real(rlist, wlist, xlist, timeout)
 
-    monkeypatch.setattr(fw.subprocess, 'run', recording)
-    ok = tmp_path / 'ok'
-    ok.write_text('#!/bin/sh\nexit 0\n')
-    ok.chmod(0o755)
-    assert fw._journal_can_resume(str(ok))
-    assert len(seen) == 1 and 'timeout' not in seen[0]
+    monkeypatch.setattr(fw.select, 'select', recording)
+    slow = tmp_path / 'slow'
+    slow.write_text('#!/bin/sh\nsleep 0.6\nexit 0\n')
+    slow.chmod(0o755)
+    assert fw._journal_can_resume(str(slow))
+    assert timeouts[0] <= 0.2 and timeouts[-1] is None and timeouts.count(None) == len(timeouts) - timeouts.index(None)
 
 
 def test_a_slow_answer_to_the_start_up_check_still_counts_and_is_noted_once(tmp_path, monkeypatch, capsys):
@@ -739,25 +704,31 @@ class Daemon(object):
     def line(self, offset, text):
         return jline(0, text, when=self.now + offset)
 
-    def run_until(self, done):
-        """One run, stopped with SIGTERM once done() or after 20 seconds; its output. A run that hands over to the follow
-        is stopped only after the follow started: a stop sent while the reader thread starts it can be taken by that
-        thread and wait for the next line (limitations, the 1.72 entry)."""
-        proc = subprocess.Popen(
+    def run_until(self, done, stop_taken_by=None):
+        """One run, stopped with SIGTERM once done() or after 20 seconds; its output. stop_taken_by: the SIGTERM is
+        handed to that thread of firewatcher ('another thread': one of the test's own), not sent to the process."""
+        argv = ['--config', str(self.conf), '-o', str(self.out), '-t', '60',
+                '--fallback-folder', '', '--position-file', str(self.position_file), str(self.pat)]
+        if stop_taken_by is None:
             # as on a journald host, whatever runs on the machine running the tests
-            [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import firewatcher as fw; '
-             'fw._journald_present = lambda: True; sys.exit(fw.main(sys.argv[2:]))', str(ROOT),
-             '--config', str(self.conf), '-o', str(self.out), '-t', '60',
-             '--fallback-folder', '', '--position-file', str(self.position_file), str(self.pat)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-            env=self.env,
+            argv = ['-c', 'import sys; sys.path.insert(0, sys.argv[1]); import firewatcher as fw; '
+                    'fw._journald_present = lambda: True; sys.exit(fw.main(sys.argv[2:]))', str(ROOT)] + argv
+        else:
+            argv = ['-c', LAUNCH, str(ROOT), stop_taken_by, str(int(signal.SIGTERM))] + argv
+        proc = subprocess.Popen(
+            [sys.executable] + argv, stdin=subprocess.PIPE if stop_taken_by else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=self.env,
         )
         self.proc = proc
         try:
             deadline = time.time() + 20
             while not done() and time.time() < deadline:
                 time.sleep(0.05)
-            proc.send_signal(signal.SIGTERM)
+            if stop_taken_by is None:
+                proc.send_signal(signal.SIGTERM)
+            else:
+                proc.stdin.write('go\n')
+                proc.stdin.flush()
             output, _ = proc.communicate(timeout=20)
         finally:
             if proc.poll() is None:
@@ -841,7 +812,7 @@ def test_a_restart_after_a_reboot_reads_what_the_old_boot_logged_after_the_stop(
     daemon.run_until(lambda: daemon.captured(1, 'saved', now - 50))
     daemon.write(*first_journal + [(-40, 'HIT during shutdown', old), (-39, 'HIT unmount failed', old), (-20, 'booted'),
                                    (-10, 'HIT in the new boot'), (-5, 'later')])
-    second = daemon.run_until(lambda: daemon.saved().get('time') == now - 5 and daemon.following())
+    second = daemon.run_until(lambda: daemon.saved().get('time') == now - 5)
     assert 'Resuming the journal after' in second
     logs = incident_logs(daemon.out)
     assert len(logs) == 2
@@ -870,7 +841,7 @@ def test_a_restart_whose_read_is_cut_part_way_ends_the_run_and_the_next_start_re
     assert len(incident_logs(daemon.out)) == 2 and 'HIT read' in incident_logs(daemon.out)[1].read_text()
     # the next start reads on from that entry: each line after it once, the cut one whole
     (daemon.bin_dir / 'cut.txt').unlink()
-    third = daemon.run_until(lambda: daemon.captured(3, 'HIT late', now - 5) and daemon.following())
+    third = daemon.run_until(lambda: daemon.captured(3, 'HIT late', now - 5))
     assert 'Resuming the journal after' in third
     text = incident_logs(daemon.out)[2].read_text()
     assert 'Matched line:    %s' % line(-5, 'HIT late').strip() in text
@@ -924,7 +895,7 @@ def test_a_restart_with_a_position_file_of_1_69_matches_every_line_of_the_window
     line, now = daemon.line, daemon.now
     daemon.write((-30, 'HIT before the upgrade'), (-10, 'HIT after it'))
     daemon.position_file.write_text(json.dumps({'time': now - 20, 'line': 1, 'sha1': 'f' * 40}))
-    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after it', now - 10) and daemon.following())
+    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after it', now - 10))
     assert 'Cannot find the last entry read before the stop' in second
     assert daemon.reads()[0] == '--output=export --all --no-pager --since=@%d' % (now - 20 - 60)
     assert 'Matched line:    %s' % line(-30, 'HIT before the upgrade').strip() in incident_logs(daemon.out)[0].read_text()
@@ -943,7 +914,7 @@ def test_a_journalctl_that_fails_on_the_read_from_the_saved_entry_ends_the_run_a
     assert 'journalctl ended with status' in output and 'Process ended.' in output and 'Traceback' not in output
     assert daemon.position_file.read_text() == before and incident_logs(daemon.out) == []
     daemon.unwrap()
-    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after', now - 10) and daemon.following())
+    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after', now - 10))
     assert 'Resuming the journal after' in second
     # the window's match is context, not a capture of its own
     assert len(incident_logs(daemon.out)) == 1
@@ -956,18 +927,20 @@ def test_a_restart_on_a_journal_without_the_saved_entry_and_a_clock_set_back_mat
     daemon.run_until(lambda: daemon.captured(1, 'last line read', now - 20))
     # A reboot with a volatile journal (CentOS 7's default) lost the saved entry, and the clock came back behind it.
     daemon.write((-50, 'booted with the clock behind'), (-49, 'HIT after the reboot'))
-    second = daemon.run_until(lambda: len(incident_logs(daemon.out)) == 2 and daemon.saved().get('time') == now - 49 and daemon.following())
+    second = daemon.run_until(lambda: len(incident_logs(daemon.out)) == 2 and daemon.saved().get('time') == now - 49)
     assert 'Cannot find the last entry read before the stop' in second
     logs = incident_logs(daemon.out)
     assert len(logs) == 2
     assert 'Matched line:    %s' % line(-49, 'HIT after the reboot').strip() in logs[1].read_text()
 
 
-@pytest.mark.parametrize('stalled', ['the read from the saved entry', 'the read back'])
-def test_a_stop_signal_while_journalctl_is_waited_for_at_a_restart_exits_cleanly(tmp_path, stalled):
-    # A real SIGTERM and real processes: the journalctl reading from the saved entry prints nothing, or the one reading
-    # back prints the start of its first entry (head -c 200 ends inside it), and stalls. The stop must end firewatcher
-    # with exit 0 (run_until asserts it), the position as it was, and that journalctl with it.
+@pytest.mark.parametrize('taken_by', [None, 'another thread'], ids=['the process', 'another thread'])
+@pytest.mark.parametrize('stalled', ['the start-up check', 'the read from the saved entry', 'the read back'])
+def test_a_stop_signal_while_journalctl_is_waited_for_at_a_restart_exits_cleanly(tmp_path, stalled, taken_by):
+    # A real SIGTERM and real processes: the start-up check or the journalctl reading from the saved entry prints
+    # nothing, or the one reading back prints the start of its first entry (head -c 200 ends inside it), and stalls. The
+    # stop, sent to the process or taken by another thread (1.71 then waited for journalctl), must end firewatcher with
+    # exit 0 (run_until asserts it), the position as it was, and that journalctl with it.
     daemon = Daemon(tmp_path)
     now = daemon.now
     daemon.write((-50, 'context'), (-10, 'saved'), (-5, 'HIT after'))
@@ -976,10 +949,13 @@ def test_a_stop_signal_while_journalctl_is_waited_for_at_a_restart_exits_cleanly
     stall = 'echo $$ > %s/stalled.pid; exec sleep 30' % daemon.bin_dir
     if stalled == 'the read back':
         daemon.wrap('case " $* " in *" --reverse "*) $FAKE "$@" | head -c 200; %s ;; esac' % stall)
+    elif stalled == 'the start-up check':
+        daemon.wrap('case " $* " in *" --lines=0 "*) %s ;; esac' % stall)
     else:
         daemon.wrap('case " $* " in *" --reverse "*|*" --follow "*) ;; *" --cursor="*) %s ;; esac' % stall)
-    output = daemon.run_until(lambda: (daemon.bin_dir / 'stalled.pid').exists())
-    assert 'Exiting.' in output and 'Traceback' not in output and 'Resuming' not in output
+    output = daemon.run_until(lambda: (daemon.bin_dir / 'stalled.pid').exists(), taken_by)
+    assert EXITING.search(output) and 'journalctl ended with status' not in output
+    assert 'Traceback' not in output and 'Resuming' not in output
     assert daemon.position_file.read_text() == before
     pid = int((daemon.bin_dir / 'stalled.pid').read_text())
     deadline = time.time() + 10
@@ -1120,6 +1096,39 @@ def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monke
     run(tmp_path, monkeypatch, [entry(0, 'quiet'), entry(0, 'HIT one'), entry(0, 'HIT two'), entry(0, 'after')], position)
     # the first line, the match that opened the capture (not the one that extended it), and the last line at exit
     assert saves == [cursor(0, 'quiet'), cursor(0, 'HIT one'), cursor(0, 'after')]
+
+
+def test_the_position_of_a_line_that_matches_nothing_is_saved_while_the_journal_is_quiet(tmp_path, monkeypatch):
+    # No capture is open, and no later line or stop comes to save it: the wait's own deadline does. 1.71 saved it only at
+    # the next line or the stop.
+    monkeypatch.setattr(fw, 'POSITION_SAVE_INTERVAL', 0.3)  # a real second would only make the test slower
+    path = tmp_path / 'journal.position'
+
+    class QuietAfter(ExportStdout):
+        """Its entries, then up to 5 s (far past the 0.3 s above) of silence in which the position file is watched; then
+        the end of the output, which saves the position at exit whatever came before."""
+        found = False
+
+        def _fill(self):
+            if super()._fill():
+                return True
+            end = time.time() + 5
+            while not self.found and time.time() < end:
+                try:
+                    self.found = json.loads(path.read_text())['cursor'] == cursor(0, 'second')
+                except (OSError, ValueError, KeyError):
+                    pass
+                time.sleep(0.02)
+            return False
+
+    popen = ScriptedPopen([])
+    popen.stdout = QuietAfter([entry(0, 'first'), entry(0, 'second')])
+    patch_popen(monkeypatch, popen)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                        compress_after_months=0, delete_after_months=0, journal_position=fw.JournalPosition(str(path), now=T))
+    assert popen.stdout.script.found, 'the second line was not saved while the journal was quiet'
 
 
 def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch, capsys):
@@ -1297,59 +1306,11 @@ def test_a_carriage_return_in_a_message_cannot_start_a_line_of_its_own(tmp_path,
     assert len(logs) == 1 and b'app[1]: x\r2026-13-01T00:00:00Z HIT poison' in logs[0].read_bytes()
 
 
-def _stopped_run(tmp_path, monkeypatch, events, stop_at=None, **kwargs):
-    position = fw.JournalPosition(str(tmp_path / 'journal.position'), now=T)
-    real_write = fw.CaptureFile.write
-
-    def write(self, text):
-        if stop_at is not None and stop_at in text:
-            raise KeyboardInterrupt  # where SIGINT or SIGTERM would land
-        return real_write(self, text)
-
-    monkeypatch.setattr(fw.CaptureFile, 'write', write)
-    run(tmp_path, monkeypatch, events, position, **kwargs)
-    monkeypatch.setattr(fw.CaptureFile, 'write', real_write)
-    return saved(tmp_path)['cursor']
-
-
-def test_a_stop_while_a_line_is_handled_reads_it_again(tmp_path, monkeypatch):
-    events = [entry(0, 'HIT'), entry(0, 'post-1'), entry(1, 'post-2'), entry(1, 'post-3')]
-    assert _stopped_run(tmp_path, monkeypatch, events, stop_at='post-2') == cursor(0, 'post-1')
-
-
 def test_a_stop_between_lines_keeps_the_last_one_read(tmp_path, monkeypatch):
-    events = [entry(0, 'HIT'), entry(0, 'post-1'), KeyboardInterrupt()]
-    assert _stopped_run(tmp_path, monkeypatch, events) == cursor(0, 'post-1')
-
-
-def test_a_stop_after_a_match_is_captured_does_not_capture_it_again(tmp_path, monkeypatch):
-    class StopAtOpen(fw.JournalPosition):
-        stopped = False
-
-        def save(self, now=None):
-            if self.changed and not self.stopped:
-                self.stopped = True
-                raise KeyboardInterrupt  # lands as the capture that holds the match is saved
-            super().save(now)
-
-    run(tmp_path, monkeypatch, [entry(0, 'HIT'), entry(0, 'post-1')], StopAtOpen(str(tmp_path / 'journal.position'), now=T))
-    assert saved(tmp_path)['cursor'] == cursor(0, 'HIT')
-
-
-def test_a_stop_after_a_line_is_written_does_not_read_it_again(tmp_path, monkeypatch):
-    real_end = fw._end_capture
-    calls = []
-
-    def stop_once(*args, **kwargs):
-        calls.append(1)
-        if len(calls) == 1:
-            raise KeyboardInterrupt  # lands as the line cap ends the capture, after post-2 is written
-        return real_end(*args, **kwargs)
-
-    monkeypatch.setattr(fw, '_end_capture', stop_once)
-    events = [entry(0, 'HIT'), entry(0, 'post-1'), entry(0, 'post-2'), entry(1, 'post-3')]
-    run(tmp_path, monkeypatch, events, fw.JournalPosition(str(tmp_path / 'journal.position'), now=T), capture_line_count_max=1)
-    assert saved(tmp_path)['cursor'] == cursor(0, 'post-2')
+    # the stop comes in the wait for the next line (the scripted KeyboardInterrupt): the line before it was handled
+    run(tmp_path, monkeypatch, [entry(0, 'HIT'), entry(0, 'post-1'), KeyboardInterrupt()],
+        fw.JournalPosition(str(tmp_path / 'journal.position'), now=T))
+    assert saved(tmp_path)['cursor'] == cursor(0, 'post-1')
 
 
 def test_save_never_follows_a_link_planted_where_the_file_is_written(tmp_path):

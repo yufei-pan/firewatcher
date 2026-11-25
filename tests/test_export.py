@@ -216,7 +216,7 @@ def test_an_old_position_reads_back_only_resume_max_without_the_cursor(tmp_path,
     assert position.cursor is None and position.since == T + 3000 and 'seconds old' in position.note
 
 
-def test_saw_saves_the_cursor_and_stored_second_and_unsee_takes_it_back(tmp_path):
+def test_saw_saves_the_cursor_and_stored_second(tmp_path):
     path = tmp_path / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
     position.saw(cursor(1), T + 1, 100.0)
@@ -224,6 +224,5 @@ def test_saw_saves_the_cursor_and_stored_second_and_unsee_takes_it_back(tmp_path
     position.saw(cursor(1), T + 1, 100.5)  # a later line of the same entry
     assert json.loads(path.read_text()) == {'cursor': cursor(1), 'time': T + 1}
     position.saw(cursor(2), T + 2, 100.6)
-    position.unsee()
     position.save()
-    assert json.loads(path.read_text()) == {'cursor': cursor(1), 'time': T + 1}
+    assert json.loads(path.read_text()) == {'cursor': cursor(2), 'time': T + 2}

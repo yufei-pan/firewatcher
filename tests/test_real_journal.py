@@ -1,19 +1,23 @@
 """Restarts of firewatcher on the real journalctl, reading journals written with systemd-journal-remote through
 `journalctl -D`. Skipped where either program is missing, unless FIREWATCHER_REQUIRE_JOURNALCTL is set (CI), which
 makes their absence a failure. With -D, journalctl 252 and later follow the folder's newest boot."""
+import collections
 import json
 import os
+import random
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
 import pytest
 
 from conftest import ROOT, incident_logs
+from test_stop import EXITING, read_until
 
 JOURNALCTL = shutil.which('journalctl')
 JOURNAL_REMOTE = next((path for path in ('/lib/systemd/systemd-journal-remote', '/usr/lib/systemd/systemd-journal-remote')
@@ -229,3 +233,125 @@ def test_a_restart_after_the_clock_was_set_back_takes_no_later_line_as_context(j
     assert openers == ['HIT post 7']
     assert messages(lines) == ['pre %d' % k for k in range(29)] + ['saved'] + \
         [('HIT post %d' if k % 100 == 7 else 'post %d') % k for k in range(400)]
+
+
+def _children(pid):
+    """The processes whose parent is pid (firewatcher's journalctls)."""
+    found = []
+    for name in os.listdir('/proc'):
+        if name.isdigit():
+            try:
+                with open('/proc/%s/stat' % name) as f:
+                    if int(f.read().rsplit(')', 1)[1].split()[1]) == pid:
+                        found.append(int(name))
+            except (OSError, ValueError, IndexError):
+                pass
+    return found
+
+
+def _kill_all(proc, known):
+    """SIGKILL firewatcher and its journalctls: the ones it has now and the ones (known) from before. They hold the
+    test's pipe as their stderr, so a read of it would not end until they do."""
+    for pid in (_children(proc.pid) if proc.poll() is None else []) + list(known):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def test_a_busy_capture_stopped_hundreds_of_times_loses_no_line_and_matches_none_twice(journal):
+    # 200 stops at random while a backlog of 40,000 entries is read with a capture open nearly all the time (a match
+    # every 1,000), in four lanes, each with its own position and captures: half sent to firewatcher alone, half as the
+    # unit's stop sends them (to firewatcher, then its journalctl). 1.71 went wrong in 58 of 6,000 such stops (hung after
+    # "Exiting.", or "Error reading line" and a line lost; 2026-11-25); at that rate 200 stops miss it about 1 time in 7.
+    # Each stop must end with exit 0 and the line "Exiting." on its own (a stop that came with journalctl's end and was
+    # taken for that end prints no such line; in the read before the follow it also prints "journalctl ended with
+    # status").
+    texts = [('HIT e%d' if k % 1000 == 500 else 'e%d') % k for k in range(40000)]
+    journal.write('system.journal', *[(-80 + k, 'pre %d' % k) for k in range(20)] + [(-55, 'saved')] +
+                  [(-50 + 0.001 * k, text) for k, text in enumerate(texts)])
+    cursors = [c for c, m in journal.entries()]
+    index = dict((c, i - 21) for i, c in enumerate(cursors))
+    stops, checks = [], []
+
+    def lane(n):
+        rnd = random.Random(n)
+        folder = journal.folder.parent / ('lane%d' % n)
+        position, out = folder / 'journal.position', folder / 'out'
+        done = 0
+        while done < 50:
+            shutil.rmtree(str(folder), ignore_errors=True)
+            out.mkdir(parents=True)
+            position.write_text(json.dumps({'cursor': cursors[20], 'time': journal.T}))
+            clean = True
+            reached = None
+            while done < 50 and reached != cursors[-1]:
+                proc = subprocess.Popen(
+                    [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import firewatcher as fw; '
+                     'fw._journald_present = lambda: True; sys.exit(fw.main(sys.argv[2:]))', str(ROOT),
+                     '--config', str(journal.conf), '-o', str(out), '-t', '10', '--fallback-folder', '',
+                     '--position-file', str(position), str(journal.pat)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=journal.env)
+                kids = []
+                try:
+                    seen = read_until(proc, 'Starting firewatcher')
+                    time.sleep(rnd.uniform(0.12, 0.4))
+                    signum = rnd.choice((signal.SIGTERM, signal.SIGINT))
+                    group = rnd.random() < 0.5
+                    kids = _children(proc.pid)
+                    proc.send_signal(signum)
+                    for pid in kids if group else []:
+                        try:
+                            os.kill(pid, signum)
+                        except OSError:
+                            pass
+                    try:
+                        text = seen + proc.communicate(timeout=5)[0].decode('utf-8', 'replace')
+                        outcome = 'ok' if proc.returncode == 0 else 'exit %s' % proc.returncode
+                    except subprocess.TimeoutExpired:
+                        _kill_all(proc, kids)
+                        text = seen + proc.communicate(timeout=10)[0].decode('utf-8', 'replace')
+                        outcome = 'not ended within 5 s'
+                finally:
+                    if proc.poll() is None:  # a read_until that failed
+                        _kill_all(proc, kids)
+                    proc.stdout.close()
+                if outcome == 'ok' and (not EXITING.search(text) or 'journalctl ended with status' in text
+                                        or 'Traceback' in text or 'Error reading line' in text):
+                    outcome = 'ended wrong'
+                done += 1
+                stops.append((outcome, signal.Signals(signum).name, 'and journalctl' if group else 'alone',
+                              text[-400:] if outcome != 'ok' else ''))
+                clean = clean and outcome == 'ok'
+                try:
+                    reached = json.loads(position.read_text())['cursor']
+                except (OSError, ValueError, KeyError):
+                    reached = None
+            # every line from the first match to the last one the position covers is in a capture; in a pass with no
+            # stop gone wrong, none was read in two captures
+            hits = list(range(500, index.get(reached, -1) + 1, 1000))
+            captured, read = set(), []
+            for log in incident_logs(out):
+                shown = re.sub(r'\x1b\[[0-9;]*m', '', log.read_text(encoding='utf-8')).splitlines()
+                opener = next((line.split(' h app[7]: ', 1)[1] for line in shown if line.startswith('Matched line:')), None)
+                lines = [line.split(' h app[7]: ', 1)[1] for line in shown
+                         if ' h app[7]: ' in line and not line.startswith('Matched line:')]
+                captured.update(lines)
+                read.extend(lines[lines.index(opener):] if opener in lines else [])
+            if hits:
+                lost = [t for t in texts[500:hits[-1] + 1] if t not in captured]
+                twice = [t for t, c in collections.Counter(read).items() if c > 1] if clean else []
+                checks.append((n, lost[:3], twice[:3]))
+
+    lanes = [threading.Thread(target=lane, args=(n,)) for n in range(4)]
+    for each in lanes:
+        each.start()
+    for each in lanes:
+        each.join()
+    assert len(stops) == 200 and checks
+    wrong = [stop for stop in stops if stop[0] != 'ok']
+    assert not wrong, (len(wrong), wrong[:5])
+    assert not [check for check in checks if check[1] or check[2]], checks

@@ -1,6 +1,9 @@
 import contextlib
 import os
+import select
 import sys
+import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -29,8 +32,19 @@ def isolated_firewatcher_config(tmp_path, monkeypatch):
     monkeypatch.delenv(fw.LLM_API_KEY_ENV, raising=False)
     monkeypatch.delenv(fw.NTFY_TOKEN_ENV, raising=False)
     monkeypatch.delenv(fw.EVENTS_TOKEN_ENV, raising=False)
-    # a SIGHUP flag left set by one test must not reload patterns in the next
+    # a SIGHUP flag left set by one test must not reload patterns in the next, nor a stop flag stop it
     monkeypatch.setattr(fw, '_reload_requested', False)
+    monkeypatch.setattr(fw, '_stop_requested', False)
+
+
+@pytest.fixture(autouse=True)
+def scripted_streams_through_pipes(monkeypatch):
+    """firewatcher's waits for a process's output see a Feed's pipe filled as they wait on it; the feeds a test left
+    open are closed after it."""
+    monkeypatch.setattr(fw, 'select', types.SimpleNamespace(select=_select))
+    yield
+    for feed in list(_FEEDS.values()):
+        feed.close()
 
 
 def parse_cli(argv):
@@ -126,6 +140,97 @@ class Clock:
         return self.t
 
 
+_FEEDS = {}  # the descriptor firewatcher reads: its Feed
+_real_select = select.select
+
+
+class Feed(object):
+    """A scripted stream behind a real pipe, which firewatcher reads as a process's output (fileno(), close()).
+    script.readline() gives what comes next: text or bytes, '' or b'' at the end, or it raises. It is asked only when
+    firewatcher waits on the empty pipe, on a thread of its own, so a script that sleeps or polls (a quiet source)
+    leaves firewatcher's deadlines running, and the order of lines, clock moves and exceptions is the script's. What it
+    raises is raised in that wait (_select)."""
+
+    def __init__(self, script):
+        self.script = script
+        self.read_fd, self.write_fd = os.pipe()
+        self.raised_r, self.raised_w = os.pipe()
+        self.wanted = threading.Event()
+        self.asked = self.ended = self.closed = False
+        self.error = None
+        _FEEDS[self.read_fd] = self
+        threading.Thread(target=self._feed, name='test-feed', daemon=True).start()
+
+    def fileno(self):
+        return self.read_fd
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            del _FEEDS[self.read_fd]
+            os.close(self.read_fd)
+            os.close(self.raised_r)
+            # the thread closes its own ends
+            self.wanted.set()
+
+    def ask(self):
+        if not (self.asked or self.ended) and not _real_select([self.read_fd], [], [], 0)[0]:
+            self.asked = True
+            self.wanted.set()
+
+    def _feed(self):
+        try:
+            while True:
+                self.wanted.wait()
+                self.wanted.clear()
+                if self.closed:
+                    return
+                try:
+                    line = self.script.readline()
+                    # inside the try: a line that cannot be encoded is raised in firewatcher's wait like any other error
+                    data = line.encode('utf-8', 'surrogateescape') if isinstance(line, str) else line
+                except BaseException as exc:
+                    self.error = exc
+                    self.asked = False
+                    os.write(self.raised_w, b'!')
+                    continue
+                if self.closed:
+                    return
+                if not data:
+                    # the end of the output; the pipe that carries what the script raises stays open until close()
+                    self.ended = True
+                    os.close(self.write_fd)
+                    self.write_fd = None
+                    continue
+                # cleared before the bytes are there, so firewatcher's next wait asks again
+                self.asked = False
+                while data:
+                    data = data[os.write(self.write_fd, data):]
+        except OSError:
+            pass  # firewatcher closed its end
+        finally:
+            if self.write_fd is not None:
+                os.close(self.write_fd)
+            os.close(self.raised_w)
+
+
+def _select(rlist, wlist, xlist, timeout=None):
+    """select.select for firewatcher: a Feed's pipe is fed as firewatcher waits on it, and what its script raised is
+    raised here, in that wait."""
+    feeds = [_FEEDS[fd] for fd in rlist if fd in _FEEDS]
+    if not feeds:
+        return _real_select(rlist, wlist, xlist, timeout)
+    for feed in feeds:
+        feed.ask()
+    ready, written, failed = _real_select(list(rlist) + [feed.raised_r for feed in feeds], wlist, xlist, timeout)
+    for feed in feeds:
+        if feed.raised_r in ready:
+            os.read(feed.raised_r, 1)
+            error, feed.error = feed.error, None
+            raise error
+    return [fd for fd in ready if fd in rlist], written, failed
+
+
 class ScriptedStdout:
     """stdout.readline() script: str, BaseException, or (str_or_exc, dt) to advance clock."""
 
@@ -175,5 +280,10 @@ class ScriptedPopen:
 
 
 def patch_popen(monkeypatch, popen):
-    monkeypatch.setattr(fw.subprocess, 'Popen', lambda *a, **k: popen)
+    """Each start of a process gives popen, whose stdout script (popen.stdout as set) is read through a pipe of its own."""
+    def start(*args, **kwargs):
+        popen.stdout = Feed(getattr(popen.stdout, 'script', popen.stdout))
+        return popen
+
+    monkeypatch.setattr(fw.subprocess, 'Popen', start)
     return popen
