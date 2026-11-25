@@ -96,9 +96,10 @@ class Journal(object):
             env=self.env)
 
     def wait_for_the_end(self, proc, nudge=False):
-        """Until the saved position is the journal's last entry (20 s at most: the runs here take about one). With nudge,
-        an entry is written every 2 s meanwhile: journalctl's follow can miss the end of a burst until the journal
-        changes again (systemd 257, 1 in 2,400 bursts of 40 entries without firewatcher, 2026-11-25)."""
+        """Until the saved position is the journal's last entry (20 s at most: the runs here take about one); the test
+        fails when it never is, or when firewatcher ends first. With nudge, an entry is written every 2 s meanwhile:
+        journalctl's follow can miss the end of a burst until the journal changes again (systemd 257, 1 in 2,400 bursts
+        of 40 entries without firewatcher, 2026-11-25)."""
         ends = [self.entries()[-1][0]]
         deadline = time.time() + 20
         nudged = time.time()
@@ -113,6 +114,8 @@ class Journal(object):
                 self.write('system.journal', (nudged - self.T, 'nudge'))
                 ends.append(self.entries()[-1][0])
             time.sleep(0.05)
+        pytest.fail('the saved position never reached the end of the journal%s' % (
+            '' if proc.poll() is None else ' (firewatcher ended with %s first)' % proc.returncode))
 
     def stop(self, proc):
         proc.send_signal(signal.SIGTERM)
@@ -190,24 +193,31 @@ def test_a_restart_after_a_reboot_reads_what_the_old_boot_logged_after_the_stop(
     journal.restart()
     lines, openers = journal.captured()
     assert openers == ['HIT during shutdown']
-    assert messages(lines)[-7:] == ['saved', 'HIT during shutdown', 'HIT unmount failed', 'old boot last', 'new boot first',
-                                    'HIT in the new boot', 'new boot more']
+    # the old boot's lead-up from the read back, the saved entry, and every line after it, once and in order
+    assert messages(lines) == ['old boot %d' % k for k in range(20)] + [
+        'saved', 'HIT during shutdown', 'HIT unmount failed', 'old boot last', 'new boot first', 'HIT in the new boot',
+        'new boot more']
 
 
 def test_a_restart_after_the_journal_lost_the_saved_entry_reads_by_time(journal):
     journal.write('a.journal', *[(-200 + 10 * k, ('HIT in the window %d' if k == 15 else 'a %d') % k) for k in range(20)] + [(0, 'saved')])
     journal.save_at('saved')
+    # the journal keeps one entry just before the window (--capture-time, 300 s, before the saved entry) and one in it
+    journal.write('c.journal', (-301, 'before the window'), (-299, 'HIT inside the window'))
     journal.write('b.journal', *[(50 + k, ('HIT b %d' if k % 10 == 5 else 'b %d') % k) for k in range(40)])
     (journal.folder / 'a.journal').unlink()
     output = journal.restart()
     assert 'Cannot find the last entry read before the stop' in output, output
     lines, openers = journal.captured()
-    assert openers == ['HIT b 5'] and messages(lines) == [('HIT b %d' if k % 10 == 5 else 'b %d') % k for k in range(40)]
+    # the match in the window opens the capture, and the line before the window is not read
+    assert openers == ['HIT inside the window']
+    assert messages(lines) == ['HIT inside the window'] + [('HIT b %d' if k % 10 == 5 else 'b %d') % k for k in range(40)]
 
 
 def test_a_restart_after_the_clock_was_set_back_takes_no_later_line_as_context(journal):
     # In a long journal, journalctl --since lands after the saved entry when the clock was set back after it (1.70
-    # took 2,000 lines logged after the stop as context, then matched them too); the read from the saved entry is exact.
+    # took the lines logged after the stop that it reached as context, then matched them too); the read from the saved entry
+    # is exact.
     # (the smallest of the design check's layouts, all of which landed after it on systemd 219 to 257)
     journal.write('system.journal', *[(-30000 + 0.5 * k, 'old %d' % k) for k in range(3000)] +
                   [(-290 + 10 * k, 'pre %d' % k) for k in range(29)] + [(0, 'saved')] +

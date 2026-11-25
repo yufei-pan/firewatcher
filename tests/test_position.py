@@ -201,7 +201,9 @@ def test_the_saved_entry_first_resumes_after_it_with_the_lines_before_it_as_cont
     out, journalctl = resume(
         tmp_path, monkeypatch, position,
         cursor=([entry(0, 'HIT before the restart'), entry(5, 'logged while stopped'), entry(6, 'HIT after the restart')], 0),
-        reverse=([entry(0, 'HIT before the restart'), entry(-20, 'context line'), entry(-61, 'before the window')], 0),
+        # the read back stops at the first entry stored before the window: reading on would raise
+        reverse=([entry(0, 'HIT before the restart'), entry(-20, 'context line'), entry(-61, 'before the window'),
+                  AssertionError('the read back went on past the window')], 0),
         follow=([entry(6, 'HIT after the restart'), entry(7, 'followed')], 0))
     logs = incident_logs(out)
     assert len(logs) == 1
@@ -219,7 +221,7 @@ def test_the_saved_entry_first_resumes_after_it_with_the_lines_before_it_as_cont
     assert reverse[-2:] == ['--cursor=' + cursor(0, 'HIT before the restart'), '--reverse'] and '--follow' not in reverse
     assert follow == ['journalctl', '--output=export', '--all', '--no-pager', '--cursor=' + cursor(6, 'HIT after the restart'),
                       '--no-tail', '--follow']
-    # the read back ended once it passed the window's start
+    # the read back is ended, not read to its end
     assert journalctl.proc('reverse').killed
     note = [line for line in capsys.readouterr().out.splitlines() if line.startswith('Resuming the journal after %s, ' % (
         datetime.datetime.fromtimestamp(T).isoformat()))]
@@ -275,11 +277,11 @@ def test_the_follow_keeps_its_first_entry_when_it_is_not_the_last_one_read(tmp_p
     # From systemd 252 on, a follow from an entry of an older boot does not print it, and starts with the running boot's
     # entries; the same when the last entry read was vacuumed before the follow started.
     position = saved_at(tmp_path, 0, 'saved')
-    out, journalctl = resume(tmp_path, monkeypatch, position, cursor=([entry(0, 'saved'), entry(2, 'old boot, last')], 0),
+    out, journalctl = resume(tmp_path, monkeypatch, position, cursor=([entry(0, 'saved'), entry(2, 'last read')], 0),
                              reverse=([entry(0, 'saved')], 0),
-                             follow=([entry(5, 'new boot, first followed'), entry(6, 'HIT second')], 0))
-    assert journalctl.calls[-1][-3:] == ['--cursor=' + cursor(2, 'old boot, last'), '--no-tail', '--follow']
-    assert jline(5, 'new boot, first followed') in incident_logs(out)[0].read_text()
+                             follow=([entry(5, 'first the follow prints'), entry(6, 'HIT second')], 0))
+    assert journalctl.calls[-1][-3:] == ['--cursor=' + cursor(2, 'last read'), '--no-tail', '--follow']
+    assert jline(5, 'first the follow prints') in incident_logs(out)[0].read_text()
     assert saved(tmp_path)['cursor'] == cursor(6, 'HIT second')
 
 
@@ -327,14 +329,18 @@ def test_a_stop_while_journalctl_is_waited_for_or_the_context_read_back_ends_as_
     assert (tmp_path / 'journal.position').read_text() == before
 
 
-def test_a_stop_during_the_handover_starts_no_follow(tmp_path, monkeypatch):
+def test_a_stop_before_the_handover_starts_no_follow(tmp_path, monkeypatch):
     position = saved_at(tmp_path, 0, 'saved')
     source = fw._JournalSource(position, FOLLOW)
     journalctl = FakeJournalctl(monkeypatch, cursor=([entry(0, 'saved')], 0))
     source.open(fw.ContextBuffer(60, 1 << 20))
     source.terminate()
     assert source.readline() == '' and journalctl.kinds() == ['cursor', 'reverse']
-    # a stop that comes while the follow starts ends it at once
+
+
+def test_a_follow_that_starts_after_the_stop_is_ended_at_once(tmp_path, monkeypatch):
+    position = saved_at(tmp_path, 0, 'saved')
+    journalctl = FakeJournalctl(monkeypatch, cursor=([entry(0, 'saved')], 0))
     source = fw._JournalSource(position, FOLLOW)
     source.stopped = True
     source._start(['--cursor=' + cursor(0, 'saved'), '--no-tail'], skip=cursor(0, 'saved'))
@@ -599,8 +605,26 @@ def test_journal_can_resume_probes_journalctl(tmp_path):
     assert not fw._journal_can_resume(str(tmp_path / 'missing'))
 
 
+def test_the_start_up_check_has_no_timeout(tmp_path, monkeypatch):
+    # A timeout of any length would turn resuming off for the run when journalctl answers later (1.70 gave it 30 s).
+    seen = []
+    real_run = subprocess.run
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(fw.subprocess, 'run', recording)
+    ok = tmp_path / 'ok'
+    ok.write_text('#!/bin/sh\nexit 0\n')
+    ok.chmod(0o755)
+    assert fw._journal_can_resume(str(ok))
+    assert len(seen) == 1 and 'timeout' not in seen[0]
+
+
 def test_a_slow_answer_to_the_start_up_check_still_counts_and_is_noted_once(tmp_path, monkeypatch, capsys):
-    # 1.70 gave the check 30 s and then turned resuming off for the run: the lines logged while stopped were not matched.
+    # 1.70 gave the check 30 s and then turned resuming off for the run: it read the last 20 lines, so what was logged
+    # while stopped beyond them was not matched.
     slow = tmp_path / 'slow'
     slow.write_text('#!/bin/sh\nsleep 1\nexit 0\n')
     slow.chmod(0o755)
@@ -620,7 +644,7 @@ at or after its time, as journalctl lands, and nothing with --reverse), backward
 last --lines=N; then, with --follow, waits. Like journalctl 219 and 239 to 252 from --cursor, --follow without --no-tail
 or --lines=N prints only the first 10 entries of its start (the fake does it from --since too, which is stricter). Like
 journalctl 252 and later, --follow shows only the newest boot. With cut.txt beside it holding N, a read without --follow
-or --reverse prints N entries and half of the next, and exits 3."""
+or --reverse prints N entries and the start of the next (its cursor and time whole), and exits 3."""
 import os, re, sys, time, zlib
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, 'calls.txt'), 'a') as f:
@@ -672,7 +696,7 @@ for k, e in enumerate(entries):
     text = e['text'].encode('utf-8')
     data += b'MESSAGE\n' + len(text).to_bytes(8, 'little') + text + b'\n\n'
     if cut is not None and k == cut:
-        out.write(data[:len(data) // 2])
+        out.write(data[:data.index(b'_HOSTNAME') + 5])  # the cursor and the time whole, the rest of the entry cut
         out.flush()
         sys.exit(3)
     out.write(data)
@@ -803,8 +827,8 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
 
 
 def test_a_restart_after_a_reboot_reads_what_the_old_boot_logged_after_the_stop(tmp_path):
-    # From systemd 252 on, a follow shows only the newest boot (the fake does so too): 1.67 to 1.70 followed from the
-    # saved entry and never matched what the old boot logged between firewatcher's stop and its end.
+    # From systemd 252 on, a follow shows only the newest boot (the fake does so too): 1.67 to 1.70 followed (1.70 from the
+    # saved entry, the others from a time) and never matched what the old boot logged between firewatcher's stop and its end.
     daemon = Daemon(tmp_path)
     now = daemon.now
     old = 'c' * 32
@@ -834,7 +858,7 @@ def test_a_restart_whose_read_is_cut_part_way_ends_the_run_and_the_next_start_re
     daemon.run_until(lambda: daemon.captured(1, 'saved', now - 80))
     backlog = [(-79, 'HIT read')] + [(-50 + i, 'filler %02d' % i) for i in range(30)] + [(-5, 'HIT late')]
     daemon.write(*first_journal + backlog)
-    (daemon.bin_dir / 'cut.txt').write_text('2')  # the saved entry, 'HIT read', and half of 'filler 00'
+    (daemon.bin_dir / 'cut.txt').write_text('2')  # the saved entry, 'HIT read', and the start of 'filler 00'
     second = daemon.run_until(lambda: daemon.proc.poll() is not None)
     assert 'journalctl ended with status 3 while reading on from the saved position.' in second and 'Process ended.' in second
     assert 'Traceback' not in second and not any('--follow' in call for call in daemon.reads())
@@ -938,8 +962,8 @@ def test_a_restart_on_a_journal_without_the_saved_entry_and_a_clock_set_back_mat
 @pytest.mark.parametrize('stalled', ['the read from the saved entry', 'the read back'])
 def test_a_stop_signal_while_journalctl_is_waited_for_at_a_restart_exits_cleanly(tmp_path, stalled):
     # A real SIGTERM and real processes: the journalctl reading from the saved entry prints nothing, or the one reading
-    # back prints one entry, and stalls. The stop must end firewatcher with exit 0 (run_until asserts it), the position
-    # as it was, and that journalctl with it.
+    # back prints the start of its first entry (head -c 200 ends inside it), and stalls. The stop must end firewatcher
+    # with exit 0 (run_until asserts it), the position as it was, and that journalctl with it.
     daemon = Daemon(tmp_path)
     now = daemon.now
     daemon.write((-50, 'context'), (-10, 'saved'), (-5, 'HIT after'))
@@ -980,12 +1004,16 @@ def test_a_slow_journalctl_at_a_restart_is_waited_for_and_noted_once(tmp_path, m
 def test_journal_before_reads_back_from_the_saved_entry_to_the_window_start(tmp_path):
     daemon = Daemon(tmp_path)
     now = daemon.now
-    daemon.write((-100, 'too old'), (-50, 'context'), (-30, 'ahead and set back'), (-40, 'more'), (-20, 'saved'), (-10, 'after'))
+    daemon.write((-100, 'too old'), (-50, 'context'), (-35, 'two lines\nthe second'), (-30, 'ahead and set back'), (-40, 'more'),
+                 (-20, 'saved'), (-10, 'after'))
     journalctl = str(daemon.bin_dir / 'journalctl')
     got = list(fw._journal_before(journalctl, daemon.cursor(-20, 'saved'), now - 60, now))
-    # newest first, through the saved entry's own line; a time never later than the line after it
+    first = daemon.line(-35, 'two lines')
+    second = ' ' * (len(first) - len('two lines\n')) + 'the second\n'  # a later line of a message is indented, as journalctl does
+    # newest first, through the saved entry's own line, the lines of an entry last to first; a time never later than the line after it
     assert got == [(now - 20, daemon.line(-20, 'saved')), (now - 40, daemon.line(-40, 'more')),
-                   (now - 40, daemon.line(-30, 'ahead and set back')), (now - 50, daemon.line(-50, 'context'))]
+                   (now - 40, daemon.line(-30, 'ahead and set back')), (now - 40, second), (now - 40, first),
+                   (now - 50, daemon.line(-50, 'context'))]
     assert not (tmp_path / 'bin' / 'calls.txt').read_text().count('--follow')
     # an entry the journal no longer holds, and a journalctl that is not there: nothing
     assert list(fw._journal_before(journalctl, daemon.cursor(-25, 'gone'), now - 60, now)) == []
@@ -1030,6 +1058,7 @@ def test_refill_under_the_cap_takes_every_line_as_append_would(count, cap):
     assert refilled.refill(reversed(lines)) == count
     assert list(refilled.entries(0)) == list(appended.entries(0)) == [(at, seq, line) for seq, (at, line) in enumerate(lines, 1)]
     assert refilled.dropped_until is None and refilled.memory <= cap
+    assert refilled.memory == sum(block[7] for block in refilled.blocks)  # what the cap counts
     # the loop's lines go on from there
     refilled.append(2000.0, count + 1, 'next\n')
     assert list(refilled.entries(0))[-1] == (2000.0, count + 1, 'next\n') and refilled.seq_span(0) == (1, count + 1)
@@ -1049,6 +1078,7 @@ def test_refill_over_the_cap_keeps_the_newest_lines_and_reads_no_further():
     count = refilled.refill(newest_first())
     kept = list(refilled.entries(0))
     assert 0 < count == len(kept) < len(lines) and refilled.memory <= cap
+    assert refilled.memory == sum(block[7] for block in refilled.blocks)
     assert [line for _at, _seq, line in kept] == [line for _at, line in lines[-count:]]
     assert [seq for _at, seq, _line in kept] == list(range(1, count + 1))
     # the capture says older lines were dropped, from the newest one left out on
@@ -1090,7 +1120,8 @@ def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monke
 
 def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch, capsys):
     # After a restart that follows a busy window, the lines before the saved entry go straight into the bounded
-    # context buffer: 1.70 first kept the whole read back, which cost 200 MB for 300,000 lines for the life of the process.
+    # context buffer: an early build of 1.70 kept the whole read back, which cost 200 MB for 300,000 lines for the life of
+    # the process.
     import tracemalloc
     real_popen = subprocess.Popen
     daemon = Daemon(tmp_path)
@@ -1116,7 +1147,8 @@ def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch, caps
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    # the lines did reach the buffer (a read that yields nothing would pass the limit below): the context lines and the saved one
+    # the read back gave its lines (one that yields nothing would pass the limit below): refill's count is in the total,
+    # and that it keeps them is the refill tests'
     assert 'Processed %d lines.' % (count + 1) in capsys.readouterr().out
     # measured at this size in 1.70: with the lines in the buffer, compressed, the peak is 1.4 MB; with a list of them in
     # between (as 1.70's first build had) it is 12.4 MB

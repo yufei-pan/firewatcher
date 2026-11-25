@@ -45,9 +45,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: when the journal lost the saved line (as a volatile journal does at a reboot), a restart
   reads from `--capture-time` (300 s by default) before the saved line; lines logged while firewatcher was stopped
   and stamped earlier than that are not read. That needs the clock set back by more than `--capture-time` while
-  firewatcher was stopped: most often a boot whose hardware clock was that far behind and was corrected before
-  firewatcher started; a clock set back by hand does it too (shown without a reboot on systemd 219 to 257,
-  2026-11-25). 1.68 did the same, and was worse (it skipped the whole second it could not find).
+  firewatcher was stopped, and firewatcher started once the clock is within a minute of the saved line again: most
+  often a boot whose hardware clock was that far behind and was corrected before firewatcher started; a clock set
+  back by hand does it too (shown without a reboot on systemd 219 to 257, 2026-11-25). Started while the clock is
+  still more than a minute behind the saved line, firewatcher takes the position for one from the future and reads
+  only the last `--tail-lines` lines. 1.68 did the same, and was worse (it skipped the whole second it could not find).
 - Why: where the saved line is gone, firewatcher can only go by time, and so does journalctl: a cursor from another
   boot lands by its time (tested on systemd 219, 2026-11-23). Where the saved line is still there (a persistent
   journal), a clock set back does not change where the resume starts; the age of the position (`--resume-max`) is
@@ -60,15 +62,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A stop signal another thread takes waits for the next line
 - Kind: deferred
 - What the operator sees: rarely, a SIGTERM or SIGINT sent to firewatcher's process alone (`kill`) is acted on only
-  at the next log line, or at the end of an open capture's `--capture-time` window, instead of at once. The kernel
-  hands a process's signal to any of its threads, and one taken by the thread that reads the log or sends
-  notifications wakes none of the main thread's waits. Seen once in about 1,000 stops in
-  tests (systemd 252 under load, 2026-11-25). `systemctl stop` signals journalctl too, whose end wakes firewatcher.
-  Since 1.58, which added those threads.
+  when the main thread next wakes: at the next log line, or with a capture open at its next sync or position save, at
+  the latest the end of its `--capture-time` window. The kernel hands a process's signal to any of its threads, and
+  one taken by another thread (the log reader, the notifier, a compression run) wakes none of the main thread's
+  waits. Seen once in about 1,000 stops in tests (systemd 252 under load, 2026-11-25). `systemctl stop` signals
+  journalctl too, whose end wakes firewatcher. Since 1.58, which added those threads.
 - Why: blocking the stop signals in those threads, the usual cure, is inherited by the processes they start: the
   thread that reads the log starts journalctl, which could then not be stopped (tried in 1.71's build: a journalctl
   that thread had started ignored the stop, and firewatcher's exit waited for it).
-- Plan (1.72): a design check of the two routes: the threads block the stop signals and start their processes with
+- Plan (1.72): one design check, with the entry below, of how a stop reaches the loop: a stop that sets a flag the loop
+  checks and that wakes its wait, or the two routes: the threads block the stop signals and start their processes with
   them unblocked, or the main thread waits on a wakeup descriptor (`signal.set_wakeup_fd`) beside its read; then a test
   that hands a stop to each thread.
+- Revisit when: 1.72.
+
+### A stop that lands while a busy capture is read can hang, or be ignored and lose one line
+- Kind: deferred
+- What the operator sees: while a capture is open and lines arrive fast (a burst, or the lines logged while stopped
+  after a restart), about 1 stop in 100 goes wrong in one of two ways (tests on Python 3.6, 3.11 and 3.13,
+  2026-11-25). It hangs after "Exiting." until the unit's `TimeoutStopSec` kills firewatcher, so the last position is
+  not saved and up to a second of lines is read again at the next start. Or it is ignored: the log says "Error
+  reading line: cannot release un-acquired lock", one line already read is neither matched nor captured, and
+  firewatcher runs on until its journalctl ends or a second signal. Since 1.58, which added the reader thread.
+- Why: a stop is raised as an exception wherever the main thread is, Python's lock code is not safe against that, and
+  the loop takes the broken lock for a read error.
+- Plan (1.72): with the entry above: a stop sets a flag that the loop checks and that wakes its wait, and is no
+  longer an exception in the main thread; then a test that stops a busy capture a few hundred times.
 - Revisit when: 1.72.
