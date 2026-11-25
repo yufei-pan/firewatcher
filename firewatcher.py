@@ -3455,8 +3455,8 @@ _stop_requested = False
 
 def _request_stop(signum, frame):
 	"""SIGTERM or SIGINT: only noted. The main thread's wait for the log raises it as KeyboardInterrupt, between two
-	lines, so the open capture is finished and handed to the dispatcher, and the line being handled is finished first. Both
-	stop signals get the default action, so a second one, of either kind, ends the process at once."""
+	lines, so the open capture is finished and handed to the dispatcher, and the line being handled is finished first. Each
+	stop signal it handles gets the default action, so a second one, of either kind, ends the process at once."""
 	global _stop_requested
 	_stop_requested = True
 	for stop in (signal.SIGTERM, signal.SIGINT):

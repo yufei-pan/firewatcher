@@ -35,8 +35,8 @@ else:
     def hand_over():
         if not sys.stdin.readline():
             return  # the test closed stdin without a word
-        # The notifier and the compressor are started when firewatcher first needs them, a few milliseconds after the
-        # first line; the test allows the stop 5 s, so 4 s is the longest this waits for the thread.
+        # The notifier and the compressor start with the run, before the first line (the compressor's thread stays while
+        # its tar runs); the test allows the stop 5 s, so 4 s is the longest this waits for the thread.
         end = time.time() + 4
         while True:
             thread = threading.current_thread() if who == 'another thread' else next(
@@ -53,7 +53,8 @@ sys.exit(fw.main(sys.argv[4:]))
 
 
 def start(tmp_path, who, signum, args):
-    """firewatcher under LAUNCH, with a tar on PATH that takes a minute (so a compression run, and its thread, stay)."""
+    """firewatcher under LAUNCH, with a tar on PATH that takes a minute (so a compression run, and its thread, stay),
+    in a process group of its own (see end_group)."""
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir(exist_ok=True)
     tar = bin_dir / 'tar'
@@ -61,7 +62,8 @@ def start(tmp_path, who, signum, args):
     tar.chmod(0o755)
     env = dict(os.environ, PYTHONUNBUFFERED='1', PATH='%s%s%s' % (bin_dir, os.pathsep, os.environ.get('PATH', '')))
     return subprocess.Popen([sys.executable, '-c', LAUNCH, str(ROOT), who, str(int(signum))] + [str(arg) for arg in args],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                            start_new_session=True)
 
 
 def read_until(proc, text, seconds=20):
@@ -77,26 +79,41 @@ def read_until(proc, text, seconds=20):
     return seen.decode('utf-8', 'replace')
 
 
-# The stop's own line. Every end prints "Process ended. Exiting.", so the text alone proves nothing.
-EXITING = re.compile(r'^Exiting\.$', re.M)
+def end_group(proc):
+    """SIGKILL what is left of firewatcher, the `tail -F` it started and the tar it runs (a test that failed must not
+    leave any of them: `tail` holds the output pipe, and where it does not leave when its output closes (macOS, CentOS
+    7's coreutils) a test that reads the pipe to its end would hang)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass  # none left
+    proc.stdout.close()
+    proc.wait()
 
 
-def stopped(proc, seen, tmp_path, signum):
-    """The whole output once the stop is acted on, 5 s at most (it is about 10 ms): exit 0, the line "Exiting." (a stop,
-    not a journalctl that ended), and no traceback and no read error."""
+def ended(proc, seen, what):
+    """firewatcher's output once it has ended, 5 s at most. Past that the test fails with `what` and the output so far,
+    after its group is killed (the read after that is at its end, and bounded, so a failing test never hangs here)."""
     try:
         output, _ = proc.communicate(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        output, _ = proc.communicate()
-        pytest.fail('a %s was not acted on within 5 s: %s' % (
-            signal.Signals(signum).name, (seen + output.decode('utf-8', 'replace'))[-600:]))
-    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
         try:
-            os.kill(int((tmp_path / 'tar.pid').read_text()), signal.SIGKILL)
-        except (OSError, ValueError):
-            pass
-    text = seen + output.decode('utf-8', 'replace')
+            output, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            output = b''  # something outside the group holds the pipe
+        pytest.fail('%s within 5 s: %s' % (what, (seen + output.decode('utf-8', 'replace'))[-600:]))
+    return output.decode('utf-8', 'replace')
+
+
+# The stop's own line. A run that returns prints "Process ended. Exiting.", so that text alone proves nothing.
+EXITING = re.compile(r'^Exiting\.$', re.M)
+
+
+def stopped(proc, seen, signum):
+    """The whole output once the stop is acted on, 5 s at most (it is about 10 ms): exit 0, the line "Exiting." (a stop,
+    not a journalctl that ended), and no traceback and no read error."""
+    text = seen + ended(proc, seen, 'a %s was not acted on' % signal.Signals(signum).name)
     assert proc.returncode == 0, text[-800:]
     assert EXITING.search(text) and 'journalctl ended with status' not in text, text[-800:]
     assert 'Traceback' not in text and 'Error reading line' not in text, text[-800:]
@@ -117,16 +134,19 @@ def test_a_stop_ends_the_run_at_once_whichever_thread_takes_it(tmp_path, who, si
     (out / '2001-01' / 'old.log').write_text('old\n')
     proc = start(tmp_path, who, signum, ['--config', conf, '-o', out, '-t', '300', '--fallback-folder', '',
                                          '--log-file', log, pat])
-    # "Capturing logs to" is the capture's open; the start-up line "Capturing logs for" comes before any capture
-    seen = read_until(proc, 'Capturing logs to' if capture_open else 'Delete logs after')
-    time.sleep(0.3)  # the main thread is in its wait for the next line
-    if who == 'a line being handled':
-        with log.open('a') as f:
-            f.write('the LAST line\n')
-    else:
-        proc.stdin.write(b'go\n')
-        proc.stdin.flush()
-    text = stopped(proc, seen, tmp_path, signum)
+    try:
+        # "Capturing logs to" is the capture's open; the start-up line "Capturing logs for" comes before any capture
+        seen = read_until(proc, 'Capturing logs to' if capture_open else 'Delete logs after')
+        time.sleep(0.3)  # the main thread is in its wait for the next line
+        if who == 'a line being handled':
+            with log.open('a') as f:
+                f.write('the LAST line\n')
+        else:
+            proc.stdin.write(b'go\n')
+            proc.stdin.flush()
+        text = stopped(proc, seen, signum)
+    finally:
+        end_group(proc)
     if capture_open:
         assert 'End of capture' in text, text[-800:]
     if who == 'a line being handled' and capture_open:
@@ -145,25 +165,17 @@ def test_a_stop_ends_the_last_wait_of_a_run_that_read_its_input_to_the_end(tmp_p
     (out / '2001-01' / 'old.log').write_text('old\n')
     proc = start(tmp_path, 'MainThread', signum, ['--config', conf, '-o', out, '--fallback-folder', '', '--filter-only',
                                                   '--log-file', log, pat])
-    seen = read_until(proc, 'End of capture')
-    deadline = time.time() + 20
-    while not (tmp_path / 'tar.pid').exists() and time.time() < deadline:
-        time.sleep(0.02)
-    assert (tmp_path / 'tar.pid').exists(), 'the compressor never started tar: ' + seen
-    time.sleep(0.2)
-    proc.send_signal(signum)
     try:
-        output, _ = proc.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        pytest.fail('the stop did not end the wait for the compressor within 5 s')
+        seen = read_until(proc, 'End of capture')
+        deadline = time.time() + 20
+        while not (tmp_path / 'tar.pid').exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert (tmp_path / 'tar.pid').exists(), 'the compressor never started tar: ' + seen
+        time.sleep(0.2)
+        proc.send_signal(signum)
+        text = seen + ended(proc, seen, 'the stop did not end the wait for the compressor')
     finally:
-        try:
-            os.kill(int((tmp_path / 'tar.pid').read_text()), signal.SIGKILL)
-        except (OSError, ValueError):
-            pass
-    text = seen + output.decode('utf-8', 'replace')
+        end_group(proc)
     assert proc.returncode == 0 and 'Process ended.' in text and 'Traceback' not in text, text[-800:]
 
 
@@ -268,8 +280,8 @@ def test_request_stop_only_notes_the_stop_and_a_second_of_either_kind_takes_the_
 
 
 # firewatcher on a log file, with the notifier on (so a dispatcher exists), whose clean-up waits when argv[2] is 'slow', as
-# when an LLM or events call is in flight at the stop (up to llm_timeout + ntfy_timeout, 70 s by default; here 30 s, far
-# past the 5 s the tests allow)
+# when an LLM or events call is in flight at the stop (close() waits up to llm_timeout + ntfy_timeout, plus another
+# ntfy_timeout with events_url set; here 30 s, far past the 5 s the tests allow)
 CLEANUP_LAUNCH = r"""
 import sys, time
 sys.path.insert(0, sys.argv[1])
@@ -294,17 +306,6 @@ def start_on_a_log_file(tmp_path, cleanup, wrapper=()):
     return subprocess.Popen(list(wrapper) + [sys.executable, '-c', CLEANUP_LAUNCH, str(ROOT), cleanup] +
                             [str(arg) for arg in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED='1'), start_new_session=True)
-
-
-def end_group(proc):
-    """SIGKILL what is left of firewatcher and the `tail -F` it started (a test that failed must not leave either: the
-    tail holds the output pipe, so the test would hang at the next read of it)."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        pass  # none left
-    proc.stdout.close()
-    proc.wait()
 
 
 @pytest.mark.parametrize('second', [signal.SIGTERM, signal.SIGINT], ids=['then SIGTERM', 'then SIGINT'])

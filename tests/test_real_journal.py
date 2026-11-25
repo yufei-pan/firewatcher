@@ -268,7 +268,8 @@ def test_a_busy_capture_stopped_hundreds_of_times_loses_no_line_and_matches_none
     # unit's stop sends them (to firewatcher, then its journalctl). 1.71 went wrong in 58 of 6,000 such stops (hung after
     # "Exiting.", or "Error reading line" and a line lost; 2026-11-25); at that rate 200 stops miss it about 1 time in 7.
     # Each stop must end with exit 0 and the line "Exiting." on its own (a stop that came with journalctl's end and was
-    # taken for a journalctl that failed prints "journalctl ended with status" and no such line).
+    # taken for that end prints no such line; in the read before the follow it also prints "journalctl ended with
+    # status").
     texts = [('HIT e%d' if k % 1000 == 500 else 'e%d') % k for k in range(40000)]
     journal.write('system.journal', *[(-80 + k, 'pre %d' % k) for k in range(20)] + [(-55, 'saved')] +
                   [(-50 + 0.001 * k, text) for k, text in enumerate(texts)])
