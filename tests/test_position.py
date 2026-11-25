@@ -529,7 +529,10 @@ def test_a_stop_while_the_start_up_check_waits_exits_cleanly(tmp_path, monkeypat
     monkeypatch.setattr(fw, '_journal_can_resume', stopped)
     pat = tmp_path / 'p.txt'
     pat.write_text('HIT\n')
-    assert fw.main([str(pat)]) == 0
+    try:
+        assert fw.main([str(pat)]) == 0
+    except KeyboardInterrupt:
+        pytest.fail('a stop during the start-up check came out of main')
     assert 'Exiting.' in capsys.readouterr().out
     # the position file's lock is let go
     assert _main_with(monkeypatch, [str(pat)])['journal_position'] is not None
