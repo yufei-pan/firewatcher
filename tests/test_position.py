@@ -72,6 +72,9 @@ class ExportStdout(object):
     def read(self, size=-1):
         return self.buffer.read(size) if self._fill() else b''
 
+    def close(self):
+        pass
+
 
 def export_popen(monkeypatch, events, clock=None):
     popen = ScriptedPopen([])
