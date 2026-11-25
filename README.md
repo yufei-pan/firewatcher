@@ -52,7 +52,7 @@ Put the fallback folder on a different filesystem from the output folder. The de
 
 The fallback needs the failure to come back as an error. On an NFS mount with the default `hard` option, writes to an unreachable server wait instead of failing, and `firewatcher` waits with them. To fall back instead, mount the output folder with `soft` (or `softerr`) and a short `timeo`.
 
-On SIGINT or SIGTERM, `firewatcher` finishes the line it is handling and the open capture, and exits. A second SIGINT or SIGTERM ends it at once.
+On SIGINT or SIGTERM, `firewatcher` handles the lines it has already read from the log, finishes the open capture, and exits. A second SIGINT or SIGTERM ends it at once.
 
 SIGHUP reloads the pattern files and the `--always-notify` files from the paths given at startup, so after editing `/etc/firewatcher/patterns.d/`, run `sudo systemctl reload firewatcher`. The new patterns apply from the next log line, and the journal says how many loaded. If no watch pattern loads, the old ones stay and the error is logged. The config file and other settings are not re-read; restart for those. In a terminal, SIGHUP keeps its usual meaning (the terminal went away) and ends `firewatcher`. Two SIGHUPs close together reload once.
 
