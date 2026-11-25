@@ -590,8 +590,8 @@ def load_patterns(pattern_files):
 			print(f"Pattern file not found: {pattern_file}")
 			continue
 		try:
-			# UTF-8 whatever the locale, as the log lines are read. Bytes that are not UTF-8 refuse the file.
-			with open(pattern_file, 'r', encoding='utf-8') as f:
+			# UTF-8 whatever the locale, as the log lines are read, a byte-order mark at the start read past. Bytes that are not UTF-8 refuse the file.
+			with open(pattern_file, 'r', encoding='utf-8-sig') as f:
 				# Lines starting with # are comments.
 				patterns = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
 		except Exception as e:

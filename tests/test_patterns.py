@@ -170,3 +170,10 @@ def test_seed_skips_existing_dest_even_if_not_a_pattern_file(tmp_path):
     fw._seed_example_patterns([str(d)])
     assert (d / 'sys_msg.txt').is_dir()
     assert (d / 'nvme_failure.regex').is_file()
+
+
+def test_a_byte_order_mark_at_the_start_of_a_pattern_file_is_not_part_of_its_first_pattern(tmp_path):
+    pat = tmp_path / 'p.txt'
+    pat.write_bytes(b'\xef\xbb\xbfdisk failure\nother\n')
+    patterns = fw.load_patterns([str(pat)])
+    assert fw._as_matcher(patterns).find('kernel: disk failure on sda') is not None
