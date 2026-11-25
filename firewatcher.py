@@ -3096,8 +3096,9 @@ class JournalPosition(object):
 			start = ['--since=@%d' % self.since]
 		else:
 			return command
-		# --no-tail: with --follow, journalctl 219 and 239 to 252 print only the first 10 entries from --cursor (219
-		# also from --since) and then wait for the journal to change; it also undoes --lines, which is why it comes in its place.
+		# --no-tail: with --follow, journalctl 219 and 239 to 252 print only the first 10 entries from --cursor and then
+		# wait for the journal to change. --since is cut so only by 219's --since=@0; it gets the flag too, all the
+		# entries being what is wanted. The flag is what undoes --lines, so it comes in its place and never beside it.
 		return [word for part in command for word in (start + ['--no-tail'] if part.startswith('--lines=') else [part])]
 
 	def read_context(self):

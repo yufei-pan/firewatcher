@@ -380,7 +380,8 @@ FAKE_JOURNALCTL = r'''#!%s
 """Prints journal.jsonl (one {"stored": seconds, "text": ...} per line, in the order stored) as journalctl -o export:
 from the entry at --cursor=C (where the journal no longer holds it, from the first entry stored at or after its time,
 as journalctl lands), backwards with --reverse, from --since=@N, or the last --lines=N; then, with --follow, waits.
-Like journalctl 219 and 239 to 252, --follow without --no-tail or --lines=N prints only the first 10 entries of its start."""
+Like journalctl 219 and 239 to 252 from --cursor, --follow without --no-tail or --lines=N prints only the first 10
+entries of its start (the fake does it from --since too, which is stricter)."""
 import os, re, sys, time, zlib
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, 'calls.txt'), 'a') as f:
@@ -522,8 +523,8 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
 
 @pytest.mark.parametrize('journal_keeps_the_saved_entry', [True, False])
 def test_a_restart_reads_a_backlog_longer_than_journalctls_follow_default_at_once(tmp_path, journal_keeps_the_saved_entry):
-    # journalctl 219 and 239 to 252 print only 10 entries of a --follow from a cursor (219 from --since too) and
-    # wait for the journal to change, unless --no-tail is given: the match after 30 other entries would wait.
+    # journalctl 219 and 239 to 252 print only 10 entries of a --follow from a cursor and wait for the journal to
+    # change, unless --no-tail is given: the match after 30 other entries would wait.
     daemon = Daemon(tmp_path)
     line, now = daemon.line, daemon.now
     first_journal = [(-100, 'quiet'), (-90, 'HIT first'), (-80, 'saved')]
