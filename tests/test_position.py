@@ -13,7 +13,7 @@ import pytest
 
 import firewatcher as fw
 from conftest import ROOT, Clock, Feed, ScriptedPopen, fake_exists, incident_logs, patch_popen, use_journal
-from test_stop import LAUNCH
+from test_stop import EXITING, LAUNCH
 
 # --- resuming the journal after a restart ---
 
@@ -954,7 +954,8 @@ def test_a_stop_signal_while_journalctl_is_waited_for_at_a_restart_exits_cleanly
     else:
         daemon.wrap('case " $* " in *" --reverse "*|*" --follow "*) ;; *" --cursor="*) %s ;; esac' % stall)
     output = daemon.run_until(lambda: (daemon.bin_dir / 'stalled.pid').exists(), taken_by)
-    assert 'Exiting.' in output and 'Traceback' not in output and 'Resuming' not in output
+    assert EXITING.search(output) and 'journalctl ended with status' not in output
+    assert 'Traceback' not in output and 'Resuming' not in output
     assert daemon.position_file.read_text() == before
     pid = int((daemon.bin_dir / 'stalled.pid').read_text())
     deadline = time.time() + 10
@@ -1095,6 +1096,39 @@ def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monke
     run(tmp_path, monkeypatch, [entry(0, 'quiet'), entry(0, 'HIT one'), entry(0, 'HIT two'), entry(0, 'after')], position)
     # the first line, the match that opened the capture (not the one that extended it), and the last line at exit
     assert saves == [cursor(0, 'quiet'), cursor(0, 'HIT one'), cursor(0, 'after')]
+
+
+def test_the_position_of_a_line_that_matches_nothing_is_saved_while_the_journal_is_quiet(tmp_path, monkeypatch):
+    # No capture is open, and no later line or stop comes to save it: the wait's own deadline does. 1.71 saved it only at
+    # the next line or the stop.
+    monkeypatch.setattr(fw, 'POSITION_SAVE_INTERVAL', 0.3)  # a real second would only make the test slower
+    path = tmp_path / 'journal.position'
+
+    class QuietAfter(ExportStdout):
+        """Its entries, then up to 5 s (far past the 0.3 s above) of silence in which the position file is watched; then
+        the end of the output, which saves the position at exit whatever came before."""
+        found = False
+
+        def _fill(self):
+            if super()._fill():
+                return True
+            end = time.time() + 5
+            while not self.found and time.time() < end:
+                try:
+                    self.found = json.loads(path.read_text())['cursor'] == cursor(0, 'second')
+                except (OSError, ValueError, KeyError):
+                    pass
+                time.sleep(0.02)
+            return False
+
+    popen = ScriptedPopen([])
+    popen.stdout = QuietAfter([entry(0, 'first'), entry(0, 'second')])
+    patch_popen(monkeypatch, popen)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                        compress_after_months=0, delete_after_months=0, journal_position=fw.JournalPosition(str(path), now=T))
+    assert popen.stdout.script.found, 'the second line was not saved while the journal was quiet'
 
 
 def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch, capsys):

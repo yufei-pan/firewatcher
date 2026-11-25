@@ -22,7 +22,6 @@ LAUNCH = r'''
 import os, signal, sys, threading, time
 sys.path.insert(0, sys.argv[1])
 import firewatcher as fw
-fw._journald_present = lambda: True  # as on a journald host, whatever runs on the machine running the tests
 who, signum = sys.argv[2], int(sys.argv[3])
 if who == 'a line being handled':
     find = fw.PatternMatcher.find
@@ -36,8 +35,17 @@ else:
     def hand_over():
         if not sys.stdin.readline():
             return  # the test closed stdin without a word
-        thread = threading.current_thread() if who == 'another thread' else next(
-            t for t in threading.enumerate() if t.name == who)
+        # The notifier and the compressor are started when firewatcher first needs them, a few milliseconds after the
+        # first line; the test allows the stop 5 s, so 4 s is the longest this waits for the thread.
+        end = time.time() + 4
+        while True:
+            thread = threading.current_thread() if who == 'another thread' else next(
+                (t for t in threading.enumerate() if t.name == who), None)
+            if thread is not None or time.time() > end:
+                break
+            time.sleep(0.01)
+        if thread is None:
+            print('NO THREAD NAMED %s' % who, flush=True)
         signal.pthread_kill(thread.ident, signum)
     threading.Thread(target=hand_over, name='test-hand-over', daemon=True).start()
 sys.exit(fw.main(sys.argv[4:]))
@@ -69,15 +77,20 @@ def read_until(proc, text, seconds=20):
     return seen.decode('utf-8', 'replace')
 
 
+# The stop's own line. Every end prints "Process ended. Exiting.", so the text alone proves nothing.
+EXITING = re.compile(r'^Exiting\.$', re.M)
+
+
 def stopped(proc, seen, tmp_path, signum):
-    """The rest of the output once the stop is acted on, 5 s at most (it is about 10 ms); exit 0, "Exiting." or the
-    end of the run, and neither a traceback nor a read error."""
+    """The whole output once the stop is acted on, 5 s at most (it is about 10 ms): exit 0, the line "Exiting." (a stop,
+    not a journalctl that ended), and no traceback and no read error."""
     try:
         output, _ = proc.communicate(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.communicate()
-        pytest.fail('a %s was not acted on within 5 s: %s' % (signal.Signals(signum).name, seen[-600:]))
+        output, _ = proc.communicate()
+        pytest.fail('a %s was not acted on within 5 s: %s' % (
+            signal.Signals(signum).name, (seen + output.decode('utf-8', 'replace'))[-600:]))
     finally:
         try:
             os.kill(int((tmp_path / 'tar.pid').read_text()), signal.SIGKILL)
@@ -85,7 +98,8 @@ def stopped(proc, seen, tmp_path, signum):
             pass
     text = seen + output.decode('utf-8', 'replace')
     assert proc.returncode == 0, text[-800:]
-    assert 'Exiting.' in text and 'Traceback' not in text and 'Error reading line' not in text, text[-800:]
+    assert EXITING.search(text) and 'journalctl ended with status' not in text, text[-800:]
+    assert 'Traceback' not in text and 'Error reading line' not in text, text[-800:]
     return text
 
 
@@ -103,7 +117,8 @@ def test_a_stop_ends_the_run_at_once_whichever_thread_takes_it(tmp_path, who, si
     (out / '2001-01' / 'old.log').write_text('old\n')
     proc = start(tmp_path, who, signum, ['--config', conf, '-o', out, '-t', '300', '--fallback-folder', '',
                                          '--log-file', log, pat])
-    seen = read_until(proc, 'Capturing logs' if capture_open else 'Delete logs after')
+    # "Capturing logs to" is the capture's open; the start-up line "Capturing logs for" comes before any capture
+    seen = read_until(proc, 'Capturing logs to' if capture_open else 'Delete logs after')
     time.sleep(0.3)  # the main thread is in its wait for the next line
     if who == 'a line being handled':
         with log.open('a') as f:
@@ -111,9 +126,11 @@ def test_a_stop_ends_the_run_at_once_whichever_thread_takes_it(tmp_path, who, si
     else:
         proc.stdin.write(b'go\n')
         proc.stdin.flush()
-    stopped(proc, seen, tmp_path, signum)
+    text = stopped(proc, seen, tmp_path, signum)
+    if capture_open:
+        assert 'End of capture' in text, text[-800:]
     if who == 'a line being handled' and capture_open:
-        # the line being handled at the stop is finished: 1.71 dropped it and read it again after the restart
+        # the line being handled at the stop is finished (1.71 dropped it)
         assert 'the LAST line' in ''.join(log.read_text() for log in incident_logs(out) if log.name != 'old.log')
 
 
@@ -132,6 +149,7 @@ def test_a_stop_ends_the_last_wait_of_a_run_that_read_its_input_to_the_end(tmp_p
     deadline = time.time() + 20
     while not (tmp_path / 'tar.pid').exists() and time.time() < deadline:
         time.sleep(0.02)
+    assert (tmp_path / 'tar.pid').exists(), 'the compressor never started tar: ' + seen
     time.sleep(0.2)
     proc.send_signal(signum)
     try:
@@ -326,27 +344,27 @@ def test_a_stop_signal_firewatcher_was_started_ignoring_stays_ignored(tmp_path, 
 
 
 def test_an_exception_while_the_source_is_quiet_ends_the_run(tmp_path, monkeypatch, capsys):
-    # A bug in what the wait runs at a deadline (here the open capture's sync) ends the run, as in 1.71; it must not
-    # become a read error that the loop reads on after.
-    monkeypatch.setattr(fw, 'CAPTURE_SYNC_INTERVAL', 0.05)
-    real_sync = fw.CaptureFile.sync
+    # A bug in what the wait runs at a deadline (here the end of the open capture, when the source has been quiet for
+    # capture_time) ends the run, as in 1.71; it must not become a read error that the loop reads on after. One line and
+    # the capture's own end, so no commit's fsync (whose time decides whether a sync is due) is in the way.
+    real_end = fw._end_capture
     raised = []
 
-    def sync(self, now=None):
-        if now is None and not raised:  # the quiet wait's sync (a commit passes its time)
+    def end_capture(*args, **kwargs):
+        if not raised:  # the quiet wait's end of the capture; the one that finishes the run after it is real
             raised.append(1)
             raise RuntimeError('a bug')
-        return real_sync(self, now)
+        return real_end(*args, **kwargs)
 
-    monkeypatch.setattr(fw.CaptureFile, 'sync', sync)
+    monkeypatch.setattr(fw, '_end_capture', end_capture)
 
     class Quiet(object):
-        lines = ['HIT now\n', 'more\n']
+        lines = ['HIT now\n']
 
         def readline(self, size=-1):
             if self.lines:
                 return self.lines.pop(0)
-            time.sleep(0.5)
+            time.sleep(5)  # far past the 0.3 s capture time below, so the deadline ends the wait first
             return ''
 
     popen = ScriptedPopen([])
@@ -355,7 +373,7 @@ def test_an_exception_while_the_source_is_quiet_ends_the_run(tmp_path, monkeypat
     pat = tmp_path / 'p.txt'
     pat.write_text('HIT\n')
     with pytest.raises(fw._DeadlineError) as ended:
-        fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+        fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=0.3, output_folder=str(tmp_path / 'out'),
                             compress_after_months=0, delete_after_months=0)
     assert isinstance(ended.value.__cause__, RuntimeError)
     assert 'Error reading line' not in capsys.readouterr().out

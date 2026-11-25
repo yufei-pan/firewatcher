@@ -17,7 +17,7 @@ import uuid
 import pytest
 
 from conftest import ROOT, incident_logs
-from test_stop import read_until
+from test_stop import EXITING, read_until
 
 JOURNALCTL = shutil.which('journalctl')
 JOURNAL_REMOTE = next((path for path in ('/lib/systemd/systemd-journal-remote', '/usr/lib/systemd/systemd-journal-remote')
@@ -249,11 +249,26 @@ def _children(pid):
     return found
 
 
+def _kill_all(proc, known):
+    """SIGKILL firewatcher and its journalctls: the ones it has now and the ones (known) from before. They hold the
+    test's pipe as their stderr, so a read of it would not end until they do."""
+    for pid in (_children(proc.pid) if proc.poll() is None else []) + list(known):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
 def test_a_busy_capture_stopped_hundreds_of_times_loses_no_line_and_matches_none_twice(journal):
     # 200 stops at random while a backlog of 40,000 entries is read with a capture open nearly all the time (a match
     # every 1,000), in four lanes, each with its own position and captures: half sent to firewatcher alone, half as the
     # unit's stop sends them (to firewatcher, then its journalctl). 1.71 went wrong in 58 of 6,000 such stops (hung after
-    # "Exiting.", or "Error reading line" and a line lost; 2026-11-25); at that rate 200 stops miss it about 1 time in 30.
+    # "Exiting.", or "Error reading line" and a line lost; 2026-11-25); at that rate 200 stops miss it about 1 time in 7.
+    # Each stop must end with exit 0 and the line "Exiting." on its own (a stop that came with journalctl's end and was
+    # taken for a journalctl that failed prints "journalctl ended with status" and no such line).
     texts = [('HIT e%d' if k % 1000 == 500 else 'e%d') % k for k in range(40000)]
     journal.write('system.journal', *[(-80 + k, 'pre %d' % k) for k in range(20)] + [(-55, 'saved')] +
                   [(-50 + 0.001 * k, text) for k, text in enumerate(texts)])
@@ -279,25 +294,32 @@ def test_a_busy_capture_stopped_hundreds_of_times_loses_no_line_and_matches_none
                      '--config', str(journal.conf), '-o', str(out), '-t', '10', '--fallback-folder', '',
                      '--position-file', str(position), str(journal.pat)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=journal.env)
-                seen = read_until(proc, 'Starting firewatcher')
-                time.sleep(rnd.uniform(0.12, 0.4))
-                signum = rnd.choice((signal.SIGTERM, signal.SIGINT))
-                group = rnd.random() < 0.5
-                kids = _children(proc.pid) if group else []
-                proc.send_signal(signum)
-                for pid in kids:
-                    try:
-                        os.kill(pid, signum)
-                    except OSError:
-                        pass
+                kids = []
                 try:
-                    text = seen + proc.communicate(timeout=5)[0].decode('utf-8', 'replace')
-                    outcome = 'ok' if proc.returncode == 0 else 'exit %s' % proc.returncode
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    text = seen + proc.communicate()[0].decode('utf-8', 'replace')
-                    outcome = 'not ended within 5 s'
-                if outcome == 'ok' and ('Exiting.' not in text or 'Traceback' in text or 'Error reading line' in text):
+                    seen = read_until(proc, 'Starting firewatcher')
+                    time.sleep(rnd.uniform(0.12, 0.4))
+                    signum = rnd.choice((signal.SIGTERM, signal.SIGINT))
+                    group = rnd.random() < 0.5
+                    kids = _children(proc.pid)
+                    proc.send_signal(signum)
+                    for pid in kids if group else []:
+                        try:
+                            os.kill(pid, signum)
+                        except OSError:
+                            pass
+                    try:
+                        text = seen + proc.communicate(timeout=5)[0].decode('utf-8', 'replace')
+                        outcome = 'ok' if proc.returncode == 0 else 'exit %s' % proc.returncode
+                    except subprocess.TimeoutExpired:
+                        _kill_all(proc, kids)
+                        text = seen + proc.communicate(timeout=10)[0].decode('utf-8', 'replace')
+                        outcome = 'not ended within 5 s'
+                finally:
+                    if proc.poll() is None:  # a read_until that failed
+                        _kill_all(proc, kids)
+                    proc.stdout.close()
+                if outcome == 'ok' and (not EXITING.search(text) or 'journalctl ended with status' in text
+                                        or 'Traceback' in text or 'Error reading line' in text):
                     outcome = 'ended wrong'
                 done += 1
                 stops.append((outcome, signal.Signals(signum).name, 'and journalctl' if group else 'alone',

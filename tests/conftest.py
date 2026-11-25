@@ -187,6 +187,8 @@ class Feed(object):
                     return
                 try:
                     line = self.script.readline()
+                    # inside the try: a line that cannot be encoded is raised in firewatcher's wait like any other error
+                    data = line.encode('utf-8', 'surrogateescape') if isinstance(line, str) else line
                 except BaseException as exc:
                     self.error = exc
                     self.asked = False
@@ -194,13 +196,12 @@ class Feed(object):
                     continue
                 if self.closed:
                     return
-                if not line:
+                if not data:
                     # the end of the output; the pipe that carries what the script raises stays open until close()
                     self.ended = True
                     os.close(self.write_fd)
                     self.write_fd = None
                     continue
-                data = line.encode('utf-8', 'surrogateescape') if isinstance(line, str) else line
                 # cleared before the bytes are there, so firewatcher's next wait asks again
                 self.asked = False
                 while data:
