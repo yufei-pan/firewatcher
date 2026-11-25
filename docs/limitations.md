@@ -20,7 +20,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: with `events_url` set and its receiver not answering (the host down, its packets
   dropped), each alert (only `always_notify` captures fall back to ntfy) is pushed one `ntfy_timeout` late (10 s by default; 5 s for a capture that
-  overflows the analysis queue), because firewatcher tries the POST first and pushes to ntfy only when it fails. No alert is lost.
+  overflows the analysis queue), because firewatcher tries the POST first and pushes to ntfy only when it fails. A capture that is not `always_notify` is only logged then.
 - Why: the POST and the push run one after the other. A separate short timeout, or skipping the POST for a while
   after a failure, would shorten the wait at the cost of a second setting or of state; a few seconds' delay while
   the receiver is down was judged acceptable.
@@ -48,7 +48,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   second it could not find).
 - Why: where the saved line is gone, firewatcher can only go by time, and so does journalctl: a cursor from another
   boot lands by its time (tested on systemd 219, 2026-11-23). Where the saved line is still there (a persistent
-  journal), a clock set back does not change the resume.
+  journal), a clock set back does not change where the resume starts; the age of the position (`--resume-max`) is
+  judged by the clock, and one that looks older than that is read by time, as when the saved line is gone.
 - Revisit when: an operator hits it. The route then: a fallback that reads by boot instead of by time.
 - Approved: chief's decision C224, 2026-11-24 (the user made the chief session their desk on 2026-11-14 and let it
   decide where it judges they would pick the option nine times in ten; not the user's words, and the user may
@@ -64,8 +65,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (measured 2026-11-25 on 252, 255, 257 and 259; 219, 239 and 249 show every boot). No option lifts it on every
   version.
 - Plan (1.71): read the lines logged while stopped without `--follow`, from the saved entry to the journal's end,
-  then follow from the last entry read, dropping it as a restart drops the saved entry. The same change adds one test
-  that runs the real journalctl (on a journal written with systemd-journal-remote, skipped where that is missing; CI's
-  ubuntu-24.04 jobs install it): lines equal journalctl's, the entry found with 30 entries after it, the entry gone,
-  two boots. No test in the suite runs a real journalctl today, and the fake one is only as right as its author.
+  then follow from the last entry read, dropping it as a restart drops the saved entry. The context before the saved
+  entry is read in the same pass, from a cursor found by reading back from the saved entry (entry "After a restart,
+  the context before the saved entry can lack its last lines" below). The same change adds one test
+  that runs the real journalctl (on a journal written with systemd-journal-remote, skipped where that is missing; the
+  same change makes CI's ubuntu-24.04 jobs install it, which they do not today): lines equal journalctl's, the entry
+  found with 30 entries after it, the entry gone, two boots. No test in the suite runs a real journalctl today, and
+  the fake one is only as right as its author.
+- Revisit when: 1.71.
+
+### After a restart, the context before the saved entry can lack its last lines
+- Kind: deferred
+- What the operator sees: the lines read again before the saved entry, as context for a capture opened soon after a
+  restart, end early in two cases. When the clock was ahead and was set back inside the `--capture-time` window, the
+  context ends at the first line stored after the saved entry's second. When the window holds more than the read gets
+  through in 30 seconds (about 4 to 6 million lines on the hosts measured, far above journald's default rate limit),
+  the context holds the window's oldest lines. No line is skipped or matched again by this; 1.69 matched the first
+  case's lines again and read the whole window before matching. Since 1.70.
+- Why: 1.70 reads the context forward from a time, which keeps no entry in memory, but starts and stops by time.
+- Plan (1.71): the change of the entry above, which reads in journal order. Read back from the saved entry for the
+  cursor where the context starts, no further than `--buffer-max-mb` holds; then read forward from that cursor without
+  `--follow`: the lines before the saved entry refill the context, the saved entry is dropped, the rest are matched,
+  and the follow starts after the last entry read. No time stop, no separate 30-second read remains.
 - Revisit when: 1.71.
