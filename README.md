@@ -245,6 +245,8 @@ Nothing to change. What is different:
 - The position file holds the journal cursor of the last entry read, so a restart resumes exactly where the journal still holds that entry: no line is skipped or captured again, whatever the clock did. A 1.69 position file is read by its time, as when the journal lost the saved line: the lines from `--capture-time` before it are matched once more at the upgrade. A 1.69 started on a 1.70 file says it cannot read the journal position and reads the last `--tail-lines` lines.
 - firewatcher writes the journal lines in captures itself (from `journalctl -o export`): the time zone offset is always written `+HH:MM` (systemd 219, as on CentOS 7, printed `+0000`), and journalctl's `-- Boot <id> --` lines no longer appear among them.
 - A pattern file saved with a UTF-8 byte-order mark now matches its first pattern; 1.69 kept the mark in it.
+- `--print-unit` runs the install's checks: a unit name or config text that `--install-service` refuses is refused there too (exit 2); 1.69 printed the unit.
+- A failed `--install-service` through a dangling symlink at the unit path removes the file it wrote at the link's target and leaves the link; 1.69 kept that file.
 
 ## Upgrading to 1.69 from 1.68
 

@@ -53,10 +53,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: chief's decision C224, 2026-11-24 (the user made the chief session their desk on 2026-11-14 and let it
   decide where it judges they would pick the option nine times in ten; not the user's words, and the user may
   reverse it): "(a) known limitation" with one README line. The user did not ask for it; 1.69's reviews found it.
-
-### A dangling symlink at the unit path is written through, and its target is kept when the install fails
-- Kind: deferred
-- What the operator sees: with a dangling symlink at `/etc/systemd/system/firewatcher.service`, `--install-service` writes the unit at the link's target (the open follows the link), and a step that fails afterwards leaves that file, naming the config the clean-up removed. Older than 1.69.
-- Why: the clean-up counts a path that exists as a link as a unit that was there before, and keeps nothing of it to put back.
-- Plan (1.70): a path that is a link (`os.path.lexists`) but no file (`os.path.isfile`) counts as created, and a failure removes what the install wrote through it.
-- Revisit when: 1.70.

@@ -2725,13 +2725,14 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 
 	try:
 		os.makedirs(unit_dir, exist_ok=True)
-		existed = os.path.lexists(unit_path)
-		if os.path.isfile(unit_path):
+		existed = os.path.isfile(unit_path)
+		if existed:
 			with open(unit_path, 'rb') as fh:
 				old_unit = fh.read()
 		with open(unit_path, 'w', encoding='utf-8') as fh:
 			if not existed:
-				created.append(unit_path)
+				# A dangling link is written through: the file this run created is its target, and the link stays.
+				created.append(os.path.realpath(unit_path) if os.path.islink(unit_path) else unit_path)
 			fh.write(unit_text)
 	except OSError as exc:
 		return failed('cannot write unit %s: %s' % (unit_path, exc), 1)
