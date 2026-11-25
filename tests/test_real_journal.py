@@ -95,16 +95,23 @@ class Journal(object):
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
             env=self.env)
 
-    def wait_for_the_end(self, proc):
-        """Until the saved position is the journal's last entry (20 s at most: the runs here take about one)."""
-        last = self.entries()[-1][0]
+    def wait_for_the_end(self, proc, nudge=False):
+        """Until the saved position is the journal's last entry (20 s at most: the runs here take about one). With nudge,
+        an entry is written every 2 s meanwhile: journalctl's follow can miss the end of a burst until the journal
+        changes again (systemd 257, 1 in 2,400 bursts of 40 entries without firewatcher, 2026-11-25)."""
+        ends = [self.entries()[-1][0]]
         deadline = time.time() + 20
+        nudged = time.time()
         while time.time() < deadline and proc.poll() is None:
             try:
-                if json.loads(self.position.read_text()).get('cursor') == last:
+                if json.loads(self.position.read_text()).get('cursor') in ends:
                     return
             except (OSError, ValueError):
                 pass
+            if nudge and time.time() > nudged + 2:
+                nudged = time.time()
+                self.write('system.journal', (nudged - self.T, 'nudge'))
+                ends.append(self.entries()[-1][0])
             time.sleep(0.05)
 
     def stop(self, proc):
@@ -165,13 +172,13 @@ def test_a_restart_finds_the_saved_entry_and_matches_every_line_after_it_once(jo
         time.sleep(1.0)
         now = time.time() - journal.T
         journal.write('system.journal', *[(now + 0.001 * k, ('HIT live %d' if k % 10 == 5 else 'live %d') % k) for k in range(40)])
-        journal.wait_for_the_end(proc)
+        journal.wait_for_the_end(proc, nudge=True)
     finally:
         journal.stop(proc)
     lines, openers = journal.captured()
     # after the context of the last 300 s, read back
     assert openers == ['HIT live 5'] and len(set(lines)) == len(lines)
-    assert messages(lines)[-40:] == [('HIT live %d' if k % 10 == 5 else 'live %d') % k for k in range(40)]
+    assert [m for m in messages(lines) if m != 'nudge'][-40:] == [('HIT live %d' if k % 10 == 5 else 'live %d') % k for k in range(40)]
 
 
 def test_a_restart_after_a_reboot_reads_what_the_old_boot_logged_after_the_stop(journal):
