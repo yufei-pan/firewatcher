@@ -54,13 +54,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   decide where it judges they would pick the option nine times in ten; not the user's words, and the user may
   reverse it): "(a) known limitation" with one README line. The user did not ask for it; 1.69's reviews found it.
 
-### `--print-unit` does not run the install's checks of the unit name and the config text
-- Kind: deferred
-- What the operator sees: `--print-unit --unit-name 'a b'` prints a unit and exits 0, where `--install-service` refuses the name (exit 2); a config text the install would refuse (not UTF-8) is never rendered by `--print-unit`. It refuses a value that is not UTF-8 in the unit itself, as the install does. 1.68 did the same.
-- Why: the install runs its checks in `install_service`; the print path calls `render_unit_file` only.
-- Plan (1.70): one function runs the checks and renders the unit and the config text, and both commands call it.
-- Revisit when: 1.70.
-
 ### A dangling symlink at the unit path is written through, and its target is kept when the install fails
 - Kind: deferred
 - What the operator sees: with a dangling symlink at `/etc/systemd/system/firewatcher.service`, `--install-service` writes the unit at the link's target (the open follows the link), and a step that fails afterwards leaves that file, naming the config the clean-up removed. Older than 1.69.

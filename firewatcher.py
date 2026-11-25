@@ -2640,6 +2640,19 @@ def _seed_example_patterns(pattern_paths):
 
 
 
+def _render_install(args, raw=None, executable=None):
+	"""(settings, parsed command line, unit file name, unit text, config text or None when the config exists), after
+	every check the install runs; ConfigError or ValueError when one refuses. --print-unit and --install-service both
+	call it, so a print shows what the install would write, or its refusal."""
+	resolved, raw = _prepare_unit_settings(args, raw=raw)
+	unit_name = unit_filename(resolved.unit_name)
+	_check_new_unit_name(unit_name)
+	config_existed = os.path.isfile(resolved.config_path)
+	unit_text = _strict_utf8(render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw))
+	config_text = None if config_existed else _strict_utf8(render_config_text(resolved))
+	return resolved, raw, unit_name, unit_text, config_text
+
+
 def install_service(args, systemd_available=None, unit_dir=None, systemctl=None, executable=None, raw=None):
 	if systemd_available is None:
 		systemd_available = systemd_is_available()
@@ -2651,15 +2664,11 @@ def install_service(args, systemd_available=None, unit_dir=None, systemctl=None,
 	# Everything is checked and rendered before anything is written, so a refused install leaves nothing behind
 	# (a left-over config would make the next install render a different unit).
 	try:
-		resolved, raw = _prepare_unit_settings(args, raw=raw)
-		unit_name = unit_filename(resolved.unit_name)
-		_check_new_unit_name(unit_name)
-		config_existed = os.path.isfile(resolved.config_path)
-		unit_text = _strict_utf8(render_unit_file(resolved, executable=executable, config_exists=config_existed, raw=raw))
-		config_text = None if config_existed else _strict_utf8(render_config_text(resolved))
+		resolved, raw, unit_name, unit_text, config_text = _render_install(args, raw=raw, executable=executable)
 	except (ConfigError, ValueError) as exc:
 		print(str(exc), file=sys.stderr)
 		return 2
+	config_existed = config_text is None
 	os.makedirs(resolved.output_folder, exist_ok=True)
 	_seed_example_patterns(resolved.pattern_file)
 	# The config and unit this run creates, removed again if a later step fails. The output folder and the example
@@ -3229,8 +3238,8 @@ def main(argv=None):
 		# The text --install-service would write, as the UTF-8 bytes it would write whatever the locale: a unit piped
 		# into a file is read as UTF-8, and stdout may not be.
 		try:
-			unit = _strict_utf8(render_unit_file(resolved, raw=args))
-		except ConfigError as exc:
+			unit = _render_install(resolved, raw=args)[3]
+		except (ConfigError, ValueError) as exc:
 			print(str(exc), file=sys.stderr)
 			return 2
 		stream = getattr(sys.stdout, 'buffer', None)
