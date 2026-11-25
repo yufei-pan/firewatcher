@@ -1774,8 +1774,9 @@ class ContextBuffer(object):
 
 	New lines collect in a block; once a block holds BUFFER_BLOCK_BYTES of text it is compressed with
 	zlib, so a busy host keeps several times more context in the same memory. Over max_bytes, the oldest
-	block goes first; the newest block (or open block) always stays. Each line has a sequence number (lines read so far),
-	so a capture can leave out what an earlier capture already holds.
+	block goes first; the newest block (or open block) always stays. Each line has a sequence number (lines read so far; at a
+	restart, the lines read back that the buffer keeps, numbered from 1), so a capture can leave out what an earlier capture
+	already holds.
 	"""
 
 	def __init__(self, max_age, max_bytes):
@@ -3037,10 +3038,11 @@ def _noted_wait(what):
 
 
 def _journal_before(journalctl, cursor, since, now):
-	"""Yields (time, line), newest first, for the journal entry at cursor and the ones before it, back to the first entry
-	stored before since: one journalctl --cursor --reverse, ended when the caller stops taking lines. Nothing when its
-	first entry is not the one at cursor. A line's time is the second journald stored its entry, never later than now or
-	than the time of the line after it, so the times never run backwards (a clock that was ahead and was set back)."""
+	"""Yields (time, line), newest first, for the journal entry at cursor and the ones before it that were stored at or
+	after since (it stops at the first one stored before, which it does not yield): one journalctl --cursor --reverse,
+	ended when the caller stops taking lines. Nothing when its first entry is not the one at cursor. A line's time is the
+	second journald stored its entry, never later than now or than the time of the line after it, so the times never run
+	backwards (a clock that was ahead and was set back)."""
 	try:
 		proc = _journalctl_export(journalctl, '--cursor=' + cursor, '--reverse')
 	except OSError:
@@ -3078,7 +3080,7 @@ class _JournalSource(object):
 		self.following = False
 		# terminate() was called: no journalctl is started after it, and one starting then is ended.
 		self.stopped = False
-		# journalctl failed before its first entry: the next read ends the run.
+		# journalctl failed before its first entry, or at the end of the read without --follow: the next read ends the run.
 		self.ended = False
 		# Where the follow starts: the last entry read without --follow, or with none read, the time that read started at.
 		self.last = None
@@ -3170,12 +3172,18 @@ class _JournalSource(object):
 			line = self.reader.readline(limit)
 			if line or self.following or self.stopped:
 				return line
-			# The end of the read without --follow: the journal's end, or a journalctl that died part-way. Follow on from
+			# The end of the read without --follow. A journalctl that ended with a failure (it died part-way, or was
+			# stopped by a signal that did not reach firewatcher) ends the run, as a follow that dies does: the position
+			# is the last line handled, and the restart reads on from it. At the journal's end (status 0), follow on from
 			# the last whole entry read, dropped when it comes first, or by time when that read had none. --no-tail: with
 			# --follow, journalctl 219 and 239 to 252 print only the first 10 entries from --cursor and then wait for the
 			# journal to change. --since is cut so only by 219's --since=@0; it gets the flag too.
 			self.last = self.reader.cursor or self.last
-			self._close()
+			status = self._close()
+			if status != 0:
+				print('journalctl ended with status %d while reading on from the saved position.' % status)
+				self.ended = True
+				return ''
 			if self.last is not None:
 				self._start(['--cursor=' + self.last, '--no-tail'], skip=self.last)
 			else:
@@ -3240,7 +3248,7 @@ class JournalPosition(object):
 		if isinstance(cursor, str) and _CURSOR_RE.match(cursor):
 			self.cursor = cursor
 			return
-		# A 1.69 file.
+		# A 1.69 file, or no cursor in it that passes the check.
 		self.lost(now)
 
 	def lost(self, now):

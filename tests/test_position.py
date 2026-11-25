@@ -283,16 +283,26 @@ def test_the_follow_keeps_its_first_entry_when_it_is_not_the_last_one_read(tmp_p
     assert saved(tmp_path)['cursor'] == cursor(6, 'HIT second')
 
 
-def test_a_read_cut_in_the_middle_of_an_entry_follows_from_the_last_whole_one(tmp_path, monkeypatch):
+def test_a_read_cut_in_the_middle_of_an_entry_ends_the_run_and_the_next_start_resumes_from_the_last_whole_one(tmp_path, monkeypatch, capsys):
+    # A journalctl that ends with a failure part-way (it died, or a stop signal reached it alone) ends the run as a
+    # follow that dies does, not with a follow from where it stopped: the lost stop is then not waited out. 1.71 as
+    # first built followed on, and was still running a unit's stop timeout after the signal.
     position = saved_at(tmp_path, 0, 'saved')
     out, journalctl = resume(tmp_path, monkeypatch, position,
-                             cursor=([entry(0, 'saved'), entry(1, 'HIT one'), entry(2, 'two'), entry(3, 'three')[:40]], 3),
-                             reverse=([entry(0, 'saved')], 0),
-                             follow=([entry(2, 'two'), entry(3, 'three'), entry(4, 'four')], 0))
-    assert journalctl.calls[-1][-3:] == ['--cursor=' + cursor(2, 'two'), '--no-tail', '--follow']
-    text = incident_logs(out)[0].read_text()
-    assert text.count('two') == 1 and text.count(jline(3, 'three')) == 1 and 'four' in text
-    assert saved(tmp_path)['cursor'] == cursor(4, 'four')
+                             cursor=([entry(0, 'saved'), entry(1, 'HIT one'), entry(2, 'two'), entry(3, 'HIT three')[:40]], 3),
+                             reverse=([entry(0, 'saved')], 0), follow=([entry(9, 'never read')], 0))
+    assert journalctl.kinds() == ['cursor', 'reverse']
+    assert 'journalctl ended with status 3 while reading on from the saved position.' in capsys.readouterr().out
+    assert len(incident_logs(out)) == 1 and saved(tmp_path) == {'cursor': cursor(2, 'two'), 'time': T + 2}
+    # the next start reads from that entry: the cut one whole, once, and what follows
+    again = fw.JournalPosition(str(tmp_path / 'journal.position'), context_time=60, now=T + 10)
+    out, journalctl = resume(tmp_path, monkeypatch, again,
+                             cursor=([entry(2, 'two'), entry(3, 'HIT three'), entry(4, 'four')], 0),
+                             reverse=([entry(2, 'two')], 0), follow=([entry(5, 'five')], 0))
+    assert journalctl.calls[-1][-3:] == ['--cursor=' + cursor(4, 'four'), '--no-tail', '--follow']
+    text = incident_logs(out)[-1].read_text()
+    assert text.count('HIT three') == 2 and 'four' in text and 'five' in text  # in its header too
+    assert saved(tmp_path)['cursor'] == cursor(5, 'five')
 
 
 @pytest.mark.parametrize('stalled', ['cursor', 'reverse'])
@@ -813,23 +823,53 @@ def test_a_restart_after_a_reboot_reads_what_the_old_boot_logged_after_the_stop(
     assert [text.count(match) for match in ('HIT during shutdown', 'HIT unmount failed', 'HIT in the new boot')] == [2, 1, 1]
 
 
-def test_a_restart_whose_read_is_cut_part_way_follows_the_rest_at_once(tmp_path):
-    # The read without --follow ends in the middle of an entry (a journalctl that died): the follow starts from the
-    # last whole entry, and must print the 30 entries after it at once, which journalctl 219 and 239 to 252 do only
-    # with --no-tail.
+def test_a_restart_whose_read_is_cut_part_way_ends_the_run_and_the_next_start_resumes_exactly(tmp_path):
+    # The read without --follow ends in the middle of an entry (a journalctl that died, or that a stop signal reached
+    # alone): the run ends, as a follow that dies does, with the position at the last whole entry. 1.71 as first built
+    # followed on from there, and a stop whose signal firewatcher itself had lost was waited out to the unit's timeout.
     daemon = Daemon(tmp_path)
     line, now = daemon.line, daemon.now
     first_journal = [(-100, 'quiet'), (-90, 'HIT first'), (-80, 'saved')]
     daemon.write(*first_journal)
     daemon.run_until(lambda: daemon.captured(1, 'saved', now - 80))
-    backlog = [(-79, 'HIT read')] + [(-70 + i, 'filler %02d' % i) for i in range(30)] + [(-5, 'HIT late')]
+    backlog = [(-79, 'HIT read')] + [(-50 + i, 'filler %02d' % i) for i in range(30)] + [(-5, 'HIT late')]
     daemon.write(*first_journal + backlog)
     (daemon.bin_dir / 'cut.txt').write_text('2')  # the saved entry, 'HIT read', and half of 'filler 00'
+    second = daemon.run_until(lambda: daemon.proc.poll() is not None)
+    assert 'journalctl ended with status 3 while reading on from the saved position.' in second and 'Process ended.' in second
+    assert 'Traceback' not in second and not any('--follow' in call for call in daemon.reads())
+    assert daemon.saved() == {'cursor': daemon.cursor(-79, 'HIT read'), 'time': now - 79}
+    assert len(incident_logs(daemon.out)) == 2 and 'HIT read' in incident_logs(daemon.out)[1].read_text()
+    # the next start reads on from that entry: each line after it once, the cut one whole
+    (daemon.bin_dir / 'cut.txt').unlink()
+    third = daemon.run_until(lambda: daemon.captured(3, 'HIT late', now - 5))
+    assert 'Resuming the journal after' in third
+    text = incident_logs(daemon.out)[2].read_text()
+    assert 'Matched line:    %s' % line(-5, 'HIT late').strip() in text
+    assert [text.count(line(-50 + i, 'filler %02d' % i)) for i in range(30)] == [1] * 30
+    # the entry it was cut after is not matched again: no capture of its own (captured() counts three)
+    assert len(incident_logs(daemon.out)) == 3
+
+
+def test_a_follow_that_starts_with_more_than_ten_entries_waiting_prints_them_at_once(tmp_path):
+    # journalctl 219 and 239 to 252 print only the first 10 entries of a follow from a cursor, and then wait for the
+    # journal to change, unless it has --no-tail (the fake does so too): the 31 entries logged between the end of the
+    # read without --follow and the start of the follow must all be read.
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    first_journal = [(-100, 'quiet'), (-90, 'HIT first'), (-80, 'saved')]
+    daemon.write(*first_journal)
+    daemon.run_until(lambda: daemon.captured(1, 'saved', now - 80))
+    daemon.write(*first_journal + [(-79, 'HIT read')])
+    later = [(-50 + i, 'filler %02d' % i) for i in range(30)] + [(-5, 'HIT late')]
+    (daemon.bin_dir / 'later.jsonl').write_text(''.join(json.dumps({'stored': now + at, 'text': text}) + '\n' for at, text in later))
+    # the entries are logged as the follow starts
+    daemon.wrap('case " $* " in *" --follow "*) cat "$(dirname "$FAKE")/later.jsonl" >> "$(dirname "$FAKE")/journal.jsonl" ;; esac')
     second = daemon.run_until(lambda: daemon.captured(2, 'HIT late', now - 5))
     assert 'Resuming the journal after' in second
     text = incident_logs(daemon.out)[1].read_text()
     assert 'Matched line:    %s' % line(-79, 'HIT read').strip() in text
-    assert [text.count(line(-70 + i, 'filler %02d' % i)) for i in range(30)] == [1] * 30 and 'HIT late' in text
+    assert [text.count(line(-50 + i, 'filler %02d' % i)) for i in range(30)] == [1] * 30 and 'HIT late' in text
     assert daemon.reads()[-1] == '--output=export --all --no-pager --cursor=%s --no-tail --follow' % daemon.cursor(-79, 'HIT read')
 
 
