@@ -163,8 +163,9 @@ def test_every_save_syncs_the_file_before_the_rename(tmp_path, monkeypatch):
     position.save()
     assert events == ['fsync', 'replace'] * 3
     assert json.loads(path.read_text())['cursor'] == cursor(1, 'c')
-    # the file that is renamed over the old position is the one that was synced, not its folder
-    assert synced == renamed and len(set(synced)) == 3
+    # the file that is renamed over the old position is the one that was synced, not its folder (not also that the
+    # three files differ: ext4 gives a freed inode to the next temp file)
+    assert synced == renamed
 
 
 def test_save_survives_a_filesystem_without_fsync(tmp_path, monkeypatch):
@@ -603,7 +604,7 @@ def test_journal_context_reads_forward_from_since_through_the_saved_entry(tmp_pa
 
 
 def test_journal_context_stops_before_an_entry_stored_after_the_saved_second_when_the_saved_entry_never_shows(tmp_path):
-    # a clock set back: the order journalctl prints is not the order of the stored times
+    # the saved entry is not in the journal: the read ends at the first entry stored after its second
     daemon = Daemon(tmp_path)
     daemon.write((-50, 'context'), (-30, 'a later entry'), (-10, 'another'))
     journalctl = str(daemon.bin_dir / 'journalctl')
@@ -639,9 +640,69 @@ def test_journal_context_stopped_early_ends_journalctl(tmp_path):
         os.kill(pid, 0)
 
 
+def test_a_stop_during_the_context_read_ends_as_a_stop_in_the_loop_does(tmp_path, monkeypatch, capsys):
+    # SIGINT (as the unit sends) or SIGTERM lands while the entries before the saved one are read: "Exiting.", the
+    # main journalctl ended and the saved position as it was, as in the loop. 1.70's first build read them before
+    # the try that holds the loop, so the stop came out of capture_messages as a traceback (exit 1 on Python 3.6).
+    path = tmp_path / 'journal.position'
+    save_position(path, 0, 'saved')
+    before = path.read_text()
+    monkeypatch.setattr(fw, '_journal_holds', lambda journalctl, c: True)
+
+    def context(journalctl, c, since, until):
+        yield T - 20, jline(-20, 'context line')
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fw, '_journal_context', context)
+    position = fw.JournalPosition(str(path), context_time=60, now=T + 10)
+    popen = export_popen(monkeypatch, [entry(5, 'never read')])
+    pat = tmp_path / 'p.txt'
+    pat.write_text('HIT\n')
+    try:
+        fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                            compress_after_months=0, delete_after_months=0, journal_position=position)
+    except KeyboardInterrupt:
+        pytest.fail('a stop during the context read came out of capture_messages')
+    assert 'Exiting.' in capsys.readouterr().out
+    assert popen.terminated
+    assert path.read_text() == before
+
+
+def test_a_stop_signal_during_the_context_read_exits_cleanly(tmp_path):
+    # The same with a real SIGTERM and a real process: the journalctl that reads the context prints one entry and
+    # stalls, the stop must end firewatcher with exit 0 (run_until asserts it), and that journalctl with it.
+    daemon = Daemon(tmp_path)
+    daemon.write((-10, 'saved'))
+    bin_dir = daemon.bin_dir
+    (bin_dir / 'journalctl').rename(str(bin_dir / 'journalctl.fake'))
+    (bin_dir / 'context.bin').write_bytes(entry(0, 'context', when=daemon.now - 50))
+    wrapper = bin_dir / 'journalctl'
+    wrapper.write_text('#!/bin/sh\ncase " $* " in\n'
+                       ' *" --follow "*|*" --reverse "*|*" --lines=0 "*) exec %(dir)s/journalctl.fake "$@" ;;\n'
+                       ' *" --since=@"*) cat %(dir)s/context.bin; echo $$ > %(dir)s/stalled.pid; exec sleep 30 ;;\n'
+                       'esac\nexec %(dir)s/journalctl.fake "$@"\n' % {'dir': bin_dir})
+    wrapper.chmod(0o755)
+    daemon.position_file.write_text(json.dumps({'cursor': cursor(daemon.now - 10 - T, 'saved'), 'time': daemon.now - 10}))
+    before = daemon.position_file.read_text()
+    output = daemon.run_until(lambda: (bin_dir / 'stalled.pid').exists())
+    assert 'Resuming the journal after' in output and 'Exiting.' in output and 'Traceback' not in output
+    assert daemon.position_file.read_text() == before
+    pid = int((bin_dir / 'stalled.pid').read_text())
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.05)
+    with pytest.raises(OSError):
+        os.kill(pid, 0)
+
+
 def test_journal_holds_is_bounded_by_the_probe_timeout(tmp_path, monkeypatch):
     stub = _stalling_journalctl(tmp_path, [])
-    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 0.5)
+    # 2 s: a fork and exec take milliseconds, and 2 s leaves a loaded runner room to start the stub before the timer ends it
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 2)
     started = time.time()
     assert not fw._journal_holds(stub, cursor(0, 'x'))
     assert time.time() - started < 10
@@ -650,7 +711,8 @@ def test_journal_holds_is_bounded_by_the_probe_timeout(tmp_path, monkeypatch):
 
 def test_journal_context_cut_off_by_the_probe_timeout_keeps_what_it_read(tmp_path, monkeypatch):
     stub = _stalling_journalctl(tmp_path, [entry(-50, 'context')])
-    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 0.5)
+    # 2 s, for the reason above: the stub must have printed its entry before the timer ends it
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 2)
     started = time.time()
     assert list(fw._journal_context(stub, cursor(0, 'x'), T - 60, T)) == [(T - 50, jline(-50, 'context'))]
     assert time.time() - started < 10
@@ -675,7 +737,7 @@ def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monke
     assert saves == [cursor(0, 'quiet'), cursor(0, 'HIT one'), cursor(0, 'after')]
 
 
-def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch):
+def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch, capsys):
     # After a restart that follows a busy window, the lines before the saved entry go straight into the bounded
     # context buffer: 1.70 first kept the whole read back, which cost 200 MB for 300,000 lines for the life of the process.
     import tracemalloc
@@ -702,7 +764,10 @@ def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch):
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    # a list of the lines read back is about 8 MB at this size (more while it is built); the buffer holds them compressed
+    # the lines did reach the buffer (a read that yields nothing would pass the limit below): the context lines and the saved one
+    assert 'Processed %d lines.' % (count + 1) in capsys.readouterr().out
+    # measured at this size: with the lines in the buffer, compressed, the peak is 1.4 MB; with a list of them in
+    # between (as the first build had) it is 12.4 MB
     assert peak < 4 * 1024 * 1024, peak
 
 

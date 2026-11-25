@@ -174,6 +174,8 @@ def test_the_context_is_read_back_no_further_than_resume_max(tmp_path, monkeypat
     path = write_position(tmp_path, {'cursor': cursor(0), 'time': T})
     position = fw.JournalPosition(path, resume_max=resume_max, context_time=context_time, now=now)
     assert position.context_since == since
+    # the note says how much context there will be, not what --capture-time asked for
+    assert 'with up to %d seconds of context before it' % (T - since) in position.note
 
 
 def test_a_saved_entry_still_there_resumes_whatever_the_clock_says(tmp_path, monkeypatch):

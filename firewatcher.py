@@ -2207,14 +2207,17 @@ def capture_messages(command_to_run, patterns, capture_time=300, output_folder=D
 			if journal_position is not None:
 				# journalctl -o export, written as -o short-iso lines, each with the entry it came from.
 				stream = journal_position.reader(stream)
-				for stored, line in journal_position.read_context():
-					processed_line_counter += 1
-					context.append(min(stored, time.time()), processed_line_counter, line)
 			elif isinstance(stream, io.BufferedIOBase):
 				stream = io.TextIOWrapper(stream, encoding='utf-8', errors='replace', newline='\n')
 			pending_read = None
 			line_in_flight = False
 			try:
+				if journal_position is not None:
+					# The entries before the saved one, as context: read inside this try, so a stop (SIGINT, as the unit
+					# sends, or SIGTERM) during the read ends as one in the loop below, with journalctl ended.
+					for stored, line in journal_position.read_context():
+						processed_line_counter += 1
+						context.append(min(stored, time.time()), processed_line_counter, line)
 				while True:
 					# Set while a line read from the journal is being handled, so a stop then reads it again after the restart.
 					line_in_flight = False
@@ -2996,9 +2999,9 @@ def _journal_holds(journalctl, cursor):
 
 def _journal_context(journalctl, cursor, since, until):
 	"""Yields (stored second, line) for the journal entries stored from since on, oldest first, as the caller takes
-	them, so none is kept here: through the entry at cursor, or up to the first one stored after until when the
-	journal never shows it (a clock set back). Read once without --follow, for JOURNAL_PROBE_TIMEOUT at most; when
-	journalctl fails or is cut off, what it printed until then is yielded."""
+	them, so none is kept here: through the entry at cursor. Read once, without --follow. The read ends early, with
+	what it has yielded, at the first entry stored after until (a clock that was ahead and was set back, or a saved
+	entry gone since the look), when journalctl fails, and after JOURNAL_PROBE_TIMEOUT."""
 	try:
 		proc = _journalctl_export(journalctl, '--since=@%d' % since)
 	except OSError:
@@ -3076,7 +3079,7 @@ class JournalPosition(object):
 			# No further back than --resume-max, as the fallback below.
 			self.context_since = int(max(saved_time - max(0, context_time), now - resume_max))
 			self.note = 'Resuming the journal after %s, %d seconds ago, with up to %d seconds of context before it.' % (
-				shown, max(0, now - saved_time), max(0, context_time))
+				shown, max(0, now - saved_time), max(0, saved_time - self.context_since))
 			return
 		# No entry to resume at (rotated away, a volatile journal after a reboot, a 1.69 file, or journalctl said
 		# nothing in time): by time, as journalctl itself would go.
