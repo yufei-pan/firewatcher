@@ -139,15 +139,17 @@ def test_every_save_syncs_the_file_before_the_rename(tmp_path, monkeypatch):
     # position could come back empty. Every save, periodic or at exit, must sync first.
     path = tmp_path / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
-    events = []
+    events, synced, renamed = [], [], []
     real_fsync, real_replace = os.fsync, os.replace
 
     def fsync(fd):
         events.append('fsync')
+        synced.append(os.fstat(fd).st_ino)
         real_fsync(fd)
 
     def replace(a, b):
         events.append('replace')
+        renamed.append(os.stat(a).st_ino)
         real_replace(a, b)
 
     monkeypatch.setattr(fw.os, 'fsync', fsync)
@@ -161,6 +163,8 @@ def test_every_save_syncs_the_file_before_the_rename(tmp_path, monkeypatch):
     position.save()
     assert events == ['fsync', 'replace'] * 3
     assert json.loads(path.read_text())['cursor'] == cursor(1, 'c')
+    # the file that is renamed over the old position is the one that was synced, not its folder
+    assert synced == renamed and len(set(synced)) == 3
 
 
 def test_save_survives_a_filesystem_without_fsync(tmp_path, monkeypatch):
@@ -174,6 +178,49 @@ def test_save_survives_a_filesystem_without_fsync(tmp_path, monkeypatch):
     position.save(100.0)
     assert json.loads(path.read_text())['time'] == T
     assert not position.save_failed
+
+
+def test_an_fsync_error_that_is_not_a_missing_feature_is_a_failed_save(tmp_path, monkeypatch, capsys):
+    def broken(fd):
+        raise OSError(fw.errno.EIO, 'Input/output error')
+
+    monkeypatch.setattr(fw.os, 'fsync', broken)
+    path = tmp_path / 'journal.position'
+    position = fw.JournalPosition(str(path), now=T)
+    position.saw(cursor(0, 'a'), T, 100.0)
+    position.save(100.0)
+    # not reported as saved: the position stays due, nothing replaces the old file, no half-written file is left
+    assert position.save_failed and position.changed and not path.exists()
+    assert os.listdir(str(tmp_path)) == []
+    assert 'Input/output error' in capsys.readouterr().out
+
+
+def test_a_failed_save_is_retried_while_the_journal_is_quiet_and_logged_once_per_failure_streak(tmp_path, monkeypatch, capsys):
+    failing = [True]
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if failing[0]:
+            raise OSError(fw.errno.EIO, 'Input/output error')
+        real_fsync(fd)
+
+    monkeypatch.setattr(fw.os, 'fsync', fsync)
+    path = tmp_path / 'journal.position'
+    position = fw.JournalPosition(str(path), now=T)
+    position.saw(cursor(0, 'a'), T, 100.0)
+    position.save(100.0)
+    position.save(101.0)  # no new entry: the position is still due
+    assert capsys.readouterr().out.count('cannot save the journal position') == 1
+    failing[0] = False
+    position.save(102.0)
+    assert json.loads(path.read_text()) == {'cursor': cursor(0, 'a'), 'time': T}
+    assert not position.save_failed
+    # a failure after a success is a new streak, and is logged again
+    position.saw(cursor(1, 'b'), T + 1, 102.5)
+    failing[0] = True
+    position.save(103.0)
+    assert capsys.readouterr().out.count('cannot save the journal position') == 1
+    assert json.loads(path.read_text())['cursor'] == cursor(0, 'a')
 
 
 def test_a_stop_inside_the_save_of_saw_does_not_take_back_the_line_before(tmp_path):
@@ -196,12 +243,18 @@ def test_a_stop_inside_the_save_of_saw_does_not_take_back_the_line_before(tmp_pa
     assert json.loads(path.read_text())['cursor'] == cursor(1, 'B')
 
 
-def test_save_without_a_new_entry_writes_nothing(tmp_path):
+def test_save_without_a_new_entry_writes_nothing(tmp_path, monkeypatch):
     path = tmp_path / 'journal.position'
     position = fw.JournalPosition(str(path), now=T)
-    position.saw(None, None, 100.0)
     position.save()
     assert not path.exists()
+    position.saw(cursor(0, 'a'), T, 100.0)
+    position.save(100.0)
+    writes = []
+    monkeypatch.setattr(fw.os, 'replace', lambda a, b: writes.append(b))
+    position.saw(cursor(0, 'a'), T, 100.5)  # another line of the same entry
+    position.save(102.0)
+    assert writes == []
 
 
 def test_save_failure_is_logged_once_and_retried(tmp_path, capsys):
@@ -234,6 +287,19 @@ def test_capture_matches_only_lines_after_the_saved_entry(tmp_path, monkeypatch)
     assert text.index('context line') < text.index('HIT before the restart') < text.index('logged while stopped')
     assert text.count('HIT before the restart') == 1
     assert saved(tmp_path) == {'cursor': cursor(6, 'HIT after the restart'), 'time': T + 6}
+
+
+def test_the_first_followed_entry_is_kept_when_it_is_not_the_saved_one(tmp_path, monkeypatch):
+    # The saved entry was vacuumed between the look for it and the follow: journalctl starts at the entry after it,
+    # which has not been read.
+    path = tmp_path / 'journal.position'
+    save_position(path, 0, 'saved')
+    monkeypatch.setattr(fw, '_journal_holds', lambda journalctl, c: True)
+    monkeypatch.setattr(fw, '_journal_context', lambda journalctl, c, since, until: iter(()))
+    position = fw.JournalPosition(str(path), context_time=60, now=T + 10)
+    out = run(tmp_path, monkeypatch, [entry(5, 'new, first followed'), entry(6, 'HIT second')], position)
+    assert jline(5, 'new, first followed') in incident_logs(out)[0].read_text()
+    assert saved(tmp_path)['cursor'] == cursor(6, 'HIT second')
 
 
 def _main_with(monkeypatch, argv, can_resume=True):
@@ -526,7 +592,7 @@ def test_journal_holds_looks_for_the_saved_entry(tmp_path):
 
 def test_journal_context_reads_forward_from_since_through_the_saved_entry(tmp_path):
     daemon = Daemon(tmp_path)
-    daemon.write((-100, 'too old'), (-50, 'context'), (-20, 'saved'), (-10, 'after'))
+    daemon.write((-100, 'too old'), (-50, 'context'), (-20, 'saved'), (-20, 'stored in the same second, after it'), (-10, 'after'))
     journalctl = str(daemon.bin_dir / 'journalctl')
     now = daemon.now
     got = list(fw._journal_context(journalctl, cursor(now - 20 - T, 'saved'), now - 60, now - 20))
@@ -574,8 +640,8 @@ def test_journal_context_cut_off_by_the_probe_timeout_keeps_what_it_read(tmp_pat
 
 
 def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monkeypatch):
-    # The periodic save (every POSITION_SAVE_INTERVAL of real time) must not fall inside this run, however slow
-    # the disk's fsync is: only the saves that come with the open and the exit are counted.
+    # After the first line's save (the periodic one is due at the start), the next periodic save is an hour away,
+    # however slow the disk's fsync is: only the saves that come with the capture's open and the exit follow.
     monkeypatch.setattr(fw, 'POSITION_SAVE_INTERVAL', 3600)
     saves = []
 
@@ -755,7 +821,8 @@ def test_a_carriage_return_in_a_message_cannot_start_a_line_of_its_own(tmp_path,
               position)
     assert saved(tmp_path) == {'cursor': cursor(2, 'after'), 'time': T + 2}
     logs = incident_logs(out)
-    assert len(logs) == 1 and 'HIT poison' in logs[0].read_text()
+    # one line, the CR in it as it came (read_text would turn it into a line break)
+    assert len(logs) == 1 and b'app[1]: x\r2026-13-01T00:00:00Z HIT poison' in logs[0].read_bytes()
 
 
 def _stopped_run(tmp_path, monkeypatch, events, stop_at=None, **kwargs):

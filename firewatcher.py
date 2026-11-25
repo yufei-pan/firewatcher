@@ -3120,7 +3120,7 @@ class JournalPosition(object):
 		if self.changed and now >= self.next_save:
 			self.save(now)
 		self.before = (self.last_cursor, self.stamp_time, self.changed)
-		if cursor is None or cursor == self.last_cursor:
+		if cursor == self.last_cursor:
 			return
 		self.last_cursor = cursor
 		self.stamp_time = stored
