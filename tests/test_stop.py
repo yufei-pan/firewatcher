@@ -284,7 +284,8 @@ sys.exit(fw.main(sys.argv[3:]))
 
 
 def start_on_a_log_file(tmp_path, cleanup, wrapper=()):
-    """CLEANUP_LAUNCH ('slow' or 'plain'), after the wrapper command if there is one."""
+    """CLEANUP_LAUNCH ('slow' or 'plain'), after the wrapper command if there is one, in a process group of its own (see
+    end_group)."""
     log, out, pat, conf = tmp_path / 'app.log', tmp_path / 'out', tmp_path / 'p.txt', tmp_path / 'fw.conf'
     pat.write_text('HIT\n')
     conf.write_text('[notify]\nevents_url = http://127.0.0.1:9/e\n')
@@ -292,7 +293,18 @@ def start_on_a_log_file(tmp_path, cleanup, wrapper=()):
     args = ['--config', conf, '-o', out, '-t', '300', '--fallback-folder', '', '--log-file', log, pat]
     return subprocess.Popen(list(wrapper) + [sys.executable, '-c', CLEANUP_LAUNCH, str(ROOT), cleanup] +
                             [str(arg) for arg in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED='1'))
+                            stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED='1'), start_new_session=True)
+
+
+def end_group(proc):
+    """SIGKILL what is left of firewatcher and the `tail -F` it started (a test that failed must not leave either: the
+    tail holds the output pipe, so the test would hang at the next read of it)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass  # none left
+    proc.stdout.close()
+    proc.wait()
 
 
 @pytest.mark.parametrize('second', [signal.SIGTERM, signal.SIGINT], ids=['then SIGTERM', 'then SIGINT'])
@@ -312,35 +324,44 @@ def test_a_second_stop_signal_of_either_kind_ends_a_clean_up_that_waits_at_once(
             pytest.fail('a %s after a %s did not end firewatcher within 5 s: %s' % (
                 signal.Signals(second).name, signal.Signals(first).name, seen[-600:]))
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.communicate()
+        end_group(proc)
     assert proc.returncode == -second, (proc.returncode, seen + output.decode('utf-8', 'replace'))
 
 
-@pytest.mark.parametrize('ignored', [signal.SIGINT, signal.SIGTERM], ids=['SIGINT', 'SIGTERM'])
-def test_a_stop_signal_firewatcher_was_started_ignoring_stays_ignored(tmp_path, ignored):
+def _stopped_with(proc, seen, signum):
+    """The output once signum has ended firewatcher (exit 0, "Exiting." on its own line), 5 s at most."""
+    proc.send_signal(signum)
+    try:
+        output, _ = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        pytest.fail('a %s did not end it within 5 s: %s' % (signal.Signals(signum).name, seen[-600:]))
+    text = seen + output.decode('utf-8', 'replace')
+    assert proc.returncode == 0 and 'Traceback' not in text and EXITING.search(text), text[-800:]
+
+
+def test_a_sigint_firewatcher_was_started_ignoring_stays_ignored(tmp_path):
     # `sh -c 'firewatcher ... & wait'`: a script's background job starts with SIGINT ignored, and a Ctrl-C on the script
-    # reaches it. 1.71 left that SIGINT ignored; the other stop signal still ends firewatcher.
-    other = signal.SIGTERM if ignored == signal.SIGINT else signal.SIGINT
-    name = signal.Signals(ignored).name[3:]
-    proc = start_on_a_log_file(tmp_path, 'plain', wrapper=['sh', '-c', 'trap "" %s; exec "$@"' % name, 'sh'])
+    # reaches it. 1.71 left that SIGINT ignored; SIGTERM still ends firewatcher.
+    proc = start_on_a_log_file(tmp_path, 'plain', wrapper=['sh', '-c', 'trap "" INT; exec "$@"', 'sh'])
     try:
         seen = read_until(proc, 'Capturing logs')
-        proc.send_signal(ignored)
+        proc.send_signal(signal.SIGINT)
         time.sleep(1)  # a stop is acted on in about 10 ms (p95 14 ms), so a second is far past it
-        assert proc.poll() is None, 'the ignored %s ended firewatcher: %s' % (name, seen)
-        proc.send_signal(other)
-        try:
-            output, _ = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pytest.fail('a %s did not end it within 5 s: %s' % (signal.Signals(other).name, seen[-600:]))
+        assert proc.poll() is None, 'the ignored SIGINT ended firewatcher: ' + seen
+        _stopped_with(proc, seen, signal.SIGTERM)
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.communicate()
-    assert proc.returncode == 0 and 'Traceback' not in seen + output.decode('utf-8', 'replace')
-    assert re.search(r'^Exiting\.$', seen + output.decode('utf-8', 'replace'), re.M)
+        end_group(proc)
+
+
+def test_a_sigterm_firewatcher_was_started_ignoring_still_stops_it(tmp_path):
+    # As in 1.71. Left ignored, SIGTERM would be inherited by the `tail -F` firewatcher starts, and terminate() could not
+    # end it where tail does not leave when its output closes (macOS): firewatcher then never ended.
+    proc = start_on_a_log_file(tmp_path, 'plain', wrapper=['sh', '-c', 'trap "" TERM; exec "$@"', 'sh'])
+    try:
+        seen = read_until(proc, 'Capturing logs')
+        _stopped_with(proc, seen, signal.SIGTERM)
+    finally:
+        end_group(proc)
 
 
 def test_an_exception_while_the_source_is_quiet_ends_the_run(tmp_path, monkeypatch, capsys):

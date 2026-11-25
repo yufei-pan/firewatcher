@@ -3478,8 +3478,8 @@ def _stop_signalled():
 
 @contextlib.contextmanager
 def _stops_wake_reads():
-	"""Inside, SIGTERM and SIGINT end the run at the main thread's next wait for the log, whichever thread takes them. One
-	that firewatcher was started ignoring (a background job of a script) stays ignored."""
+	"""Inside, SIGTERM and SIGINT end the run at the main thread's next wait for the log, whichever thread takes them. A
+	SIGINT that firewatcher was started ignoring (a background job of a script) stays ignored."""
 	global _wakeup_fd, _stop_requested
 	read_end, write_end = os.pipe()
 	os.set_blocking(read_end, False)
@@ -3489,9 +3489,11 @@ def _stops_wake_reads():
 		kept_fd = signal.set_wakeup_fd(write_end, warn_on_full_buffer=False)
 	except TypeError:  # Python 3.6 has no warn_on_full_buffer
 		kept_fd = signal.set_wakeup_fd(write_end)
-	# A signal firewatcher was started ignoring stays ignored.
+	# A SIGINT firewatcher was started ignoring stays ignored (a background job of a script is started so, and a Ctrl-C on
+	# the script would stop it). SIGTERM is always taken: left ignored it is inherited by journalctl and `tail -F`, and then
+	# terminate() cannot end a `tail -F` that does not leave when its output closes (macOS: the stop never ended).
 	kept = [(signum, signal.signal(signum, _request_stop)) for signum in (signal.SIGTERM, signal.SIGINT)
-			if signal.getsignal(signum) != signal.SIG_IGN]
+			if signum == signal.SIGTERM or signal.getsignal(signum) != signal.SIG_IGN]
 	_wakeup_fd = read_end
 	try:
 		yield
