@@ -66,7 +66,7 @@ POSITION_SAVE_INTERVAL = 1.0
 BACKLOG_LAG = 2
 # Longest a journalctl run at start may take (the probe, and reading back from the saved entry) before it counts as
 # hung. Measured on a 3.9 GB journal: about 4 us per entry in journalctl -o export and 8 us in firewatcher, so 30 s
-# reads back over two million entries, far more than --capture-time holds on any journal measured.
+# reads back over two million entries; a read back cut short by it still resumes at the saved entry, with less context.
 JOURNAL_PROBE_TIMEOUT = 30
 # A journal cursor as journalctl writes it (systemd 219 and 257 alike); a saved cursor must match it before it is used.
 _CURSOR_RE = re.compile(r's=[0-9a-f]{32};i=[0-9a-f]{1,16};b=[0-9a-f]{32};m=[0-9a-f]{1,16};t=[0-9a-f]{1,16};x=[0-9a-f]{1,16}\Z')
