@@ -39,6 +39,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: a way to tell such a URL from a real host and path appears, or someone hits it.
 - Approved: 2026-11-01, the user ticked "fw: digits shown as port". The no-warning sentence added 2026-11-04, the user: "Add it to the wording".
 
+### After a boot with the clock far behind, a restart does not read the lines logged before the clock was corrected
+- Kind: known limitation
+- What the operator sees: when the journal lost the saved line (as a volatile journal does at a reboot), a restart
+  reads from `--capture-time` (300 s by default) before the saved line; lines logged while firewatcher was stopped
+  and stamped earlier than that are not read. That needs a boot whose hardware clock was more than `--capture-time`
+  behind and was corrected before firewatcher started. 1.68 did the same, and was worse (it skipped the whole
+  second it could not find).
+- Why: where the saved line is gone, firewatcher can only go by time, and so does journalctl: a cursor from another
+  boot lands by its time (tested on systemd 219, 2026-11-23). Where the saved line is still there (a persistent
+  journal), the resume does not depend on the clock.
+- Revisit when: an operator hits it. The route then: a fallback that reads by boot instead of by time.
+- Approved: chief's decision C224, 2026-11-24 (the user made the chief session their desk on 2026-11-14 and let it
+  decide where it judges they would pick the option nine times in ten; not the user's words, and the user may
+  reverse it): "(a) known limitation" with one README line. The user did not ask for it; 1.69's reviews found it.
+
 ### A restart after the journal lost the saved line can skip lines that follow it
 - Kind: deferred
 - What the operator sees: when the journal lost the saved line, or lines before it in its second (a rotated file, a crash or a reboot), but still holds a later line of that second with the same text, the replay can end at that twin. The lines between the lost line and the twin were not read before the stop, and on the restart they are read as context only, not matched. 1.68 did the same. A message logged several times in one second is the usual twin.
