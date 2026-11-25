@@ -8,7 +8,7 @@ Open work lives here and nowhere else (RULES, "Long work: the progress file"). E
 ## Open work
 
 ### firewatcher 1.73 (no written plan: the docs/limitations.md entry of kind "deferred (1.73)", with its plan)
-- **A stop while a compression run's `tar` writes leaves its `.partial` archive behind** (archive-sized, counted as that month until a purge removes it; 1.71 the same). State: not started; plan: a `.partial` unchanged for a day is removed, the rule the free-space purge already uses (not a pid check: output folders can be shared between firewatchers on other hosts); the entry written in 1.72's fix round (f172a). From: 1.72's final review (2026-11-25), a deferral, not asked.
+- **A stop while a compression run's `tar` writes leaves its `.partial` archive behind** (archive-sized, counted as that month until a purge removes it; 1.71 the same). State: building (b173f, 2026-11-25, on feat/173 from 34ca01a); plan: a `.partial` unchanged for a day is removed, the rule the free-space purge already uses (not a pid check: output folders can be shared between firewatchers on other hosts); the entry written in 1.72's fix round (f172a). From: 1.72's final review (2026-11-25), a deferral, not asked.
 
 ### Standing rows
 - **Deferred work** is in `docs/limitations.md` (entries of kind "deferred"); each names when it is revisited. The file holds four known limitations and the 1.73 deferral (the row above).
