@@ -19,8 +19,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### While the events receiver is down, each alert waits one timeout before ntfy
 - Kind: known limitation
 - What the operator sees: with `events_url` set and its receiver not answering (the host down, its packets
-  dropped), each alert (only `always_notify` captures fall back to ntfy) is pushed one `ntfy_timeout` late (10 s by default; 5 s for a capture that
-  overflows the analysis queue), because firewatcher tries the POST first and pushes to ntfy only when it fails. A capture that is not `always_notify` is only logged then.
+  dropped), each alert (only `always_notify` captures fall back to ntfy) is pushed one `ntfy_timeout` late (10 s by
+  default; 5 s for a capture that overflows the analysis queue), because firewatcher tries the POST first and pushes
+  to ntfy only when it fails. Other captures are not pushed then; they stay in the capture folder and the journal.
 - Why: the POST and the push run one after the other. A separate short timeout, or skipping the POST for a while
   after a failure, would shorten the wait at the cost of a second setting or of state; a few seconds' delay while
   the receiver is down was judged acceptable.
@@ -80,11 +81,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   restart, end early in two cases. When the clock was ahead and was set back inside the `--capture-time` window, the
   context ends at the first line stored after the saved entry's second. When the window holds more than the read gets
   through in 30 seconds (about 4 to 6 million lines on the hosts measured, far above journald's default rate limit),
-  the context holds the window's oldest lines. No line is skipped or matched again by this; 1.69 matched the first
-  case's lines again and read the whole window before matching. Since 1.70.
+  the context ends where that read stopped, without the window's last lines. No line is skipped or matched again by
+  this; 1.69 matched the first case's lines again and read the whole window before matching. Since 1.70.
 - Why: 1.70 reads the context forward from a time, which keeps no entry in memory, but starts and stops by time.
 - Plan (1.71): the change of the entry above, which reads in journal order. Read back from the saved entry for the
   cursor where the context starts, no further than `--buffer-max-mb` holds; then read forward from that cursor without
   `--follow`: the lines before the saved entry refill the context, the saved entry is dropped, the rest are matched,
   and the follow starts after the last entry read. No time stop, no separate 30-second read remains.
+- Revisit when: 1.71.
+
+### After a restart, a journalctl that does not answer the look matches the window again
+- Kind: deferred
+- What the operator sees: when journalctl fails, or prints nothing within 30 seconds, as firewatcher looks for the
+  saved entry at a restart, firewatcher reads by time as if the entry were gone: every line from `--capture-time`
+  before it is matched again, so an incident of that window is captured and pushed a second time. No line is
+  skipped. 1.69 kept its saved position in that case. Since 1.70.
+- Why: 1.70 treats "no answer" as "gone", because without the first entry it cannot tell.
+- Plan (1.71): with the change of the two entries above: when the look gets no answer, read on from the saved
+  entry without the context, as 1.69 kept its position, with a real-journalctl test of a cursor the journal lost.
 - Revisit when: 1.71.
