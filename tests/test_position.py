@@ -129,9 +129,9 @@ def test_saw_saves_once_per_interval_and_round_trips(tmp_path, monkeypatch):
     assert not [name for name in os.listdir(str(path.parent)) if name.endswith('.tmp')]
     # a restart finds 'd' and reads back to it as context
     calls = []
-    monkeypatch.setattr(fw, '_journal_back', lambda journalctl, c, since: calls.append((c, since)) or [(T + 1, jline(1, 'd'))])
+    monkeypatch.setattr(fw, '_journal_holds', lambda journalctl, c: calls.append(c) or True)
     again = fw.JournalPosition(str(path), context_time=60, now=T + 5)
-    assert calls == [(cursor(1, 'd'), T + 1 - 60)] and again.cursor == cursor(1, 'd')
+    assert calls == [cursor(1, 'd')] and again.cursor == cursor(1, 'd') and again.context_since == T + 1 - 60
 
 
 def test_every_save_syncs_the_file_before_the_rename(tmp_path, monkeypatch):
@@ -220,8 +220,9 @@ def test_save_failure_is_logged_once_and_retried(tmp_path, capsys):
 def test_capture_matches_only_lines_after_the_saved_entry(tmp_path, monkeypatch):
     path = tmp_path / 'journal.position'
     save_position(path, 0, 'HIT before the restart')
-    monkeypatch.setattr(fw, '_journal_back', lambda journalctl, c, since: [
-        (T - 20, jline(-20, 'context line')), (T, jline(0, 'HIT before the restart'))])
+    monkeypatch.setattr(fw, '_journal_holds', lambda journalctl, c: True)
+    monkeypatch.setattr(fw, '_journal_context', lambda journalctl, c, since, until: iter([
+        (T - 20, jline(-20, 'context line')), (T, jline(0, 'HIT before the restart'))]))
     position = fw.JournalPosition(str(path), context_time=60, now=T + 10)
     out = run(tmp_path, monkeypatch, [entry(0, 'HIT before the restart'), entry(5, 'logged while stopped'),
                                       entry(6, 'HIT after the restart')], position)
@@ -312,7 +313,8 @@ def test_journal_can_resume_probes_journalctl(tmp_path):
 FAKE_JOURNALCTL = r'''#!%s
 """Prints journal.jsonl (one {"stored": seconds, "text": ...} per line, in the order stored) as journalctl -o export:
 from the entry at --cursor=C (where the journal no longer holds it, from the first entry stored at or after its time,
-as journalctl lands), backwards with --reverse, from --since=@N, or the last --lines=N; then, with --follow, waits."""
+as journalctl lands), backwards with --reverse, from --since=@N, or the last --lines=N; then, with --follow, waits.
+Like journalctl 219 and 239 to 252, --follow without --no-tail or --lines=N prints only the first 10 entries of its start."""
 import os, re, sys, time, zlib
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, 'calls.txt'), 'a') as f:
@@ -343,6 +345,8 @@ for arg in args:
         entries = [e for n, e in enumerate(entries) if n >= next((k for k, x in enumerate(entries) if x['stored'] >= since), len(entries))]
     if arg.startswith('--lines='):
         entries = entries[-int(arg[len('--lines='):]):]
+if '--follow' in args and '--no-tail' not in args and not any(a.startswith('--lines=') for a in args):
+    entries = entries[:10]
 out = sys.stdout.buffer
 for e in entries:
     for name, value in (('__CURSOR', e['cursor']), ('__REALTIME_TIMESTAMP', '%%d' %% (e['stored'] * 1000000)),
@@ -441,9 +445,31 @@ def test_a_restarted_daemon_matches_only_what_it_has_not_read(tmp_path):
     assert daemon.saved()['time'] == now - 5
     calls = daemon.calls()
     assert any('--lines=20' in call for call in calls)
-    back = [call for call in calls if '--reverse' in call]
-    assert len(back) == 1 and '--follow' not in back[0]
-    assert any('--follow' in call and '--cursor=' in call for call in calls)
+    # one look for the saved entry, one read of the context before it, and the follow from it
+    look = [call for call in calls if '--reverse' in call]
+    assert len(look) == 1 and '--follow' not in look[0] and '--cursor=%s' % cursor(now - 20 - T, 'after the first') in look[0]
+    back = [call for call in calls if '--since=@' in call and '--follow' not in call and '--lines=0' not in call]
+    assert back == ['--all --no-pager --quiet --output=export --since=@%d' % (now - 20 - 60)]
+    follow = [call for call in calls if '--follow' in call and '--cursor=' in call]
+    assert len(follow) == 1 and '--no-tail' in follow[0] and '--lines' not in follow[0]
+
+
+@pytest.mark.parametrize('journal_keeps_the_saved_entry', [True, False])
+def test_a_restart_reads_a_backlog_longer_than_journalctls_follow_default_at_once(tmp_path, journal_keeps_the_saved_entry):
+    # journalctl 219 and 239 to 252 print only 10 entries of a --follow from a cursor (219 from --since too) and
+    # wait for the journal to change, unless --no-tail is given: the match after 30 other entries would wait.
+    daemon = Daemon(tmp_path)
+    line, now = daemon.line, daemon.now
+    first_journal = [(-100, 'quiet'), (-90, 'HIT first'), (-80, 'saved')]
+    daemon.write(*first_journal)
+    daemon.run_until(lambda: daemon.captured(1, 'saved', now - 80))
+    backlog = [(-70 + i, 'filler %02d' % i) for i in range(30)] + [(-5, 'HIT late')]
+    daemon.write(*(first_journal if journal_keeps_the_saved_entry else []) + backlog)
+    second = daemon.run_until(lambda: daemon.captured(2, 'HIT late', now - 5))
+    assert ('Resuming the journal after' if journal_keeps_the_saved_entry else 'Cannot find the last entry') in second
+    logs = incident_logs(daemon.out)
+    assert len(logs) == 2
+    assert 'Matched line:    %s' % line(-5, 'HIT late').strip() in logs[1].read_text()
 
 
 def test_a_restart_after_the_journal_lost_the_saved_entry_matches_every_line_of_the_window(tmp_path):
@@ -454,11 +480,11 @@ def test_a_restart_after_the_journal_lost_the_saved_entry_matches_every_line_of_
     # While stopped, the journal file that held it was rotated away; a match was logged after it.
     daemon.write((-15, 'HIT logged while stopped'), (-5, 'later'))
     second = daemon.run_until(lambda: daemon.captured(2, 'later', now - 5))
-    assert 'no longer holds the last line read' in second
+    assert 'Cannot find the last entry read before the stop' in second
     logs = incident_logs(daemon.out)
     assert len(logs) == 2
     assert 'Matched line:    %s' % line(-15, 'HIT logged while stopped').strip() in logs[1].read_text()
-    assert any('--since=@%d' % (now - 20 - 60) in call and '--follow' in call for call in daemon.calls())
+    assert any('--since=@%d' % (now - 20 - 60) in call and '--no-tail' in call and '--follow' in call for call in daemon.calls())
 
 
 def test_a_restart_with_a_position_file_of_1_69_matches_every_line_of_the_window(tmp_path):
@@ -467,7 +493,7 @@ def test_a_restart_with_a_position_file_of_1_69_matches_every_line_of_the_window
     daemon.write((-30, 'HIT before the upgrade'), (-10, 'HIT after it'))
     daemon.position_file.write_text(json.dumps({'time': now - 20, 'line': 1, 'sha1': 'f' * 40}))
     second = daemon.run_until(lambda: daemon.captured(1, 'HIT after it', now - 10))
-    assert 'no longer holds the last line read' in second
+    assert 'Cannot find the last entry read before the stop' in second
     assert not any('--cursor' in call for call in daemon.calls())
     assert 'Matched line:    %s' % line(-30, 'HIT before the upgrade').strip() in incident_logs(daemon.out)[0].read_text()
 
@@ -480,34 +506,71 @@ def test_a_restart_on_a_journal_without_the_saved_entry_and_a_clock_set_back_mat
     # A reboot with a volatile journal (CentOS 7's default) lost the saved entry, and the clock came back behind it.
     daemon.write((-50, 'booted with the clock behind'), (-49, 'HIT after the reboot'))
     second = daemon.run_until(lambda: len(incident_logs(daemon.out)) == 2 and daemon.saved().get('time') == now - 49)
-    assert 'no longer holds the last line read' in second
+    assert 'Cannot find the last entry read before the stop' in second
     logs = incident_logs(daemon.out)
     assert len(logs) == 2
     assert 'Matched line:    %s' % line(-49, 'HIT after the reboot').strip() in logs[1].read_text()
 
 
-def test_journal_back_reads_from_the_cursor_back_to_since_oldest_first(tmp_path):
+def test_journal_holds_looks_for_the_saved_entry(tmp_path):
     daemon = Daemon(tmp_path)
     daemon.write((-100, 'too old'), (-50, 'context'), (-20, 'saved'), (-10, 'after'))
     journalctl = str(daemon.bin_dir / 'journalctl')
-    saved_cursor = cursor(daemon.now - 20 - T, 'saved')
-    assert fw._journal_back(journalctl, saved_cursor, daemon.now - 60) == [
-        (daemon.now - 50, daemon.line(-50, 'context')), (daemon.now - 20, daemon.line(-20, 'saved'))]
+    assert fw._journal_holds(journalctl, cursor(daemon.now - 20 - T, 'saved'))
     # an entry the journal no longer holds: journalctl lands on another one
-    assert fw._journal_back(journalctl, cursor(daemon.now - 30 - T, 'gone'), daemon.now - 60) is None
+    assert not fw._journal_holds(journalctl, cursor(daemon.now - 30 - T, 'gone'))
     # a cursor journalctl cannot seek to
-    assert fw._journal_back(journalctl, 's=x', daemon.now - 60) is None
-    assert fw._journal_back(str(tmp_path / 'missing'), saved_cursor, 0) is None
+    assert not fw._journal_holds(journalctl, 's=x')
+    assert not fw._journal_holds(str(tmp_path / 'missing'), cursor(0, 'x'))
 
 
-def test_journal_back_is_bounded_by_the_probe_timeout(tmp_path, monkeypatch):
-    slow = tmp_path / 'journalctl'
-    slow.write_text('#!/bin/sh\nexec sleep 30\n')
-    slow.chmod(0o755)
-    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 0.2)
+def test_journal_context_reads_forward_from_since_through_the_saved_entry(tmp_path):
+    daemon = Daemon(tmp_path)
+    daemon.write((-100, 'too old'), (-50, 'context'), (-20, 'saved'), (-10, 'after'))
+    journalctl = str(daemon.bin_dir / 'journalctl')
+    now = daemon.now
+    got = list(fw._journal_context(journalctl, cursor(now - 20 - T, 'saved'), now - 60, now - 20))
+    assert got == [(now - 50, daemon.line(-50, 'context')), (now - 20, daemon.line(-20, 'saved'))]
+    assert not (tmp_path / 'bin' / 'calls.txt').read_text().count('--follow')
+    assert list(fw._journal_context(str(tmp_path / 'missing'), cursor(0, 'x'), 0, T)) == []
+
+
+def test_journal_context_stops_before_an_entry_stored_after_the_saved_second_when_the_saved_entry_never_shows(tmp_path):
+    # a clock set back: the order journalctl prints is not the order of the stored times
+    daemon = Daemon(tmp_path)
+    daemon.write((-50, 'context'), (-30, 'a later entry'), (-10, 'another'))
+    journalctl = str(daemon.bin_dir / 'journalctl')
+    now = daemon.now
+    got = list(fw._journal_context(journalctl, cursor(now - 40 - T, 'not there'), now - 60, now - 40))
+    assert got == [(now - 50, daemon.line(-50, 'context'))]
+
+
+def _stalling_journalctl(tmp_path, entries):
+    """A journalctl that touches started, prints entries (export bytes), and then stalls."""
+    export = tmp_path / 'export.bin'
+    export.write_bytes(b''.join(entries))
+    stub = tmp_path / 'journalctl'
+    stub.write_text('#!/bin/sh\ntouch %s\ncat %s\nexec sleep 30\n' % (tmp_path / 'started', export))
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_journal_holds_is_bounded_by_the_probe_timeout(tmp_path, monkeypatch):
+    stub = _stalling_journalctl(tmp_path, [])
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 0.5)
     started = time.time()
-    assert fw._journal_back(str(slow), cursor(0, 'x'), 0) is None
+    assert not fw._journal_holds(stub, cursor(0, 'x'))
     assert time.time() - started < 10
+    assert (tmp_path / 'started').exists()  # journalctl ran, and it was the timer that ended the wait
+
+
+def test_journal_context_cut_off_by_the_probe_timeout_keeps_what_it_read(tmp_path, monkeypatch):
+    stub = _stalling_journalctl(tmp_path, [entry(-50, 'context')])
+    monkeypatch.setattr(fw, 'JOURNAL_PROBE_TIMEOUT', 0.5)
+    started = time.time()
+    assert list(fw._journal_context(stub, cursor(0, 'x'), T - 60, T)) == [(T - 50, jline(-50, 'context'))]
+    assert time.time() - started < 10
+    assert (tmp_path / 'started').exists()
 
 
 def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monkeypatch):
@@ -528,12 +591,44 @@ def test_a_match_that_opens_a_capture_saves_the_position_at_once(tmp_path, monke
     assert saves == [cursor(0, 'quiet'), cursor(0, 'HIT one'), cursor(0, 'after')]
 
 
+def test_the_context_read_back_is_not_kept_in_memory(tmp_path, monkeypatch):
+    # After a restart that follows a busy window, the lines before the saved entry go straight into the bounded
+    # context buffer: 1.70 first kept the whole read back, which cost 200 MB for 300,000 lines for the life of the process.
+    import tracemalloc
+    daemon = Daemon(tmp_path)
+    count = 40000
+    text = 'worker %d: request %d failed: connection reset by peer (attempt 3 of 5), retrying in 250 ms'
+    daemon.write(*[(-50, text % (i % 64, i)) for i in range(count)] + [(-10, 'saved')])
+    journalctl = str(daemon.bin_dir / 'journalctl')
+    path = tmp_path / 'journal.position'
+    path.write_text(json.dumps({'cursor': cursor(daemon.now - 10 - T, 'saved'), 'time': daemon.now - 10}))
+    main = ScriptedPopen([])
+    main.stdout = ExportStdout([])
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(fw.subprocess, 'Popen', lambda argv, *a, **k: real_popen(argv, *a, **k) if argv[0] == journalctl else main)
+    pat = tmp_path / 'p.txt'
+    pat.write_text('NEVER\n')
+    tracemalloc.start()
+    try:
+        # from the construction on, whichever step holds the lines
+        position = fw.JournalPosition(str(path), context_time=60, now=daemon.now, journalctl=journalctl)
+        assert position.cursor is not None
+        fw.capture_messages(['unused'], fw.load_patterns([str(pat)]), capture_time=60, output_folder=str(tmp_path / 'out'),
+                            compress_after_months=0, delete_after_months=0, journal_position=position)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    # a list of the lines read back is about 8 MB at this size (more while it is built); the buffer holds them compressed
+    assert peak < 4 * 1024 * 1024, peak
+
+
 def test_lines_read_back_keep_their_age_in_the_context(tmp_path, monkeypatch):
     now = int(time.time())
     path = tmp_path / 'journal.position'
     path.write_text(json.dumps({'cursor': cursor(0, 'the saved line'), 'time': now - 10}))
-    monkeypatch.setattr(fw, '_journal_back', lambda journalctl, c, since: [
-        (now - 250, 'too old for the window\n'), (now - 30, 'recent\n'), (now - 10, 'the saved line\n')])
+    monkeypatch.setattr(fw, '_journal_holds', lambda journalctl, c: True)
+    monkeypatch.setattr(fw, '_journal_context', lambda journalctl, c, since, until: iter([
+        (now - 250, 'too old for the window\n'), (now - 30, 'recent\n'), (now - 10, 'the saved line\n')]))
     position = fw.JournalPosition(str(path), context_time=300)
     out = run(tmp_path, monkeypatch, [entry(0, 'HIT', when=now - 1)], position)
     text = incident_logs(out)[0].read_text()

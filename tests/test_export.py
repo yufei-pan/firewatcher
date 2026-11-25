@@ -132,29 +132,52 @@ def write_position(tmp_path, record):
     return str(path)
 
 
-def fake_back(monkeypatch, result):
+def fake_holds(monkeypatch, held):
+    """The journal holds the saved entry (or not); what _journal_holds was asked is returned."""
     calls = []
 
-    def back(journalctl, saved, since):
-        calls.append((journalctl, saved, since))
-        return result
+    def holds(journalctl, saved):
+        calls.append((journalctl, saved))
+        return held
 
-    monkeypatch.setattr(fw, '_journal_back', back)
+    monkeypatch.setattr(fw, '_journal_holds', holds)
     return calls
 
 
 def test_a_saved_entry_still_in_the_journal_resumes_from_it(tmp_path, monkeypatch):
-    calls = fake_back(monkeypatch, [(T - 5, 'context\n'), (T, 'saved\n')])
+    calls = fake_holds(monkeypatch, True)
+    read = []
+
+    def context(journalctl, saved, since, until):
+        read.append((journalctl, saved, since, until))
+        return iter([(T - 5, 'context\n'), (T, 'saved\n')])
+
+    monkeypatch.setattr(fw, '_journal_context', context)
     path = write_position(tmp_path, {'cursor': cursor(0), 'time': T})
     position = fw.JournalPosition(path, context_time=60, now=T + 10, journalctl='/x/journalctl')
-    assert calls == [('/x/journalctl', cursor(0), T - 60)]
-    assert position.context == [(T - 5, 'context\n'), (T, 'saved\n')] and 'Resuming the journal after' in position.note
+    assert calls == [('/x/journalctl', cursor(0))] and read == []  # the context is read when the loop takes it
+    assert 'Resuming the journal after' in position.note and 'up to 60 seconds of context' in position.note
+    assert list(position.read_context()) == [(T - 5, 'context\n'), (T, 'saved\n')]
+    assert read == [('/x/journalctl', cursor(0), T - 60, T)]
     assert position.journal_command(['journalctl', '--all', '--lines=20', '--follow']) == [
-        'journalctl', '--output=export', '--all', '--cursor=' + cursor(0), '--follow']
+        'journalctl', '--output=export', '--all', '--cursor=' + cursor(0), '--no-tail', '--follow']
+
+
+@pytest.mark.parametrize('now, context_time, resume_max, since', [
+    (T + 10, 60, 3600, T - 60),  # capture_time before the saved entry
+    (T + 3500, 300, 3600, T - 100),  # capture_time would reach past --resume-max: no further back than that
+    (T + 5, 300, 10, T - 5),
+    (T - 3600, 300, 3600, T - 300),  # a clock set back: the bound is behind the saved entry and changes nothing
+])
+def test_the_context_is_read_back_no_further_than_resume_max(tmp_path, monkeypatch, now, context_time, resume_max, since):
+    fake_holds(monkeypatch, True)
+    path = write_position(tmp_path, {'cursor': cursor(0), 'time': T})
+    position = fw.JournalPosition(path, resume_max=resume_max, context_time=context_time, now=now)
+    assert position.context_since == since
 
 
 def test_a_saved_entry_still_there_resumes_whatever_the_clock_says(tmp_path, monkeypatch):
-    fake_back(monkeypatch, [])
+    fake_holds(monkeypatch, True)
     position = fw.JournalPosition(write_position(tmp_path, {'cursor': cursor(0), 'time': T}), now=T - 3600)
     assert position.cursor == cursor(0)
 
@@ -166,35 +189,37 @@ def test_a_saved_entry_still_there_resumes_whatever_the_clock_says(tmp_path, mon
     {'cursor': 7, 'time': T},
 ])
 def test_a_file_without_a_usable_cursor_goes_by_its_time(tmp_path, monkeypatch, record):
-    calls = fake_back(monkeypatch, [])
+    calls = fake_holds(monkeypatch, True)
     position = fw.JournalPosition(write_position(tmp_path, record), context_time=60, now=T + 10)
     assert calls == [] and position.cursor is None and position.since == T - 60
-    assert 'no longer holds the last line read' in position.note
-    assert position.journal_command(['journalctl', '--lines=20', '--follow'])[2] == '--since=@%d' % (T - 60)
+    assert position.note.startswith('Cannot find the last entry read before the stop (')
+    assert 'no longer holds' not in position.note
+    assert position.journal_command(['journalctl', '--lines=20', '--follow'])[2:] == ['--since=@%d' % (T - 60), '--no-tail', '--follow']
 
 
 def test_an_entry_the_journal_no_longer_holds_goes_by_its_time(tmp_path, monkeypatch):
-    fake_back(monkeypatch, None)
+    fake_holds(monkeypatch, False)
     position = fw.JournalPosition(write_position(tmp_path, {'cursor': cursor(0), 'time': T}), context_time=60, now=T + 10)
-    assert position.cursor is None and position.since == T - 60 and position.context == []
+    assert position.cursor is None and position.since == T - 60 and list(position.read_context()) == []
+    assert 'Cannot find the last entry read before the stop' in position.note
 
 
 def test_the_future_rule_holds_only_where_the_entry_is_gone(tmp_path, monkeypatch):
-    fake_back(monkeypatch, None)
+    fake_holds(monkeypatch, False)
     position = fw.JournalPosition(write_position(tmp_path, {'cursor': cursor(0), 'time': T}), now=T - 3600)
     assert position.since is None and 'is in the future' in position.note
 
 
 @pytest.mark.parametrize('content', ['', 'not json', '{"cursor": "x"}', '{"time": "soon"}', '{"time": 1e400}', '[]'])
 def test_a_damaged_file_reads_the_last_lines(tmp_path, monkeypatch, content):
-    calls = fake_back(monkeypatch, [])
+    calls = fake_holds(monkeypatch, True)
     position = fw.JournalPosition(write_position(tmp_path, content), now=T)
     assert calls == [] and position.since is None and position.cursor is None
     assert 'Cannot read the journal position' in position.note
 
 
 def test_an_old_position_reads_back_only_resume_max_without_the_cursor(tmp_path, monkeypatch):
-    calls = fake_back(monkeypatch, [])
+    calls = fake_holds(monkeypatch, True)
     position = fw.JournalPosition(write_position(tmp_path, {'cursor': cursor(0), 'time': T}), resume_max=600, now=T + 3600)
     assert calls == [] and position.since == T + 3000 and 'seconds old' in position.note
 
