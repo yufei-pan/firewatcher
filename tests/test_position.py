@@ -285,16 +285,17 @@ def test_the_follow_keeps_its_first_entry_when_it_is_not_the_last_one_read(tmp_p
     assert saved(tmp_path)['cursor'] == cursor(6, 'HIT second')
 
 
-def test_a_read_cut_in_the_middle_of_an_entry_ends_the_run_and_the_next_start_resumes_from_the_last_whole_one(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('status', [3, -2, -15])  # it failed part-way, or a SIGINT or a SIGTERM reached it alone
+def test_a_read_cut_in_the_middle_of_an_entry_ends_the_run_and_the_next_start_resumes_from_the_last_whole_one(tmp_path, monkeypatch, capsys, status):
     # A journalctl that ends with a failure part-way (it died, or a stop signal reached it alone) ends the run as a
     # follow that dies does, not with a follow from where it stopped: the lost stop is then not waited out. 1.71 as
     # first built followed on, and was still running a unit's stop timeout after the signal.
     position = saved_at(tmp_path, 0, 'saved')
     out, journalctl = resume(tmp_path, monkeypatch, position,
-                             cursor=([entry(0, 'saved'), entry(1, 'HIT one'), entry(2, 'two'), entry(3, 'HIT three')[:40]], 3),
+                             cursor=([entry(0, 'saved'), entry(1, 'HIT one'), entry(2, 'two'), entry(3, 'HIT three')[:40]], status),
                              reverse=([entry(0, 'saved')], 0), follow=([entry(9, 'never read')], 0))
     assert journalctl.kinds() == ['cursor', 'reverse']
-    assert 'journalctl ended with status 3 while reading on from the saved position.' in capsys.readouterr().out
+    assert 'journalctl ended with status %d before the end of the journal.' % status in capsys.readouterr().out
     assert len(incident_logs(out)) == 1 and saved(tmp_path) == {'cursor': cursor(2, 'two'), 'time': T + 2}
     # the next start reads from that entry: the cut one whole, once, and what follows
     again = fw.JournalPosition(str(tmp_path / 'journal.position'), context_time=60, now=T + 10)
@@ -739,6 +740,9 @@ class Daemon(object):
         return jline(0, text, when=self.now + offset)
 
     def run_until(self, done):
+        """One run, stopped with SIGTERM once done() or after 20 seconds; its output. A run that hands over to the follow
+        is stopped only after the follow started: a stop sent while the reader thread starts it can be taken by that
+        thread and wait for the next line (limitations, the 1.72 entry)."""
         proc = subprocess.Popen(
             # as on a journald host, whatever runs on the machine running the tests
             [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import firewatcher as fw; '
@@ -837,7 +841,7 @@ def test_a_restart_after_a_reboot_reads_what_the_old_boot_logged_after_the_stop(
     daemon.run_until(lambda: daemon.captured(1, 'saved', now - 50))
     daemon.write(*first_journal + [(-40, 'HIT during shutdown', old), (-39, 'HIT unmount failed', old), (-20, 'booted'),
                                    (-10, 'HIT in the new boot'), (-5, 'later')])
-    second = daemon.run_until(lambda: daemon.saved().get('time') == now - 5)
+    second = daemon.run_until(lambda: daemon.saved().get('time') == now - 5 and daemon.following())
     assert 'Resuming the journal after' in second
     logs = incident_logs(daemon.out)
     assert len(logs) == 2
@@ -860,13 +864,13 @@ def test_a_restart_whose_read_is_cut_part_way_ends_the_run_and_the_next_start_re
     daemon.write(*first_journal + backlog)
     (daemon.bin_dir / 'cut.txt').write_text('2')  # the saved entry, 'HIT read', and the start of 'filler 00'
     second = daemon.run_until(lambda: daemon.proc.poll() is not None)
-    assert 'journalctl ended with status 3 while reading on from the saved position.' in second and 'Process ended.' in second
+    assert 'journalctl ended with status 3 before the end of the journal.' in second and 'Process ended.' in second
     assert 'Traceback' not in second and not any('--follow' in call for call in daemon.reads())
     assert daemon.saved() == {'cursor': daemon.cursor(-79, 'HIT read'), 'time': now - 79}
     assert len(incident_logs(daemon.out)) == 2 and 'HIT read' in incident_logs(daemon.out)[1].read_text()
     # the next start reads on from that entry: each line after it once, the cut one whole
     (daemon.bin_dir / 'cut.txt').unlink()
-    third = daemon.run_until(lambda: daemon.captured(3, 'HIT late', now - 5))
+    third = daemon.run_until(lambda: daemon.captured(3, 'HIT late', now - 5) and daemon.following())
     assert 'Resuming the journal after' in third
     text = incident_logs(daemon.out)[2].read_text()
     assert 'Matched line:    %s' % line(-5, 'HIT late').strip() in text
@@ -920,7 +924,7 @@ def test_a_restart_with_a_position_file_of_1_69_matches_every_line_of_the_window
     line, now = daemon.line, daemon.now
     daemon.write((-30, 'HIT before the upgrade'), (-10, 'HIT after it'))
     daemon.position_file.write_text(json.dumps({'time': now - 20, 'line': 1, 'sha1': 'f' * 40}))
-    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after it', now - 10))
+    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after it', now - 10) and daemon.following())
     assert 'Cannot find the last entry read before the stop' in second
     assert daemon.reads()[0] == '--output=export --all --no-pager --since=@%d' % (now - 20 - 60)
     assert 'Matched line:    %s' % line(-30, 'HIT before the upgrade').strip() in incident_logs(daemon.out)[0].read_text()
@@ -939,7 +943,7 @@ def test_a_journalctl_that_fails_on_the_read_from_the_saved_entry_ends_the_run_a
     assert 'journalctl ended with status' in output and 'Process ended.' in output and 'Traceback' not in output
     assert daemon.position_file.read_text() == before and incident_logs(daemon.out) == []
     daemon.unwrap()
-    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after', now - 10))
+    second = daemon.run_until(lambda: daemon.captured(1, 'HIT after', now - 10) and daemon.following())
     assert 'Resuming the journal after' in second
     # the window's match is context, not a capture of its own
     assert len(incident_logs(daemon.out)) == 1
@@ -952,7 +956,7 @@ def test_a_restart_on_a_journal_without_the_saved_entry_and_a_clock_set_back_mat
     daemon.run_until(lambda: daemon.captured(1, 'last line read', now - 20))
     # A reboot with a volatile journal (CentOS 7's default) lost the saved entry, and the clock came back behind it.
     daemon.write((-50, 'booted with the clock behind'), (-49, 'HIT after the reboot'))
-    second = daemon.run_until(lambda: len(incident_logs(daemon.out)) == 2 and daemon.saved().get('time') == now - 49)
+    second = daemon.run_until(lambda: len(incident_logs(daemon.out)) == 2 and daemon.saved().get('time') == now - 49 and daemon.following())
     assert 'Cannot find the last entry read before the stop' in second
     logs = incident_logs(daemon.out)
     assert len(logs) == 2

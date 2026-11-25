@@ -3181,7 +3181,7 @@ class _JournalSource(object):
 			self.last = self.reader.cursor or self.last
 			status = self._close()
 			if status != 0:
-				print('journalctl ended with status %d while reading on from the saved position.' % status)
+				print('journalctl ended with status %d before the end of the journal.' % status)
 				self.ended = True
 				return ''
 			if self.last is not None:
