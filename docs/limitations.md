@@ -19,8 +19,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### While the events receiver is down, each alert waits one timeout before ntfy
 - Kind: known limitation
 - What the operator sees: with `events_url` set and its receiver not answering (the host down, its packets
-  dropped), each alert (only `always_notify` captures fall back to ntfy) is pushed one `ntfy_timeout` late (10 s by default; twice that for a capture that
-  overflows), because firewatcher tries the POST first and pushes to ntfy only when it fails. No alert is lost.
+  dropped), each alert (only `always_notify` captures fall back to ntfy) is pushed one `ntfy_timeout` late (10 s by default; 5 s for a capture that
+  overflows the analysis queue), because firewatcher tries the POST first and pushes to ntfy only when it fails. No alert is lost.
 - Why: the POST and the push run one after the other. A separate short timeout, or skipping the POST for a while
   after a failure, would shorten the wait at the cost of a second setting or of state; a few seconds' delay while
   the receiver is down was judged acceptable.
@@ -48,8 +48,24 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   second it could not find).
 - Why: where the saved line is gone, firewatcher can only go by time, and so does journalctl: a cursor from another
   boot lands by its time (tested on systemd 219, 2026-11-23). Where the saved line is still there (a persistent
-  journal), the resume does not depend on the clock.
+  journal), a clock set back does not change the resume.
 - Revisit when: an operator hits it. The route then: a fallback that reads by boot instead of by time.
 - Approved: chief's decision C224, 2026-11-24 (the user made the chief session their desk on 2026-11-14 and let it
   decide where it judges they would pick the option nine times in ten; not the user's words, and the user may
   reverse it): "(a) known limitation" with one README line. The user did not ask for it; 1.69's reviews found it.
+
+### After a reboot, the lines the old boot logged after firewatcher stopped are not read
+- Kind: deferred
+- What the operator sees: on systemd 252 and later (Debian 12 and 13, EL9, Ubuntu 24.04), with a persistent
+  journal, a restart after a reboot reads on from the first entry of the new boot. What the old boot logged between
+  firewatcher's stop and its end (a failed unmount, an I/O error during shutdown) is never matched. systemd 219 to
+  249 read it. Since 1.67.
+- Why: from systemd 252 on, `journalctl --follow` shows only the newest boot, with `--cursor` and with `--since`
+  (measured 2026-11-25 on 252, 255, 257 and 259; 219, 239 and 249 show every boot). No option lifts it on every
+  version.
+- Plan (1.71): read the lines logged while stopped without `--follow`, from the saved entry to the journal's end,
+  then follow from the last entry read, dropping it as a restart drops the saved entry. The same change adds one test
+  that runs the real journalctl (on a journal written with systemd-journal-remote, skipped where that is missing; CI's
+  ubuntu-24.04 jobs install it): lines equal journalctl's, the entry found with 30 entries after it, the entry gone,
+  two boots. No test in the suite runs a real journalctl today, and the fake one is only as right as its author.
+- Revisit when: 1.71.
