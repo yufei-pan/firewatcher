@@ -2,6 +2,7 @@
 thread's wait for the log, whichever thread the kernel hands the signal to (1.71 and older acted on a stop another thread
 took only at the next line, and a stop raised inside a busy capture's read could hang or lose a line)."""
 import os
+import re
 import select
 import signal
 import subprocess
@@ -228,16 +229,100 @@ def test_the_scope_puts_back_the_handlers_and_the_wakeup_descriptor():
     assert fw._wakeup_fd is None and signal.set_wakeup_fd(kept) == kept
 
 
-def test_request_stop_only_notes_the_stop_and_a_second_takes_the_default(pipe):
-    previous = signal.getsignal(signal.SIGTERM)
+def test_request_stop_only_notes_the_stop_and_a_second_of_either_kind_takes_the_default(pipe):
+    previous = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
     try:
         signal.signal(signal.SIGTERM, fw._request_stop)
+        signal.signal(signal.SIGINT, fw._request_stop)
         fw._request_stop(signal.SIGTERM, None)  # raises nothing: the wait for the log raises it
-        assert fw._stop_requested and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+        assert fw._stop_requested
+        assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == (signal.SIG_DFL, signal.SIG_DFL)
         with pytest.raises(KeyboardInterrupt):
             fw._stoppable(pipe(b'a line\n')).readline()
+        # a stop signal that is not ours (ignored when firewatcher started, or another handler) is left as it is
+        signal.signal(signal.SIGTERM, fw._request_stop)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        fw._request_stop(signal.SIGTERM, None)
+        assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == (signal.SIG_DFL, signal.SIG_IGN)
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        signal.signal(signal.SIGTERM, previous[0])
+        signal.signal(signal.SIGINT, previous[1])
+
+
+# firewatcher on a log file, with the notifier on (so a dispatcher exists), whose clean-up waits when argv[2] is 'slow', as
+# when an LLM or events call is in flight at the stop (up to llm_timeout + ntfy_timeout, 70 s by default; here 30 s, far
+# past the 5 s the tests allow)
+CLEANUP_LAUNCH = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import firewatcher as fw
+if sys.argv[2] == 'slow':
+    def close(self):
+        print('Waiting for the notifier', flush=True)
+        time.sleep(30)
+    fw.IncidentDispatcher.close = close
+sys.exit(fw.main(sys.argv[3:]))
+"""
+
+
+def start_on_a_log_file(tmp_path, cleanup, wrapper=()):
+    """CLEANUP_LAUNCH ('slow' or 'plain'), after the wrapper command if there is one."""
+    log, out, pat, conf = tmp_path / 'app.log', tmp_path / 'out', tmp_path / 'p.txt', tmp_path / 'fw.conf'
+    pat.write_text('HIT\n')
+    conf.write_text('[notify]\nevents_url = http://127.0.0.1:9/e\n')
+    log.write_text('one\ntwo\n')
+    args = ['--config', conf, '-o', out, '-t', '300', '--fallback-folder', '', '--log-file', log, pat]
+    return subprocess.Popen(list(wrapper) + [sys.executable, '-c', CLEANUP_LAUNCH, str(ROOT), cleanup] +
+                            [str(arg) for arg in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=dict(os.environ, PYTHONUNBUFFERED='1'))
+
+
+@pytest.mark.parametrize('second', [signal.SIGTERM, signal.SIGINT], ids=['then SIGTERM', 'then SIGINT'])
+@pytest.mark.parametrize('first', [signal.SIGTERM, signal.SIGINT], ids=['SIGTERM', 'SIGINT'])
+def test_a_second_stop_signal_of_either_kind_ends_a_clean_up_that_waits_at_once(tmp_path, first, second):
+    # `systemctl stop` (SIGINT) and then a `kill` (SIGTERM) to hurry it, or the other way round: the first 1.72 build put
+    # the default action back only for the signal it had got, so the other kind was absorbed until the clean-up was done
+    proc = start_on_a_log_file(tmp_path, 'slow')
+    try:
+        seen = read_until(proc, 'Capturing logs')
+        proc.send_signal(first)
+        seen += read_until(proc, 'Waiting for the notifier')
+        proc.send_signal(second)
+        try:
+            output, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pytest.fail('a %s after a %s did not end firewatcher within 5 s: %s' % (
+                signal.Signals(second).name, signal.Signals(first).name, seen[-600:]))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == -second, (proc.returncode, seen + output.decode('utf-8', 'replace'))
+
+
+@pytest.mark.parametrize('ignored', [signal.SIGINT, signal.SIGTERM], ids=['SIGINT', 'SIGTERM'])
+def test_a_stop_signal_firewatcher_was_started_ignoring_stays_ignored(tmp_path, ignored):
+    # `sh -c 'firewatcher ... & wait'`: a script's background job starts with SIGINT ignored, and a Ctrl-C on the script
+    # reaches it. 1.71 left that SIGINT ignored; the other stop signal still ends firewatcher.
+    other = signal.SIGTERM if ignored == signal.SIGINT else signal.SIGINT
+    name = signal.Signals(ignored).name[3:]
+    proc = start_on_a_log_file(tmp_path, 'plain', wrapper=['sh', '-c', 'trap "" %s; exec "$@"' % name, 'sh'])
+    try:
+        seen = read_until(proc, 'Capturing logs')
+        proc.send_signal(ignored)
+        time.sleep(1)  # a stop is acted on in about 10 ms (p95 14 ms), so a second is far past it
+        assert proc.poll() is None, 'the ignored %s ended firewatcher: %s' % (name, seen)
+        proc.send_signal(other)
+        try:
+            output, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pytest.fail('a %s did not end it within 5 s: %s' % (signal.Signals(other).name, seen[-600:]))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == 0 and 'Traceback' not in seen + output.decode('utf-8', 'replace')
+    assert re.search(r'^Exiting\.$', seen + output.decode('utf-8', 'replace'), re.M)
 
 
 def test_an_exception_while_the_source_is_quiet_ends_the_run(tmp_path, monkeypatch, capsys):

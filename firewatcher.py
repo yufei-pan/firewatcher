@@ -3455,11 +3455,13 @@ _stop_requested = False
 
 def _request_stop(signum, frame):
 	"""SIGTERM or SIGINT: only noted. The main thread's wait for the log raises it as KeyboardInterrupt, between two
-	lines, so the open capture is finished and handed to the dispatcher, and the line being handled is finished first. A
-	second one gets the default action and ends the process at once."""
+	lines, so the open capture is finished and handed to the dispatcher, and the line being handled is finished first. Both
+	stop signals get the default action, so a second one, of either kind, ends the process at once."""
 	global _stop_requested
 	_stop_requested = True
-	signal.signal(signum, signal.SIG_DFL)
+	for stop in (signal.SIGTERM, signal.SIGINT):
+		if signal.getsignal(stop) is _request_stop:
+			signal.signal(stop, signal.SIG_DFL)
 
 
 def _stop_signalled():
@@ -3476,7 +3478,8 @@ def _stop_signalled():
 
 @contextlib.contextmanager
 def _stops_wake_reads():
-	"""Inside, SIGTERM and SIGINT end the run at the main thread's next wait for the log, whichever thread takes them."""
+	"""Inside, SIGTERM and SIGINT end the run at the main thread's next wait for the log, whichever thread takes them. One
+	that firewatcher was started ignoring (a background job of a script) stays ignored."""
 	global _wakeup_fd, _stop_requested
 	read_end, write_end = os.pipe()
 	os.set_blocking(read_end, False)
@@ -3486,7 +3489,9 @@ def _stops_wake_reads():
 		kept_fd = signal.set_wakeup_fd(write_end, warn_on_full_buffer=False)
 	except TypeError:  # Python 3.6 has no warn_on_full_buffer
 		kept_fd = signal.set_wakeup_fd(write_end)
-	kept = [(signum, signal.signal(signum, _request_stop)) for signum in (signal.SIGTERM, signal.SIGINT)]
+	# A signal firewatcher was started ignoring stays ignored.
+	kept = [(signum, signal.signal(signum, _request_stop)) for signum in (signal.SIGTERM, signal.SIGINT)
+			if signal.getsignal(signum) != signal.SIG_IGN]
 	_wakeup_fd = read_end
 	try:
 		yield
