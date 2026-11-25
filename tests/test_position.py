@@ -642,7 +642,7 @@ def test_journal_context_stopped_early_ends_journalctl(tmp_path):
 
 def test_a_stop_during_the_context_read_ends_as_a_stop_in_the_loop_does(tmp_path, monkeypatch, capsys):
     # SIGINT (as the unit sends) or SIGTERM lands while the entries before the saved one are read: "Exiting.", the
-    # main journalctl ended and the saved position as it was, as in the loop. 1.70's first build read them before
+    # main journalctl ended and the saved position as it was, as in the loop. 1.70's first fix round read them before
     # the try that holds the loop, so the stop came out of capture_messages as a traceback (exit 1 on Python 3.6).
     path = tmp_path / 'journal.position'
     save_position(path, 0, 'saved')
