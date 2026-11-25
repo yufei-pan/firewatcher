@@ -44,9 +44,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: when the journal lost the saved line (as a volatile journal does at a reboot), a restart
   reads from `--capture-time` (300 s by default) before the saved line; lines logged while firewatcher was stopped
-  and stamped earlier than that are not read. That needs a boot whose hardware clock was more than `--capture-time`
-  behind and was corrected before firewatcher started. 1.68 did the same, and was worse (it skipped the whole
-  second it could not find).
+  and stamped earlier than that are not read. That needs the clock set back by more than `--capture-time` while
+  firewatcher was stopped: most often a boot whose hardware clock was that far behind and was corrected before
+  firewatcher started; a clock set back by hand does it too (shown without a reboot on systemd 219 to 257,
+  2026-11-25). 1.68 did the same, and was worse (it skipped the whole second it could not find).
 - Why: where the saved line is gone, firewatcher can only go by time, and so does journalctl: a cursor from another
   boot lands by its time (tested on systemd 219, 2026-11-23). Where the saved line is still there (a persistent
   journal), a clock set back does not change where the resume starts; the age of the position (`--resume-max`) is
@@ -56,47 +57,18 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   decide where it judges they would pick the option nine times in ten; not the user's words, and the user may
   reverse it): "(a) known limitation" with one README line. The user did not ask for it; 1.69's reviews found it.
 
-### After a reboot, the lines the old boot logged after firewatcher stopped are not read
+### A stop signal another thread takes waits for the next line
 - Kind: deferred
-- What the operator sees: on systemd 252 and later (Debian 12 and 13, EL9, Ubuntu 24.04), with a persistent
-  journal, a restart after a reboot reads on from the first entry of the new boot. What the old boot logged between
-  firewatcher's stop and its end (a failed unmount, an I/O error during shutdown) is never matched. systemd 219 to
-  249 read it. Since 1.67.
-- Why: from systemd 252 on, `journalctl --follow` shows only the newest boot, with `--cursor` and with `--since`
-  (measured 2026-11-25 on 252, 255, 257 and 259; 219, 239 and 249 show every boot). No option lifts it on every
-  version.
-- Plan (1.71): read the lines logged while stopped without `--follow`, from the saved entry to the journal's end,
-  then follow from the last entry read, dropping it as a restart drops the saved entry. The context before the saved
-  entry is read in the same pass, from a cursor found by reading back from the saved entry (entry "After a restart,
-  the context before the saved entry can lack its last lines" below). The same change adds one test
-  that runs the real journalctl (on a journal written with systemd-journal-remote, skipped where that is missing; the
-  same change makes CI's ubuntu-24.04 jobs install it, which they do not today): lines equal journalctl's, the entry
-  found with 30 entries after it, the entry gone, two boots. No test in the suite runs a real journalctl today, and
-  the fake one is only as right as its author.
-- Revisit when: 1.71.
-
-### After a restart, the context before the saved entry can lack its last lines
-- Kind: deferred
-- What the operator sees: the lines read again before the saved entry, as context for a capture opened soon after a
-  restart, end early in two cases. When the clock was ahead and was set back inside the `--capture-time` window, the
-  context ends at the first line stored after the saved entry's second. When the window holds more than the read gets
-  through in 30 seconds (about 4 to 6 million lines on the hosts measured, far above journald's default rate limit),
-  the context ends where that read stopped, without the window's last lines. No line is skipped or matched again by
-  this; 1.69 matched the first case's lines again and read the whole window before matching. Since 1.70.
-- Why: 1.70 reads the context forward from a time, which keeps no entry in memory, but starts and stops by time.
-- Plan (1.71): the change of the entry above, which reads in journal order. Read back from the saved entry for the
-  cursor where the context starts, no further than `--buffer-max-mb` holds; then read forward from that cursor without
-  `--follow`: the lines before the saved entry refill the context, the saved entry is dropped, the rest are matched,
-  and the follow starts after the last entry read. No time stop, no separate 30-second read remains.
-- Revisit when: 1.71.
-
-### After a restart, a journalctl that does not answer the look matches the window again
-- Kind: deferred
-- What the operator sees: when journalctl fails, or prints nothing within 30 seconds, as firewatcher looks for the
-  saved entry at a restart, firewatcher reads by time as if the entry were gone: every line from `--capture-time`
-  before it is matched again, so an incident of that window is captured and pushed a second time. No line is
-  skipped. 1.69 kept its saved position in that case. Since 1.70.
-- Why: 1.70 treats "no answer" as "gone", because without the first entry it cannot tell.
-- Plan (1.71): with the change of the two entries above: when the look gets no answer, read on from the saved
-  entry without the context, as 1.69 kept its position, with a real-journalctl test of a cursor the journal lost.
-- Revisit when: 1.71.
+- What the operator sees: rarely, a SIGTERM or SIGINT sent to firewatcher's process alone (`kill`) is acted on only
+  at the next log line, or at the end of an open capture's `--capture-time` window, instead of at once. The kernel
+  hands a process's signal to any of its threads, and one taken by the thread that reads the log or sends
+  notifications wakes none of the main thread's waits. Seen once in about 1,000 stops in
+  tests (systemd 252 under load, 2026-11-25). `systemctl stop` signals journalctl too, whose end wakes firewatcher.
+  Since 1.58, which added those threads.
+- Why: blocking the stop signals in those threads, the usual cure, is inherited by the processes they start: the
+  thread that reads the log starts journalctl, which could then not be stopped (tried in 1.71's build: a journalctl
+  that thread had started ignored the stop, and firewatcher's exit waited for it).
+- Plan (1.72): a design check of the two routes: the threads block the stop signals and start their processes with
+  them unblocked, or the main thread waits on a wakeup descriptor (`signal.set_wakeup_fd`) beside its read; then a test
+  that hands a stop to each thread.
+- Revisit when: 1.72.
