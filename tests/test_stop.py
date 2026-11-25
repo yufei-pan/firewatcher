@@ -6,6 +6,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -158,20 +159,27 @@ def _wakeup_write_end():
 
 @pytest.fixture
 def pipe():
-    """A pipe holding the bytes given, its writer left open (or closed with end=True): its read end."""
-    made = []
+    """A pipe holding the bytes given, its writer left open (or closed with end=True): its read end. With late, those
+    bytes come 5 s later, so a wait that a stop should have ended fails the test instead of hanging it."""
+    made, timers = [], []
 
-    def make(data=b'', end=False):
+    def make(data=b'', end=False, late=None):
         read_end, write_end = os.pipe()
         os.write(write_end, data)
         made.append(write_end)
         if end:
             os.close(made.pop())
+        elif late:
+            timers.append(threading.Timer(5, os.write, (write_end, late)))
+            timers[-1].start()
         reader = os.fdopen(read_end, 'rb', buffering=0)
         made.append(reader)
         return reader
 
     yield make
+    for timer in timers:
+        timer.cancel()
+        timer.join()
     for each in made:
         if isinstance(each, int):
             os.close(each)
@@ -186,7 +194,7 @@ def test_a_stop_byte_on_the_wakeup_pipe_ends_the_wait_before_its_handler_runs(pi
         assert fw._stoppable(pipe(b'a line\n')).readline() == b'a line\n'
         os.write(_wakeup_write_end(), bytes([signal.SIGHUP, signal.SIGTERM]))
         with pytest.raises(KeyboardInterrupt):
-            fw._stoppable(pipe()).readline()
+            fw._stoppable(pipe(late=b'not stopped\n')).readline()
         assert not fw._stop_requested
 
 
