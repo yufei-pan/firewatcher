@@ -1,7 +1,13 @@
 import datetime
+import os
+import shutil
+import stat
 import tarfile
+import tempfile
 import threading
 import time
+
+import pytest
 
 import firewatcher as fw
 from conftest import capture
@@ -115,11 +121,33 @@ def month_dirs(tmp_path, *names):
     return logs
 
 
+def test_log_compressor_leaves_a_month_that_is_a_link_to_a_folder_and_compresses_the_real_one(tmp_path, monkeypatch):
+    # An old month moved to another disk and linked back. 1.72 archived the link alone, then failed on removing it
+    # ("Cannot call rmtree on a symbolic link") and ended the run, so a real month listed after it waited.
+    logs = month_dirs(tmp_path, '2020-02')
+    elsewhere = tmp_path / 'elsewhere' / '2020-01'
+    elsewhere.mkdir(parents=True)
+    (elsewhere / 'x.log').write_text('x')
+    (logs / '2020-01').symlink_to(elsewhere)
+    real_listdir = os.listdir
+    monkeypatch.setattr(fw.os, 'listdir', lambda path: sorted(real_listdir(path)))  # the link first, as a folder may list it
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01', '2020-02.tar.xz']
+    assert (logs / '2020-01').is_symlink()
+    assert (elsewhere / 'x.log').read_text() == 'x'
+
+
 def test_log_compressor_archives_relative_paths(tmp_path):
     logs = month_dirs(tmp_path, '2020-01')
-    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    # the mode tar's own create gave it in 1.72: 0666 less the umask (the exclusive create must not narrow it)
+    old_umask = os.umask(0o022)
+    try:
+        fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    finally:
+        os.umask(old_umask)
     with tarfile.open(str(logs / '2020-01.tar.xz')) as archive:
         assert archive.getnames() == ['2020-01', '2020-01/x.log']
+    assert stat.S_IMODE((logs / '2020-01.tar.xz').stat().st_mode) == 0o644
 
 
 def test_log_compressor_keeps_the_month_when_tar_fails(tmp_path, monkeypatch, capsys):
@@ -139,6 +167,21 @@ def test_log_compressor_keeps_the_month_when_tar_fails(tmp_path, monkeypatch, ca
     assert sorted(p.name for p in logs.iterdir()) == ['2020-01']
     assert (logs / '2020-01' / 'x.log').read_text() == 'x'
     assert 'tar exited 2' in capsys.readouterr().out
+
+
+def test_log_compressor_removes_the_partial_when_tar_cannot_be_started(tmp_path, monkeypatch, capsys):
+    # tar not on PATH, or a fork refused: the empty file the exclusive create made would stay, and keep its month out
+    # of a free-space purge for a day
+    logs = month_dirs(tmp_path, '2020-01', '2020-02')
+
+    def no_tar(cmd, **kwargs):
+        raise FileNotFoundError(fw.errno.ENOENT, 'No such file or directory', 'tar')
+
+    monkeypatch.setattr(fw.subprocess, 'run', no_tar)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01', '2020-02']
+    assert (logs / '2020-01' / 'x.log').read_text() == 'x'
+    assert 'Compressing logs in %s failed: [Errno 2] No such file or directory' % logs in capsys.readouterr().out
 
 
 def test_log_compressor_never_overwrites_an_archive(tmp_path):
@@ -280,6 +323,189 @@ def test_partial_archive_name_is_per_process(tmp_path, monkeypatch):
     monkeypatch.setattr(fw.subprocess, 'run', lambda cmd, **kw: commands.append(cmd) or real_run(cmd, **kw))
     fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
     assert commands[0][2] == str(logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid()))
+
+
+def aged(path, seconds):
+    """Make path look last changed that many seconds ago (a symlink itself, not its target)."""
+    then = time.time() - seconds
+    fw.os.utime(str(path), (then, then), follow_symlinks=False)
+
+
+DAY = fw.RECENT_MONTH_ACTIVITY
+
+
+def test_a_compression_run_removes_a_partial_archive_unchanged_for_a_day(tmp_path, capsys):
+    # 1.72 kept it, archive-sized, until a purge removed its month: a stop or a crash while tar wrote it
+    logs = month_dirs(tmp_path, '2020-01')
+    stale = logs / '2020-01.tar.xz.4242.partial'
+    other = logs / '2019-12.1.tar.xz.17.partial'
+    for path in (stale, other):
+        path.write_bytes(b'x' * 4096)
+        aged(path, DAY + 60)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01.tar.xz']
+    printed = capsys.readouterr().out
+    assert 'Removing 2020-01.tar.xz.4242.partial, left by a compression that was stopped' in printed
+    assert 'Removing 2019-12.1.tar.xz.17.partial' in printed
+
+
+def test_a_partial_archive_changed_in_the_last_day_is_kept(tmp_path):
+    # another firewatcher sharing the folder (another host, another container: its pid says nothing here) may be
+    # writing it, and so may this process
+    logs = tmp_path / 'logs'
+    logs.mkdir()
+    fresh = logs / '2020-01.tar.xz.4242.partial'
+    mine = logs / ('2020-02.tar.xz.%d.partial' % fw.os.getpid())
+    for path in (fresh, mine):
+        path.write_bytes(b'being written')
+        aged(path, DAY - 60)
+    fw.Log_Compressor(str(logs), compressAfterMonths=0, deleteLogAfterMonths=0)
+    assert fresh.read_bytes() == b'being written'
+    assert mine.read_bytes() == b'being written'
+
+
+def test_a_stale_partial_archive_with_this_process_pid_is_removed_too(tmp_path):
+    # a container's firewatcher gets the same pid at each start, so an earlier run's file can carry this pid; no
+    # compression of this process is running in the folder when its run starts, and the month is compressed after it
+    logs = month_dirs(tmp_path, '2020-01')
+    mine = logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid())
+    mine.write_bytes(b'left by an earlier run')
+    aged(mine, DAY + 60)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01.tar.xz']
+    with tarfile.open(str(logs / '2020-01.tar.xz')) as archive:
+        assert archive.getnames() == ['2020-01', '2020-01/x.log']
+
+
+def test_a_partial_archive_name_already_taken_is_never_written(tmp_path, monkeypatch):
+    # another firewatcher sharing the folder, with this pid (another host or container; a container's firewatcher
+    # has the same pid at every start), may be writing it: 1.72's tar wrote the same file, and with single-threaded
+    # xz (EL7, EL8) the archive came out corrupt and the month removed. The month is compressed under the next
+    # number free, not skipped: a skipped one waited for the leftover to be a day old.
+    logs = month_dirs(tmp_path, '2020-01')
+    pid = fw.os.getpid()
+    taken = [logs / ('2020-01.tar.xz.%d.partial' % number) for number in (pid, pid + 1)]
+    for path in taken:
+        path.write_bytes(b'another tar is writing this')
+    commands = []
+    real_run = fw.subprocess.run
+    monkeypatch.setattr(fw.subprocess, 'run', lambda cmd, **kw: commands.append(cmd) or real_run(cmd, **kw))
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert [cmd[2] for cmd in commands] == [str(logs / ('2020-01.tar.xz.%d.partial' % (pid + 2)))]
+    for path in taken:
+        assert path.read_bytes() == b'another tar is writing this'
+    assert sorted(p.name for p in logs.iterdir()) == sorted(['2020-01.tar.xz'] + [path.name for path in taken])
+    with tarfile.open(str(logs / '2020-01.tar.xz')) as archive:
+        assert archive.getnames() == ['2020-01', '2020-01/x.log']
+
+
+def test_an_output_folder_that_is_a_link_to_another_filesystem_is_compressed_and_purged(tmp_path):
+    # 1.72 compared the months' device with the link's own (lstat), so nothing was compressed or deleted, and a
+    # free-space purge freed nothing: "another filesystem is mounted in it". A second real filesystem: /dev/shm.
+    shm = '/dev/shm'
+    if not (os.path.isdir(shm) and os.access(shm, os.W_OK) and os.stat(shm).st_dev != os.stat(str(tmp_path)).st_dev):
+        pytest.skip('no writable second filesystem at /dev/shm')
+    target = tempfile.mkdtemp(prefix='firewatcher-test-', dir=shm)
+    try:
+        for name in ('2020-01', '2020-02'):
+            os.mkdir(os.path.join(target, name))
+            with open(os.path.join(target, name, 'x.log'), 'w') as handle:
+                handle.write('x')
+            aged(os.path.join(target, name, 'x.log'), 2 * DAY)
+            aged(os.path.join(target, name), 2 * DAY)
+        link = tmp_path / 'out'
+        link.symlink_to(target)
+        compressor = fw.Log_Compressor(str(link), compressAfterMonths=0, deleteLogAfterMonths=0)
+        assert [month for month, _size in compressor.purgeableMonths(())] == ['2020-01', '2020-02']
+        compressor.compressAfterMonths = 1
+        compressor.lastProcessTime = 0
+        compressor.compressLogs()
+        assert sorted(os.listdir(target)) == ['2020-01.tar.xz', '2020-02.tar.xz']
+    finally:
+        shutil.rmtree(target)
+
+
+def test_removing_stale_partial_archives_touches_nothing_else(tmp_path):
+    logs = tmp_path / 'logs'
+    logs.mkdir()
+    (logs / '2019-12').mkdir()
+    (logs / '2019-12' / 'x.log').write_text('x')
+    for name in ('2019-12.tar.xz', '2019-12.1.tar.xz', '2019-12.tar.xz.partial', '2019-13.tar.xz.5.partial',
+                 '2019-12.tar.xz.5.partial.bak', '2019-12.tar.5.partial', 'notes.partial', 'journal.log'):
+        (logs / name).write_text('keep')
+    # named like one, but not the regular file firewatcher writes
+    (logs / '2019-11.tar.xz.6.partial').mkdir()
+    (logs / '2019-11.tar.xz.6.partial' / 'y').write_text('keep')
+    target = tmp_path / 'target'
+    target.write_text('keep')
+    (logs / '2019-10.tar.xz.7.partial').symlink_to(target)
+    before = sorted(p.name for p in logs.iterdir())
+    for path in list(logs.iterdir()) + [target, logs / '2019-12' / 'x.log', logs / '2019-11.tar.xz.6.partial' / 'y']:
+        aged(path, DAY + 60)
+    fw.Log_Compressor(str(logs), compressAfterMonths=0, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == before
+    assert target.read_text() == 'keep'
+    assert (logs / '2019-11.tar.xz.6.partial' / 'y').read_text() == 'keep'
+
+
+def test_a_partial_archive_that_cannot_be_removed_does_not_stop_the_run(tmp_path, monkeypatch, capsys):
+    logs = month_dirs(tmp_path, '2020-01')
+    stale = logs / '2019-12.tar.xz.4242.partial'
+    stale.write_bytes(b'x')
+    aged(stale, DAY + 60)
+    real = fw.os.remove
+
+    def remove(path):
+        if str(path).endswith('.partial'):
+            raise OSError(fw.errno.EACCES, 'Permission denied')
+        real(path)
+
+    monkeypatch.setattr(fw.os, 'remove', remove)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert 'Removing 2019-12.tar.xz.4242.partial failed: [Errno %d] Permission denied' % fw.errno.EACCES in capsys.readouterr().out
+    assert sorted(p.name for p in logs.iterdir()) == ['2019-12.tar.xz.4242.partial', '2020-01.tar.xz']
+
+
+def test_a_partial_archive_another_run_removed_first_is_passed_over_silently(tmp_path, capsys):
+    # the compression's run and a purge both remove stale files, and may list the same one
+    logs = tmp_path / 'logs'
+    logs.mkdir()
+    compressor = fw.Log_Compressor(str(logs), compressAfterMonths=0, deleteLogAfterMonths=0)
+    assert compressor.removeStalePartials(['2019-12.tar.xz.5.partial']) == 0
+    assert capsys.readouterr().out == ''
+
+
+def test_a_stale_partial_archive_of_a_month_a_purge_holds_is_left_to_it(tmp_path):
+    logs = tmp_path / 'logs'
+    logs.mkdir()
+    compressor = fw.Log_Compressor(str(logs), compressAfterMonths=0, deleteLogAfterMonths=0)
+    stale = logs / '2019-12.tar.xz.4242.partial'
+    stale.write_bytes(b'x')
+    aged(stale, DAY + 60)
+    assert compressor._claim('2019-12')  # a purge is deleting that month
+    compressor.lastProcessTime = 0
+    compressor.compressLogs()
+    assert stale.exists()
+    compressor._release('2019-12')
+    compressor.lastProcessTime = 0
+    compressor.compressLogs()
+    assert not stale.exists()
+
+
+def test_stale_partial_archives_go_before_the_compression_asks_for_room(tmp_path):
+    logs = month_dirs(tmp_path, '2020-01')
+    stale = logs / '2019-12.tar.xz.4242.partial'
+    stale.write_bytes(b'x')
+    aged(stale, DAY + 60)
+    seen = []
+
+    class Recording(fw.DiskGuard):
+        def can_spend(self, folder, nbytes):
+            seen.append(stale.exists())
+            return False
+
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0, guard=Recording(10))
+    assert seen == [False]
 
 
 def test_run_that_reads_to_the_end_finishes_compressing(tmp_path, monkeypatch):

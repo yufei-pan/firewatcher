@@ -30,7 +30,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.72'
+version = '1.73'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -177,7 +177,7 @@ def _syncfs(path):
 		pass
 
 # What firewatcher itself creates in an output folder: YYYY-MM month folders, their YYYY-MM[.N].tar.xz
-# archives, and YYYY-MM[.N].tar.xz.PID.partial while tar writes one. Anything else is never touched.
+# archives, and YYYY-MM[.N].tar.xz.N.partial while tar writes one (N: a pid, or the next number free). Anything else is never touched.
 _MONTH_ENTRY_RE = re.compile(r'(\d{4}-\d{2})(?:(?:\.\d+)?\.tar\.xz(?:\.\d+\.partial)?)?')
 
 def _month_of(name):
@@ -283,7 +283,8 @@ class Log_Compressor:
 		would not have made: a month name that is not a folder, an archive name that is not a regular file,
 		or another filesystem mounted inside, whose files a delete would wipe.
 		'''
-		device = os.lstat(self.logsDir).st_dev
+		# stat, not lstat: the folder may be a link, and the months are on what it points to.
+		device = os.stat(self.logsDir).st_dev
 		recent = time.time() - RECENT_MONTH_ACTIVITY
 		with self.busy_lock:
 			skip = set(keep) | (self.busy - {mine})
@@ -342,8 +343,11 @@ class Log_Compressor:
 		# Get the list of files and directories in the logsDir
 		if not os.path.exists(self.logsDir):
 			return
-		device = os.lstat(self.logsDir).st_dev
+		# stat, not lstat: the folder may be a link, and the months are on what it points to.
+		device = os.stat(self.logsDir).st_dev
 		pathsList = os.listdir(self.logsDir)
+		# First, so the space they took counts for this run's compressions.
+		self.removeStalePartials(pathsList)
 		pathToDelete = []
 		pathToCompress = []
 		for path in pathsList:
@@ -352,9 +356,12 @@ class Log_Compressor:
 				continue
 			# Convert the path to a timestamp
 			pathTime = datetime.datetime.strptime(month, '%Y-%m')
+			full = os.path.join(self.logsDir, path)
 			if self.deleteLogAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.deleteLogAfterMonths*30:
 				pathToDelete.append(path)
-			elif self.compressAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.compressAfterMonths*30 and path == month and os.path.isdir(os.path.join(self.logsDir,path)):
+			# A link to a folder is not a month firewatcher made: tar would archive the link alone, and removing
+			# the month would then fail and end the run.
+			elif self.compressAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.compressAfterMonths*30 and path == month and os.path.isdir(full) and not os.path.islink(full):
 				pathToCompress.append(path)
 		for dirName in pathToDelete:
 			month = _month_of(dirName)
@@ -386,6 +393,35 @@ class Log_Compressor:
 			finally:
 				self._release(dirName)
 
+	def removeStalePartials(self, names):
+		'''Remove the partial archives a stop or a crash left while tar wrote them: no later process would, as each
+		takes a name of its own. One not changed for a day is no longer being written (tar keeps changing it while it
+		writes), as the purge judges a month; a pid says nothing about a firewatcher on another host or in another
+		container sharing the folder. The bytes that freed.'''
+		stale = time.time() - RECENT_MONTH_ACTIVITY
+		freed = 0
+		for name in names:
+			month = _month_of(name)
+			# A month a purge is deleting right now is left to it.
+			if month is None or not name.endswith('.partial') or not self._claim(month):
+				continue
+			full = os.path.join(self.logsDir, name)
+			try:
+				st = os.lstat(full)
+				if stat.S_ISREG(st.st_mode) and st.st_mtime <= stale:
+					print(f"Removing {name}, left by a compression that was stopped")
+					os.remove(full)
+					freed += _freed_by_delete(st)
+			except FileNotFoundError:
+				# Another run (the compression's or a purge's) removed it first.
+				pass
+			except OSError as e:
+				# One that cannot be removed does not stop the run.
+				print(f"Removing {name} failed: {e}")
+			finally:
+				self._release(month)
+		return freed
+
 	def _compressDir(self, dirName, device):
 		'''Archive one month directory, then remove it. A failed or interrupted tar leaves the directory as it was.'''
 		source = os.path.join(self.logsDir, dirName)
@@ -398,15 +434,33 @@ class Log_Compressor:
 		if self.guard is not None and not self.guard.can_spend(self.logsDir, size + size // 50 + 20 * 1024):
 			print(f"Not compressing {dirName} now: its archive could take the disk below the free-space floor")
 			return
-		print(f"Compressing {dirName}")
 		archive = os.path.join(self.logsDir, dirName + '.tar.xz')
 		n = 0
 		while os.path.lexists(archive):
 			n += 1
 			archive = os.path.join(self.logsDir, f"{dirName}.{n}.tar.xz")
-		# Per process: two firewatchers sharing an output folder must not write the same file.
-		partial = f"{archive}.{os.getpid()}.partial"
-		result = subprocess.run(['tar', '-cJf', partial, '-C', self.logsDir, dirName])
+		# Two firewatchers sharing an output folder must not write the same file. A pid repeats across hosts and
+		# containers (and is the same at every start of a firewatcher that is pid 1), so the name is taken by an
+		# exclusive create, the next number when it is there: two tars writing one file left a corrupt archive, and
+		# the month was removed. One that is there is never written: another compression may be writing it.
+		number = os.getpid()
+		while True:
+			partial = f"{archive}.{number}.partial"
+			try:
+				os.close(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+				break
+			except FileExistsError:
+				number += 1
+		print(f"Compressing {dirName}")
+		try:
+			result = subprocess.run(['tar', '-cJf', partial, '-C', self.logsDir, dirName])
+		except BaseException:
+			# tar could not be started (not on PATH, a refused fork): the empty file the create left would stay.
+			try:
+				os.remove(partial)
+			except OSError:
+				pass
+			raise
 		if result.returncode != 0:
 			print(f"Compressing {dirName} failed: tar exited {result.returncode}")
 			if os.path.lexists(partial):
@@ -420,8 +474,8 @@ class Log_Compressor:
 			_fsync_path(partial)
 			os.replace(partial, archive)
 		except BaseException:
-			# A later process has another pid, so it would never reuse this name: a partial left here is a leak,
-			# one archive-sized file per attempt on a failing disk. The rename may have happened before the error.
+			# A partial left here would stay until it is a day old (no process writes a name that is there): one archive-sized
+			# file per attempt on a failing disk. The rename may have happened before the error.
 			try:
 				if os.path.lexists(partial):
 					os.remove(partial)
@@ -515,13 +569,23 @@ class DiskGuard(object):
 		return headroom
 
 	def _purge(self, folder, path, needed):
-		"""Delete the fewest oldest months there that free needed bytes, if they can; whether any was freed."""
+		"""Remove the stale partial archives there, then delete the fewest oldest months that free what is still needed,
+		if they can; whether any was freed."""
 		compressor = self.compressors.get(folder)
 		now = time.time()
 		if compressor is None or now < self.next_purge.get(folder, 0):
 			return False
+		# What a stop left counts as part of its month and would go with it. It goes first, and the room it frees
+		# counts, so a month is deleted only for what is still needed.
+		try:
+			freed = compressor.removeStalePartials(os.listdir(compressor.logsDir))
+		except OSError:
+			freed = 0
+		if freed >= needed:
+			self.next_purge[folder] = now + self.purge_interval
+			return True
 		keep = {datetime.datetime.now().strftime('%Y-%m'), os.path.basename(os.path.dirname(path))}
-		total = 0
+		total = freed
 		try:
 			# Sized oldest first, and only until there is enough.
 			for _month, size in compressor.purgeableMonths(keep):
@@ -534,9 +598,8 @@ class DiskGuard(object):
 			# Deleting history and still falling short would lose it for nothing: something else filled the
 			# disk. Look again only after a while, rather than walk the history for every capture.
 			self.next_purge[folder] = now + self.purge_retry
-			return False
+			return freed > 0
 		why = 'to keep %g%% of the disk free' % self.min_free_percent
-		freed = 0
 		try:
 			for month, _size in compressor.purgeableMonths(keep):
 				# Each counts what it really freed; one that cannot be deleted does not block the rest.
