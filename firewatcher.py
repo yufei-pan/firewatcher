@@ -441,7 +441,15 @@ class Log_Compressor:
 			except FileExistsError:
 				number += 1
 		print(f"Compressing {dirName}")
-		result = subprocess.run(['tar', '-cJf', partial, '-C', self.logsDir, dirName])
+		try:
+			result = subprocess.run(['tar', '-cJf', partial, '-C', self.logsDir, dirName])
+		except BaseException:
+			# tar could not be started (not on PATH, a refused fork): the empty file the create left would stay.
+			try:
+				os.remove(partial)
+			except OSError:
+				pass
+			raise
 		if result.returncode != 0:
 			print(f"Compressing {dirName} failed: tar exited {result.returncode}")
 			if os.path.lexists(partial):

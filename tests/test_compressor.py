@@ -141,6 +141,21 @@ def test_log_compressor_keeps_the_month_when_tar_fails(tmp_path, monkeypatch, ca
     assert 'tar exited 2' in capsys.readouterr().out
 
 
+def test_log_compressor_removes_the_partial_when_tar_cannot_be_started(tmp_path, monkeypatch, capsys):
+    # tar not on PATH, or a fork refused: the empty file the exclusive create made would stay, and keep its month out
+    # of a free-space purge for a day
+    logs = month_dirs(tmp_path, '2020-01', '2020-02')
+
+    def no_tar(cmd, **kwargs):
+        raise FileNotFoundError(fw.errno.ENOENT, 'No such file or directory', 'tar')
+
+    monkeypatch.setattr(fw.subprocess, 'run', no_tar)
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01', '2020-02']
+    assert (logs / '2020-01' / 'x.log').read_text() == 'x'
+    assert 'Compressing logs in %s failed: [Errno 2] No such file or directory' % logs in capsys.readouterr().out
+
+
 def test_log_compressor_never_overwrites_an_archive(tmp_path):
     logs = month_dirs(tmp_path, '2020-01')
     (logs / '2020-01.tar.xz').write_bytes(b'older archive')
