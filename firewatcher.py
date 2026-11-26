@@ -177,7 +177,7 @@ def _syncfs(path):
 		pass
 
 # What firewatcher itself creates in an output folder: YYYY-MM month folders, their YYYY-MM[.N].tar.xz
-# archives, and YYYY-MM[.N].tar.xz.PID.partial while tar writes one. Anything else is never touched.
+# archives, and YYYY-MM[.N].tar.xz.N.partial while tar writes one (N: a pid, or the next number free). Anything else is never touched.
 _MONTH_ENTRY_RE = re.compile(r'(\d{4}-\d{2})(?:(?:\.\d+)?\.tar\.xz(?:\.\d+\.partial)?)?')
 
 def _month_of(name):
@@ -390,7 +390,7 @@ class Log_Compressor:
 
 	def _removeStalePartials(self, names):
 		'''Remove the partial archives a stop or a crash left while tar wrote them: no later process would, as each
-		names its own by its pid. One not changed for a day is no longer being written (tar keeps changing it while it
+		takes a name of its own. One not changed for a day is no longer being written (tar keeps changing it while it
 		writes), as the purge judges a month; a pid says nothing about a firewatcher on another host or in another
 		container sharing the folder.'''
 		stale = time.time() - RECENT_MONTH_ACTIVITY
@@ -428,15 +428,18 @@ class Log_Compressor:
 		while os.path.lexists(archive):
 			n += 1
 			archive = os.path.join(self.logsDir, f"{dirName}.{n}.tar.xz")
-		# Per process: two firewatchers sharing an output folder must not write the same file. A pid repeats across
-		# hosts and containers, so the name is taken by an exclusive create: two tars writing one file left a corrupt
-		# archive, and the month was removed. One already there is left alone, and a later run compresses the month.
-		partial = f"{archive}.{os.getpid()}.partial"
-		try:
-			os.close(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
-		except FileExistsError:
-			print(f"Not compressing {dirName} now: {os.path.basename(partial)} is there, another compression may be writing it")
-			return
+		# Two firewatchers sharing an output folder must not write the same file. A pid repeats across hosts and
+		# containers (and is the same at every start of a firewatcher that is pid 1), so the name is taken by an
+		# exclusive create, the next number when it is there: two tars writing one file left a corrupt archive, and
+		# the month was removed. One that is there is never written: another compression may be writing it.
+		number = os.getpid()
+		while True:
+			partial = f"{archive}.{number}.partial"
+			try:
+				os.close(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+				break
+			except FileExistsError:
+				number += 1
 		print(f"Compressing {dirName}")
 		result = subprocess.run(['tar', '-cJf', partial, '-C', self.logsDir, dirName])
 		if result.returncode != 0:
@@ -452,7 +455,7 @@ class Log_Compressor:
 			_fsync_path(partial)
 			os.replace(partial, archive)
 		except BaseException:
-			# A later process has another pid, so it would never reuse this name: a partial left here is a leak,
+			# No later process writes a name that is there, so a partial left here is a leak,
 			# one archive-sized file per attempt on a failing disk. The rename may have happened before the error.
 			try:
 				if os.path.lexists(partial):

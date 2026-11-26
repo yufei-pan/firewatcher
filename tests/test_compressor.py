@@ -334,19 +334,26 @@ def test_a_stale_partial_archive_with_this_process_pid_is_removed_too(tmp_path):
         assert archive.getnames() == ['2020-01', '2020-01/x.log']
 
 
-def test_a_partial_archive_name_already_taken_is_never_written(tmp_path, capsys):
-    # another firewatcher sharing the folder, with this pid (another host or container), is writing it: 1.72's tar
-    # wrote the same file, and with single-threaded xz (EL7, EL8) the archive came out corrupt and the month removed
+def test_a_partial_archive_name_already_taken_is_never_written(tmp_path, monkeypatch):
+    # another firewatcher sharing the folder, with this pid (another host or container; a container's firewatcher
+    # has the same pid at every start), may be writing it: 1.72's tar wrote the same file, and with single-threaded
+    # xz (EL7, EL8) the archive came out corrupt and the month removed. The month is compressed under the next
+    # number free, not skipped: a skipped one waited for the leftover to be a day old.
     logs = month_dirs(tmp_path, '2020-01')
-    taken = logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid())
-    taken.write_bytes(b'another tar is writing this')
+    pid = fw.os.getpid()
+    taken = [logs / ('2020-01.tar.xz.%d.partial' % number) for number in (pid, pid + 1)]
+    for path in taken:
+        path.write_bytes(b'another tar is writing this')
+    commands = []
+    real_run = fw.subprocess.run
+    monkeypatch.setattr(fw.subprocess, 'run', lambda cmd, **kw: commands.append(cmd) or real_run(cmd, **kw))
     fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
-    assert taken.read_bytes() == b'another tar is writing this'
-    assert sorted(p.name for p in logs.iterdir()) == ['2020-01', taken.name]
-    assert (logs / '2020-01' / 'x.log').read_text() == 'x'
-    printed = capsys.readouterr().out
-    assert 'Not compressing 2020-01 now: %s is there, another compression may be writing it' % taken.name in printed
-    assert 'Compressing 2020-01' not in printed
+    assert [cmd[2] for cmd in commands] == [str(logs / ('2020-01.tar.xz.%d.partial' % (pid + 2)))]
+    for path in taken:
+        assert path.read_bytes() == b'another tar is writing this'
+    assert sorted(p.name for p in logs.iterdir()) == sorted(['2020-01.tar.xz'] + [path.name for path in taken])
+    with tarfile.open(str(logs / '2020-01.tar.xz')) as archive:
+        assert archive.getnames() == ['2020-01', '2020-01/x.log']
 
 
 def test_removing_stale_partial_archives_touches_nothing_else(tmp_path):
