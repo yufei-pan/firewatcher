@@ -121,6 +121,22 @@ def month_dirs(tmp_path, *names):
     return logs
 
 
+def test_log_compressor_leaves_a_month_that_is_a_link_to_a_folder_and_compresses_the_real_one(tmp_path, monkeypatch):
+    # An old month moved to another disk and linked back. 1.72 archived the link alone, then failed on removing it
+    # ("Cannot call rmtree on a symbolic link") and ended the run, so a real month listed after it waited.
+    logs = month_dirs(tmp_path, '2020-02')
+    elsewhere = tmp_path / 'elsewhere' / '2020-01'
+    elsewhere.mkdir(parents=True)
+    (elsewhere / 'x.log').write_text('x')
+    (logs / '2020-01').symlink_to(elsewhere)
+    real_listdir = os.listdir
+    monkeypatch.setattr(fw.os, 'listdir', lambda path: sorted(real_listdir(path)))  # the link first, as a folder may list it
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01', '2020-02.tar.xz']
+    assert (logs / '2020-01').is_symlink()
+    assert (elsewhere / 'x.log').read_text() == 'x'
+
+
 def test_log_compressor_archives_relative_paths(tmp_path):
     logs = month_dirs(tmp_path, '2020-01')
     # the mode tar's own create gave it in 1.72: 0666 less the umask (the exclusive create must not narrow it)

@@ -356,9 +356,12 @@ class Log_Compressor:
 				continue
 			# Convert the path to a timestamp
 			pathTime = datetime.datetime.strptime(month, '%Y-%m')
+			full = os.path.join(self.logsDir, path)
 			if self.deleteLogAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.deleteLogAfterMonths*30:
 				pathToDelete.append(path)
-			elif self.compressAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.compressAfterMonths*30 and path == month and os.path.isdir(os.path.join(self.logsDir,path)):
+			# A link to a folder is not a month firewatcher made: tar would archive the link alone, and removing
+			# the month would then fail and end the run.
+			elif self.compressAfterMonths > 0 and (datetime.datetime.now() - pathTime).days > self.compressAfterMonths*30 and path == month and os.path.isdir(full) and not os.path.islink(full):
 				pathToCompress.append(path)
 		for dirName in pathToDelete:
 			month = _month_of(dirName)
