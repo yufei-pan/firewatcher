@@ -58,18 +58,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: chief's decision C224, 2026-11-24 (the user made the chief session their desk on 2026-11-14 and let it
   decide where it judges they would pick the option nine times in ten; not the user's words, and the user may
   reverse it): "(a) known limitation" with one README line. The user did not ask for it; 1.69's reviews found it.
-
-### A stop while a compression run's `tar` writes leaves its `.partial` archive behind
-- Kind: deferred (1.73)
-- What the operator sees: when firewatcher is stopped (or crashes) while it compresses a month, the output folder keeps
-  `YYYY-MM.tar.xz.PID.partial`, as large as the archive tar had written so far, up to the whole archive. It counts
-  as that month, so it takes that space until a purge (delete-after months, or the free-space floor) removes it. The
-  month's own folder is untouched, and the next run compresses it again. 1.71 the same.
-- Why: the compression runs in a daemon thread and removes its `.partial` file only when tar returns; a stop ends the
-  process first, and the next process has another pid, so it never writes or removes that file.
-- Plan (1.73): when a compression run starts, remove a `YYYY-MM[.N].tar.xz.PID.partial` in the folder that has not
-  changed for a day (`RECENT_MONTH_ACTIVITY`, as the free-space purge waits for a month another firewatcher may be
-  writing; a pid says nothing about a firewatcher on another host or in another container sharing the folder); a test
-  with a stale file and a fresh one. The other way, ending tar and removing the file on the stop path, was left out: it
-  adds a wait to every stop, and a crash would still leave the file.
-- Revisit when: 1.73, started right after 1.72 is released.

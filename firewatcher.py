@@ -30,7 +30,7 @@ import syslog
 import threading
 import zlib
 
-version = '1.72'
+version = '1.73'
 __version__ = version
 
 DEFAULT_OUTPUT_FOLDER = '/var/log/captured_messages/'
@@ -344,6 +344,8 @@ class Log_Compressor:
 			return
 		device = os.lstat(self.logsDir).st_dev
 		pathsList = os.listdir(self.logsDir)
+		# First, so the space they took counts for this run's compressions.
+		self._removeStalePartials(pathsList)
 		pathToDelete = []
 		pathToCompress = []
 		for path in pathsList:
@@ -385,6 +387,29 @@ class Log_Compressor:
 					self._compressDir(dirName, device)
 			finally:
 				self._release(dirName)
+
+	def _removeStalePartials(self, names):
+		'''Remove the partial archives a stop or a crash left while tar wrote them: no later process would, as each
+		names its own by its pid. One not changed for a day is no longer being written (tar keeps changing it while it
+		writes), as the purge judges a month; a pid says nothing about a firewatcher on another host or in another
+		container sharing the folder.'''
+		stale = time.time() - RECENT_MONTH_ACTIVITY
+		for name in names:
+			month = _month_of(name)
+			# A month a purge is deleting right now is left to it.
+			if month is None or not name.endswith('.partial') or not self._claim(month):
+				continue
+			full = os.path.join(self.logsDir, name)
+			try:
+				st = os.lstat(full)
+				if stat.S_ISREG(st.st_mode) and st.st_mtime <= stale:
+					print(f"Removing {name}, left by a compression that was stopped")
+					os.remove(full)
+			except OSError as e:
+				# One that cannot be removed does not stop the run.
+				print(f"Removing {name} failed: {e}")
+			finally:
+				self._release(month)
 
 	def _compressDir(self, dirName, device):
 		'''Archive one month directory, then remove it. A failed or interrupted tar leaves the directory as it was.'''

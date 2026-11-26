@@ -81,7 +81,7 @@ After deleting, firewatcher syncs that filesystem alone (syncfs; none on macOS, 
 
 Memory is bounded too. The `--capture-time` seconds before a match are kept compressed (zlib, about 3 times smaller for a busy host's varied lines) within `--buffer-max-mb` (default 16 MiB); past it the oldest lines are dropped, and the capture says so. The newest lines, up to 256 KiB before they are compressed, are always kept, so the buffer can go over the limit by about that much. A line longer than 1 MiB is read and matched in pieces, so a pattern split across a 1 MiB boundary is missed. From the journal, the first 4 MiB of a message are read.
 
-Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`. The directory is removed only after `tar` succeeds and the archive and its folder are synced to disk; if a sync fails, the month stays and is archived again later, nothing lost. An existing archive is never overwritten: the new one becomes `YYYY-MM.1.tar.xz`, and so on.
+Monthly directories are compressed on a background thread, so log reading never waits for `tar`. Each month becomes `YYYY-MM.tar.xz` holding `YYYY-MM/…`. The directory is removed only after `tar` succeeds and the archive and its folder are synced to disk; if a sync fails, the month stays and is archived again later, nothing lost. An existing archive is never overwritten: the new one becomes `YYYY-MM.1.tar.xz`, and so on. A stop or a crash while `tar` writes leaves its `YYYY-MM.tar.xz.PID.partial` file; compression runs at each start and then every two days, and a run removes such a file once it has not changed for a day.
 
 ## systemd service
 
