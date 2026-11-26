@@ -423,14 +423,21 @@ class Log_Compressor:
 		if self.guard is not None and not self.guard.can_spend(self.logsDir, size + size // 50 + 20 * 1024):
 			print(f"Not compressing {dirName} now: its archive could take the disk below the free-space floor")
 			return
-		print(f"Compressing {dirName}")
 		archive = os.path.join(self.logsDir, dirName + '.tar.xz')
 		n = 0
 		while os.path.lexists(archive):
 			n += 1
 			archive = os.path.join(self.logsDir, f"{dirName}.{n}.tar.xz")
-		# Per process: two firewatchers sharing an output folder must not write the same file.
+		# Per process: two firewatchers sharing an output folder must not write the same file. A pid repeats across
+		# hosts and containers, so the name is taken by an exclusive create: two tars writing one file left a corrupt
+		# archive, and the month was removed. One already there is left alone, and a later run compresses the month.
 		partial = f"{archive}.{os.getpid()}.partial"
+		try:
+			os.close(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+		except FileExistsError:
+			print(f"Not compressing {dirName} now: {os.path.basename(partial)} is there, another compression may be writing it")
+			return
+		print(f"Compressing {dirName}")
 		result = subprocess.run(['tar', '-cJf', partial, '-C', self.logsDir, dirName])
 		if result.returncode != 0:
 			print(f"Compressing {dirName} failed: tar exited {result.returncode}")

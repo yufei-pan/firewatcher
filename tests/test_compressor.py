@@ -323,14 +323,30 @@ def test_a_partial_archive_changed_in_the_last_day_is_kept(tmp_path):
 
 def test_a_stale_partial_archive_with_this_process_pid_is_removed_too(tmp_path):
     # a container's firewatcher gets the same pid at each start, so an earlier run's file can carry this pid; no
-    # compression of this process is running in the folder when its run starts
-    logs = tmp_path / 'logs'
-    logs.mkdir()
-    mine = logs / ('2020-02.tar.xz.%d.partial' % fw.os.getpid())
+    # compression of this process is running in the folder when its run starts, and the month is compressed after it
+    logs = month_dirs(tmp_path, '2020-01')
+    mine = logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid())
     mine.write_bytes(b'left by an earlier run')
     aged(mine, DAY + 60)
-    fw.Log_Compressor(str(logs), compressAfterMonths=0, deleteLogAfterMonths=0)
-    assert not mine.exists()
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01.tar.xz']
+    with tarfile.open(str(logs / '2020-01.tar.xz')) as archive:
+        assert archive.getnames() == ['2020-01', '2020-01/x.log']
+
+
+def test_a_partial_archive_name_already_taken_is_never_written(tmp_path, capsys):
+    # another firewatcher sharing the folder, with this pid (another host or container), is writing it: 1.72's tar
+    # wrote the same file, and with single-threaded xz (EL7, EL8) the archive came out corrupt and the month removed
+    logs = month_dirs(tmp_path, '2020-01')
+    taken = logs / ('2020-01.tar.xz.%d.partial' % fw.os.getpid())
+    taken.write_bytes(b'another tar is writing this')
+    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    assert taken.read_bytes() == b'another tar is writing this'
+    assert sorted(p.name for p in logs.iterdir()) == ['2020-01', taken.name]
+    assert (logs / '2020-01' / 'x.log').read_text() == 'x'
+    printed = capsys.readouterr().out
+    assert 'Not compressing 2020-01 now: %s is there, another compression may be writing it' % taken.name in printed
+    assert 'Compressing 2020-01' not in printed
 
 
 def test_removing_stale_partial_archives_touches_nothing_else(tmp_path):
