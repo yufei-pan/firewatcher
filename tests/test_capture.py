@@ -845,6 +845,29 @@ def test_a_purge_counts_what_the_stale_partial_archive_freed_against_what_it_sti
         'firewatcher-self deleting 2020-01 from %s to keep 10%% of the disk free' % out]
 
 
+def test_a_stale_partial_archive_makes_a_purge_possible_that_the_months_alone_could_not(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    guard = guarded_folder(out)
+    months(out, **{'2020-01': 100_000, '2020-02': 100_000, '2020-03_tar_xz_77_partial': 150_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-250_000, 0.10)  # the two months alone fall short, with the file they cover it
+    assert guard.headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert sorted(p.name for p in out.iterdir()) == []
+
+
+def test_a_purge_that_the_stale_partial_archive_alone_covers_waits_the_full_interval(tmp_path, monkeypatch):
+    # README: a purge is tried at most once per --purge-interval; only one that could not help is tried again sooner
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    guard = guarded_folder(out)
+    months(out, **{'2020-01': 100_000, '2020-01_tar_xz_4242_partial': 500_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-100_000, 0.10)
+    assert guard.headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert guard.next_purge[str(out)] > time.time() + guard.purge_retry
+
+
 def test_a_purge_that_the_months_cannot_cover_still_removes_the_stale_partial_archive(tmp_path, monkeypatch):
     journal_records(monkeypatch)
     out = tmp_path / 'out'
