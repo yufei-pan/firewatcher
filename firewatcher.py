@@ -283,7 +283,8 @@ class Log_Compressor:
 		would not have made: a month name that is not a folder, an archive name that is not a regular file,
 		or another filesystem mounted inside, whose files a delete would wipe.
 		'''
-		device = os.lstat(self.logsDir).st_dev
+		# stat, not lstat: the folder may be a link, and the months are on what it points to.
+		device = os.stat(self.logsDir).st_dev
 		recent = time.time() - RECENT_MONTH_ACTIVITY
 		with self.busy_lock:
 			skip = set(keep) | (self.busy - {mine})
@@ -342,7 +343,8 @@ class Log_Compressor:
 		# Get the list of files and directories in the logsDir
 		if not os.path.exists(self.logsDir):
 			return
-		device = os.lstat(self.logsDir).st_dev
+		# stat, not lstat: the folder may be a link, and the months are on what it points to.
+		device = os.stat(self.logsDir).st_dev
 		pathsList = os.listdir(self.logsDir)
 		# First, so the space they took counts for this run's compressions.
 		self._removeStalePartials(pathsList)

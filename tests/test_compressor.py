@@ -1,9 +1,13 @@
 import datetime
 import os
+import shutil
 import stat
 import tarfile
+import tempfile
 import threading
 import time
+
+import pytest
 
 import firewatcher as fw
 from conftest import capture
@@ -377,6 +381,32 @@ def test_a_partial_archive_name_already_taken_is_never_written(tmp_path, monkeyp
     assert sorted(p.name for p in logs.iterdir()) == sorted(['2020-01.tar.xz'] + [path.name for path in taken])
     with tarfile.open(str(logs / '2020-01.tar.xz')) as archive:
         assert archive.getnames() == ['2020-01', '2020-01/x.log']
+
+
+def test_an_output_folder_that_is_a_link_to_another_filesystem_is_compressed_and_purged(tmp_path):
+    # 1.72 compared the months' device with the link's own (lstat), so nothing was compressed or deleted, and a
+    # free-space purge freed nothing: "another filesystem is mounted in it". A second real filesystem: /dev/shm.
+    shm = '/dev/shm'
+    if not (os.path.isdir(shm) and os.access(shm, os.W_OK) and os.stat(shm).st_dev != os.stat(str(tmp_path)).st_dev):
+        pytest.skip('no writable second filesystem at /dev/shm')
+    target = tempfile.mkdtemp(prefix='firewatcher-test-', dir=shm)
+    try:
+        for name in ('2020-01', '2020-02'):
+            os.mkdir(os.path.join(target, name))
+            with open(os.path.join(target, name, 'x.log'), 'w') as handle:
+                handle.write('x')
+            aged(os.path.join(target, name, 'x.log'), 2 * DAY)
+            aged(os.path.join(target, name), 2 * DAY)
+        link = tmp_path / 'out'
+        link.symlink_to(target)
+        compressor = fw.Log_Compressor(str(link), compressAfterMonths=0, deleteLogAfterMonths=0)
+        assert [month for month, _size in compressor.purgeableMonths(())] == ['2020-01', '2020-02']
+        compressor.compressAfterMonths = 1
+        compressor.lastProcessTime = 0
+        compressor.compressLogs()
+        assert sorted(os.listdir(target)) == ['2020-01.tar.xz', '2020-02.tar.xz']
+    finally:
+        shutil.rmtree(target)
 
 
 def test_removing_stale_partial_archives_touches_nothing_else(tmp_path):
