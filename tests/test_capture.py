@@ -811,6 +811,66 @@ def test_purge_only_touches_what_firewatcher_made_and_nothing_recent(tmp_path, m
     assert sorted(p.name for p in out.iterdir()) == ['2019-03.csv', '2019-1', '2019-11', '2019-12.bak']
 
 
+def guarded_folder(out):
+    """A guard over out, made before anything is in it: a compressor started on a folder removes the stale
+    partial archives there, and the purge's own removal is what these tests are about."""
+    out.mkdir(parents=True, exist_ok=True)
+    return guard_for(out)
+
+
+def test_a_purge_removes_a_stale_partial_archive_first_and_no_month_when_that_frees_enough(tmp_path, monkeypatch, capsys):
+    # 1.72 counted the file as part of its month, so the month went with it
+    records = journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    guard = guarded_folder(out)
+    months(out, **{'2020-01': 100_000, '2020-01_tar_xz_4242_partial': 500_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-100_000, 0.10)
+    assert guard.headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert sorted(p.name for p in out.iterdir()) == ['2020-01']
+    assert not [r for r in records if 'deleting' in r[1]]
+    assert 'Removing 2020-01.tar.xz.4242.partial, left by a compression that was stopped' in capsys.readouterr().out
+
+
+def test_a_purge_counts_what_the_stale_partial_archive_freed_against_what_it_still_needs(tmp_path, monkeypatch):
+    records = journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    guard = guarded_folder(out)
+    months(out, **{'2020-01': 300_000, '2020-02': 300_000, '2020-03': 300_000, '2020-03_tar_xz_77_partial': 150_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-250_000, 0.10)  # more than the file, less than the file and one month
+    assert guard.headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert sorted(p.name for p in out.iterdir()) == ['2020-02', '2020-03']
+    assert [r[1] for r in records if 'deleting' in r[1]] == [
+        'firewatcher-self deleting 2020-01 from %s to keep 10%% of the disk free' % out]
+
+
+def test_a_purge_that_the_months_cannot_cover_still_removes_the_stale_partial_archive(tmp_path, monkeypatch):
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    guard = guarded_folder(out)
+    months(out, **{'2020-01': 100_000, '2020-02': 100_000, '2020-02_tar_xz_5_partial': 50_000})
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-1_000_000, 0.10)  # something else filled the disk
+    room = guard.headroom(str(out / '2026-10' / 'hit.log'))
+    # the file is garbage whatever the months can do, and the room it gave shows in what is measured again
+    assert sorted(p.name for p in out.iterdir()) == ['2020-01', '2020-02']
+    assert room == disk.headroom_at(0.10) < fw.MIN_HEADROOM
+
+
+def test_a_purge_passes_by_a_partial_archive_changed_in_the_last_day(tmp_path, monkeypatch):
+    # another firewatcher may be writing it: its month is not deleted either (README: never a month changed in the last day)
+    journal_records(monkeypatch)
+    out = tmp_path / 'out'
+    guard = guarded_folder(out)
+    months(out, **{'2020-01': 200_000, '2020-01_tar_xz_9_partial': 100_000, '2020-02': 200_000})
+    os.utime(str(out / '2020-01.tar.xz.9.partial'), None)
+    disk = FakeDisk(monkeypatch, out, 10_000_000)
+    disk.set_headroom(-10_000, 0.10)
+    assert guard.headroom(str(out / '2026-10' / 'hit.log')) >= fw.MIN_HEADROOM
+    assert sorted(p.name for p in out.iterdir()) == ['2020-01', '2020-01.tar.xz.9.partial']
+
+
 def test_month_names(tmp_path):
     assert [fw._month_of(n) for n in ('2019-12', '2019-12.tar.xz', '2019-12.3.tar.xz', '2019-12.tar.xz.99.partial')] == ['2019-12'] * 4
     assert [fw._month_of(n) for n in ('2019-1', '2019-13', '2019-12.bak', '2019-12.tar', 'journal.log', '2019-12x', '2019-12\n')] == [None] * 7

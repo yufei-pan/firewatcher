@@ -450,6 +450,15 @@ def test_a_partial_archive_that_cannot_be_removed_does_not_stop_the_run(tmp_path
     assert sorted(p.name for p in logs.iterdir()) == ['2019-12.tar.xz.4242.partial', '2020-01.tar.xz']
 
 
+def test_a_partial_archive_another_run_removed_first_is_passed_over_silently(tmp_path, capsys):
+    # the compression's run and a purge both remove stale files, and may list the same one
+    logs = tmp_path / 'logs'
+    logs.mkdir()
+    compressor = fw.Log_Compressor(str(logs), compressAfterMonths=0, deleteLogAfterMonths=0)
+    assert compressor.removeStalePartials(['2019-12.tar.xz.5.partial']) == 0
+    assert capsys.readouterr().out == ''
+
+
 def test_a_stale_partial_archive_of_a_month_a_purge_holds_is_left_to_it(tmp_path):
     logs = tmp_path / 'logs'
     logs.mkdir()

@@ -347,7 +347,7 @@ class Log_Compressor:
 		device = os.stat(self.logsDir).st_dev
 		pathsList = os.listdir(self.logsDir)
 		# First, so the space they took counts for this run's compressions.
-		self._removeStalePartials(pathsList)
+		self.removeStalePartials(pathsList)
 		pathToDelete = []
 		pathToCompress = []
 		for path in pathsList:
@@ -390,12 +390,13 @@ class Log_Compressor:
 			finally:
 				self._release(dirName)
 
-	def _removeStalePartials(self, names):
+	def removeStalePartials(self, names):
 		'''Remove the partial archives a stop or a crash left while tar wrote them: no later process would, as each
 		takes a name of its own. One not changed for a day is no longer being written (tar keeps changing it while it
 		writes), as the purge judges a month; a pid says nothing about a firewatcher on another host or in another
-		container sharing the folder.'''
+		container sharing the folder. The bytes that freed.'''
 		stale = time.time() - RECENT_MONTH_ACTIVITY
+		freed = 0
 		for name in names:
 			month = _month_of(name)
 			# A month a purge is deleting right now is left to it.
@@ -407,11 +408,16 @@ class Log_Compressor:
 				if stat.S_ISREG(st.st_mode) and st.st_mtime <= stale:
 					print(f"Removing {name}, left by a compression that was stopped")
 					os.remove(full)
+					freed += _freed_by_delete(st)
+			except FileNotFoundError:
+				# Another run (the compression's or a purge's) removed it first.
+				pass
 			except OSError as e:
 				# One that cannot be removed does not stop the run.
 				print(f"Removing {name} failed: {e}")
 			finally:
 				self._release(month)
+		return freed
 
 	def _compressDir(self, dirName, device):
 		'''Archive one month directory, then remove it. A failed or interrupted tar leaves the directory as it was.'''
@@ -560,13 +566,23 @@ class DiskGuard(object):
 		return headroom
 
 	def _purge(self, folder, path, needed):
-		"""Delete the fewest oldest months there that free needed bytes, if they can; whether any was freed."""
+		"""Remove the stale partial archives there, then delete the fewest oldest months that free what is still needed,
+		if they can; whether any was freed."""
 		compressor = self.compressors.get(folder)
 		now = time.time()
 		if compressor is None or now < self.next_purge.get(folder, 0):
 			return False
+		# What a stop left counts as part of its month and would go with it. It goes first, and the room it frees
+		# counts, so a month is deleted only for what is still needed.
+		try:
+			freed = compressor.removeStalePartials(os.listdir(compressor.logsDir))
+		except OSError:
+			freed = 0
+		if freed >= needed:
+			self.next_purge[folder] = now + self.purge_interval
+			return True
 		keep = {datetime.datetime.now().strftime('%Y-%m'), os.path.basename(os.path.dirname(path))}
-		total = 0
+		total = freed
 		try:
 			# Sized oldest first, and only until there is enough.
 			for _month, size in compressor.purgeableMonths(keep):
@@ -579,9 +595,8 @@ class DiskGuard(object):
 			# Deleting history and still falling short would lose it for nothing: something else filled the
 			# disk. Look again only after a while, rather than walk the history for every capture.
 			self.next_purge[folder] = now + self.purge_retry
-			return False
+			return freed > 0
 		why = 'to keep %g%% of the disk free' % self.min_free_percent
-		freed = 0
 		try:
 			for month, _size in compressor.purgeableMonths(keep):
 				# Each counts what it really freed; one that cannot be deleted does not block the rest.
