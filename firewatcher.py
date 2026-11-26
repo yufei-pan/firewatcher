@@ -471,8 +471,8 @@ class Log_Compressor:
 			_fsync_path(partial)
 			os.replace(partial, archive)
 		except BaseException:
-			# No later process writes a name that is there, so a partial left here is a leak,
-			# one archive-sized file per attempt on a failing disk. The rename may have happened before the error.
+			# A partial left here would stay until it is a day old (no process writes a name that is there): one archive-sized
+			# file per attempt on a failing disk. The rename may have happened before the error.
 			try:
 				if os.path.lexists(partial):
 					os.remove(partial)
