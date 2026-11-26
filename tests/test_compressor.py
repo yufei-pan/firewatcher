@@ -1,4 +1,6 @@
 import datetime
+import os
+import stat
 import tarfile
 import threading
 import time
@@ -117,9 +119,15 @@ def month_dirs(tmp_path, *names):
 
 def test_log_compressor_archives_relative_paths(tmp_path):
     logs = month_dirs(tmp_path, '2020-01')
-    fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    # the mode tar's own create gave it in 1.72: 0666 less the umask (the exclusive create must not narrow it)
+    old_umask = os.umask(0o022)
+    try:
+        fw.Log_Compressor(str(logs), compressAfterMonths=1, deleteLogAfterMonths=0)
+    finally:
+        os.umask(old_umask)
     with tarfile.open(str(logs / '2020-01.tar.xz')) as archive:
         assert archive.getnames() == ['2020-01', '2020-01/x.log']
+    assert stat.S_IMODE((logs / '2020-01.tar.xz').stat().st_mode) == 0o644
 
 
 def test_log_compressor_keeps_the_month_when_tar_fails(tmp_path, monkeypatch, capsys):
